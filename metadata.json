@@ -1,0 +1,6 @@
+{
+  "name": "GameVox Hindi",
+  "description": "Real-time floating game screen OCR subtitle reader, color-inversion preprocessor, English-to-Hindi ML Kit translator, and natural Hindi TTS voice synthesizer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
