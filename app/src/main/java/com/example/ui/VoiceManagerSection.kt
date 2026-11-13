@@ -519,12 +519,12 @@ internal fun AddClonedVoiceDialog(
 
     AlertDialog(
         onDismissRequest = { if (!isRecording) onDismiss() },
-        containerColor = SlateSurface,
+        containerColor = MaterialTheme.colorScheme.surface,
         title = {
             Text(
-                text = "Add New Voice (3–5s Voice Cloning)",
+                text = "Add New Voice",
                 style = MaterialTheme.typography.titleLarge,
-                color = ElectricCyan
+                color = MaterialTheme.colorScheme.onSurface
             )
         },
         text = {
@@ -535,7 +535,8 @@ internal fun AddClonedVoiceDialog(
                 OutlinedTextField(
                     value = voiceName,
                     onValueChange = { voiceName = it },
-                    label = { Text("Voice Name (e.g., Arjun Hero, Boss Clone)") },
+                    label = { Text("Voice Name (e.g. Jenny, Arjun)") },
+                    shape = RoundedCornerShape(14.dp),
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -561,7 +562,11 @@ internal fun AddClonedVoiceDialog(
                         },
                         enabled = !isRecording,
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isRecording) SaffronGold else ElectricCyan
+                            containerColor = if (isRecording) {
+                                MaterialTheme.colorScheme.tertiary
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            }
                         ),
                         modifier = Modifier
                             .weight(1f)
@@ -570,14 +575,12 @@ internal fun AddClonedVoiceDialog(
                         Icon(
                             imageVector = Icons.Default.Mic,
                             contentDescription = "Record 4s Voice Sample",
-                            tint = ObsidianBg,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = if (isRecording) "Recording..." else "Record 4s",
-                            color = ObsidianBg,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
 
@@ -591,11 +594,10 @@ internal fun AddClonedVoiceDialog(
                         Icon(
                             imageVector = Icons.Default.AudioFile,
                             contentDescription = "Upload Audio File",
-                            tint = SaffronGold,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Upload Audio", color = SaffronGold)
+                        Text("Upload")
                     }
                 }
 
@@ -603,14 +605,14 @@ internal fun AddClonedVoiceDialog(
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         LinearProgressIndicator(
                             progress = { recordingProgress },
-                            color = NeonEmerald,
-                            trackColor = SlateCardElevated,
+                            color = MaterialTheme.colorScheme.secondary,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
                             modifier = Modifier.fillMaxWidth()
                         )
                         Text(
-                            text = "Capturing vocal pitch & timbre... ${(recordingProgress * 100).toInt()}% (Level ${(liveMicLevel * 100).toInt()}%)",
+                            text = "Capturing sample... ${(recordingProgress * 100).toInt()}% (Level ${(liveMicLevel * 100).toInt()}%)",
                             style = MaterialTheme.typography.labelSmall,
-                            color = NeonEmerald
+                            color = MaterialTheme.colorScheme.secondary
                         )
                     }
                 }
@@ -618,14 +620,18 @@ internal fun AddClonedVoiceDialog(
                 Text(
                     text = analysisSummary,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (savedSamplePath != null) NeonEmerald else MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (savedSamplePath != null) {
+                        MaterialTheme.colorScheme.secondary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                 )
 
                 // Assign to Multi-Speaker Character Slot
                 Text(
-                    text = "Assign to Game Character Slot:",
+                    text = "Character Role:",
                     style = MaterialTheme.typography.labelLarge,
-                    color = Color.White
+                    color = MaterialTheme.colorScheme.onSurface
                 )
 
                 FlowRow(
@@ -645,8 +651,8 @@ internal fun AddClonedVoiceDialog(
                                 )
                             },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = ElectricCyan,
-                                selectedLabelColor = ObsidianBg
+                                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
                             ),
                             modifier = Modifier.testTag("clone_role_chip_${role.code}")
                         )
@@ -656,33 +662,33 @@ internal fun AddClonedVoiceDialog(
                 // Cloned Pitch & Speech Rate Fine-Tuning
                 Column {
                     Text(
-                        text = String.format(Locale.US, "Cloned Pitch Profile: %.2fx", clonedPitch),
+                        text = String.format(Locale.US, "Pitch: %.2fx", clonedPitch),
                         style = MaterialTheme.typography.labelMedium,
-                        color = Color.White
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Slider(
                         value = clonedPitch,
                         onValueChange = { clonedPitch = it },
                         valueRange = 0.50f..1.65f,
                         colors = SliderDefaults.colors(
-                            thumbColor = ElectricCyan,
-                            activeTrackColor = ElectricCyan
+                            thumbColor = MaterialTheme.colorScheme.primary,
+                            activeTrackColor = MaterialTheme.colorScheme.primary
                         ),
                         modifier = Modifier.testTag("clone_pitch_slider")
                     )
 
                     Text(
-                        text = String.format(Locale.US, "Cloned Cadence / Speed: %.2fx", clonedRate),
+                        text = String.format(Locale.US, "Speed: %.2fx", clonedRate),
                         style = MaterialTheme.typography.labelMedium,
-                        color = Color.White
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Slider(
                         value = clonedRate,
                         onValueChange = { clonedRate = it },
                         valueRange = 0.60f..1.50f,
                         colors = SliderDefaults.colors(
-                            thumbColor = SaffronGold,
-                            activeTrackColor = SaffronGold
+                            thumbColor = MaterialTheme.colorScheme.primary,
+                            activeTrackColor = MaterialTheme.colorScheme.primary
                         ),
                         modifier = Modifier.testTag("clone_rate_slider")
                     )
@@ -708,11 +714,10 @@ internal fun AddClonedVoiceDialog(
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = ElectricCyan
+                        contentDescription = null
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Test Cloned Voice in Hindi", color = ElectricCyan)
+                    Text("Test Voice")
                 }
             }
         },
@@ -721,7 +726,7 @@ internal fun AddClonedVoiceDialog(
                 onClick = {
                     val created = VoiceProfileRepository.addCustomClonedVoice(
                         context = context,
-                        name = voiceName.ifBlank { "Custom Cloned Voice" },
+                        name = voiceName.ifBlank { "Custom Voice" },
                         description = analysisSummary,
                         pitch = clonedPitch,
                         speechRate = clonedRate,
@@ -731,13 +736,15 @@ internal fun AddClonedVoiceDialog(
                     onVoiceSaved(created)
                 },
                 enabled = !isRecording,
-                colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                ),
                 modifier = Modifier.testTag("save_cloned_voice_button")
             ) {
                 Text(
-                    text = "Save Cloned Voice",
-                    color = ObsidianBg,
-                    fontWeight = FontWeight.Bold
+                    text = "Save Voice",
+                    fontWeight = FontWeight.SemiBold
                 )
             }
         },

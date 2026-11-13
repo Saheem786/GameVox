@@ -1,8 +1,8 @@
 package com.example.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,16 +27,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Female
+import androidx.compose.material.icons.filled.Male
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -45,17 +43,14 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -69,40 +64,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.SpeakerRole
+import com.example.data.SpeakerGender
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
-import com.example.service.ForegroundTtsManager
-import com.example.ui.theme.CrimsonAlert
-import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonEmerald
-import com.example.ui.theme.ObsidianBg
-import com.example.ui.theme.SaffronGold
-import com.example.ui.theme.SlateCardElevated
-import com.example.ui.theme.SlateSurface
-import com.example.ui.theme.SlateSurfaceVariant
 import java.util.Locale
 import kotlinx.coroutines.launch
 
-private enum class VoiceListFilter(val label: String) {
-    ALL("All Voices"),
-    CUSTOM_ONLY("Custom Cloned"),
-    CHARACTER_A("Character A"),
-    CHARACTER_B("Character B"),
-    CHARACTER_C("Character C (Boss)"),
-    NARRATOR("Narrator")
+private enum class VoiceGenderFilter(val label: String) {
+    ALL("All"),
+    FEMALE("Female"),
+    MALE("Male"),
+    CUSTOM("Custom")
 }
 
 /**
- * Dedicated Jetpack Compose screen that lists available voices (both built-in character
- * archetypes and locally stored custom cloned voices) and includes controls to Play, Select,
- * or Delete custom voice profiles, plus a 3-5 second Voice Cloning recorder & audio importer.
+ * Clean, modern Material 3 Voice Manager Screen using LazyColumn.
+ * Each voice card displays Voice Name, Gender icon (Male/Female), and 3 clear actions:
+ * Play, Select, and Delete (styled in Red).
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -118,44 +102,32 @@ fun VoiceManagerScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-    val ttsManager = remember(context) { ForegroundTtsManager.getInstance(context) }
 
     val voices by VoiceProfileRepository.voices.collectAsStateWithLifecycle()
     val selectedVoiceId by VoiceProfileRepository.selectedVoiceId.collectAsStateWithLifecycle()
-    val multiSpeakerEnabled by VoiceProfileRepository.multiSpeakerEnabled.collectAsStateWithLifecycle()
-    val lastDetectedSpeaker by VoiceProfileRepository.lastDetectedSpeaker.collectAsStateWithLifecycle()
-    val lastAssignedVoiceName by VoiceProfileRepository.lastAssignedVoiceName.collectAsStateWithLifecycle()
-    val lastHeuristicRule by VoiceProfileRepository.lastHeuristicRule.collectAsStateWithLifecycle()
-    val roleVoiceAssignments by VoiceProfileRepository.roleVoiceAssignments.collectAsStateWithLifecycle()
-    val customTagVoiceBindings by VoiceProfileRepository.customTagVoiceBindings.collectAsStateWithLifecycle()
 
-    var activeFilter by remember { mutableStateOf(VoiceListFilter.ALL) }
+    var activeFilter by remember { mutableStateOf(VoiceGenderFilter.ALL) }
     var showAddVoiceCloneDialog by remember { mutableStateOf(false) }
     var voicePendingDeletion by remember { mutableStateOf<VoiceProfile?>(null) }
-    var customCharacterTagInput by remember { mutableStateOf("") }
 
     val filteredVoices = remember(voices, activeFilter) {
         when (activeFilter) {
-            VoiceListFilter.ALL -> voices
-            VoiceListFilter.CUSTOM_ONLY -> voices.filter { it.isCustomCloned }
-            VoiceListFilter.CHARACTER_A -> voices.filter { it.assignedRole == SpeakerRole.CHARACTER_A }
-            VoiceListFilter.CHARACTER_B -> voices.filter { it.assignedRole == SpeakerRole.CHARACTER_B }
-            VoiceListFilter.CHARACTER_C -> voices.filter { it.assignedRole == SpeakerRole.CHARACTER_C }
-            VoiceListFilter.NARRATOR -> voices.filter { it.assignedRole == SpeakerRole.NARRATOR }
+            VoiceGenderFilter.ALL -> voices
+            VoiceGenderFilter.FEMALE -> voices.filter { it.gender == SpeakerGender.FEMALE_18 }
+            VoiceGenderFilter.MALE -> voices.filter { it.gender == SpeakerGender.MALE_18 }
+            VoiceGenderFilter.CUSTOM -> voices.filter { it.isCustomCloned }
         }
     }
 
-    val customCount = remember(voices) { voices.count { it.isCustomCloned } }
-
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing,
-        containerColor = ObsidianBg,
+        containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = ObsidianBg,
-                    titleContentColor = Color.White
+                    containerColor = MaterialTheme.colorScheme.background,
+                    titleContentColor = MaterialTheme.colorScheme.onBackground
                 ),
                 navigationIcon = {
                     IconButton(
@@ -164,22 +136,22 @@ fun VoiceManagerScreen(
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back to Dashboard",
-                            tint = ElectricCyan
+                            contentDescription = "Back",
+                            tint = MaterialTheme.colorScheme.onBackground
                         )
                     }
                 },
                 title = {
                     Column {
                         Text(
-                            text = "Voice Studio & Character Voices",
+                            text = "Voice Manager",
                             style = MaterialTheme.typography.titleLarge,
-                            color = Color.White
+                            fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "${voices.size} Total Voices • $customCount Custom Cloned Profiles",
+                            text = "${voices.size} voices available",
                             style = MaterialTheme.typography.labelSmall,
-                            color = ElectricCyan
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
@@ -189,7 +161,7 @@ fun VoiceManagerScreen(
                             onClick = {
                                 VoiceProfileRepository.restoreDefaultVoices(context)
                                 coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Default character voices restored.")
+                                    snackbarHostState.showSnackbar("Default voices restored")
                                 }
                             },
                             modifier = Modifier.testTag("voice_screen_restore_defaults_button")
@@ -197,7 +169,7 @@ fun VoiceManagerScreen(
                             Icon(
                                 imageVector = Icons.Default.Refresh,
                                 contentDescription = "Restore Default Voices",
-                                tint = SaffronGold
+                                tint = MaterialTheme.colorScheme.primary
                             )
                         }
                     }
@@ -207,18 +179,18 @@ fun VoiceManagerScreen(
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = { showAddVoiceCloneDialog = true },
-                containerColor = ElectricCyan,
-                contentColor = ObsidianBg,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
                 icon = {
                     Icon(
                         imageVector = Icons.Default.Add,
-                        contentDescription = "Add or Clone New Voice"
+                        contentDescription = "Add Voice"
                     )
                 },
                 text = {
                     Text(
-                        text = "Add / Clone Voice",
-                        fontWeight = FontWeight.Bold
+                        text = "Add Voice",
+                        fontWeight = FontWeight.SemiBold
                     )
                 },
                 modifier = Modifier.testTag("voice_screen_fab_add_voice")
@@ -235,356 +207,96 @@ fun VoiceManagerScreen(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .widthIn(max = 640.dp),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                    .widthIn(max = 600.dp),
+                contentPadding = PaddingValues(
+                    start = 16.dp,
+                    end = 16.dp,
+                    top = 8.dp,
+                    bottom = 96.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // 0. Real-Time Canvas TTS Audio Visualizer synced with ForegroundTtsManager
+                // Compact filter chips row
                 item {
-                    val activeSelectedVoice = voices.find { it.id == selectedVoiceId } ?: voices.firstOrNull()
-                    TtsAudioVisualizerCard(
-                        ttsManager = ttsManager,
-                        fallbackTextToSpeak = "नमस्ते! यह ${activeSelectedVoice?.name ?: "GameVox"} की आवाज़ है।",
-                        onSpeakSample = {
-                            if (activeSelectedVoice != null) {
-                                onPlayVoicePreview(activeSelectedVoice)
-                            }
-                        }
-                    )
-                }
-
-                // 1. Multi-Speaker Character Slot Mapping & Telemetry Banner
-                item {
-                    Card(
-                        shape = RoundedCornerShape(18.dp),
-                        colors = CardDefaults.cardColors(containerColor = SlateSurface),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, ElectricCyan.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
+                        VoiceGenderFilter.entries.forEach { filter ->
+                            val selected = activeFilter == filter
+                            FilterChip(
+                                selected = selected,
+                                onClick = { activeFilter = filter },
+                                label = {
                                     Text(
-                                        text = "Character Tag Heuristic Engine",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = NeonEmerald
+                                        text = filter.label,
+                                        style = MaterialTheme.typography.labelMedium
                                     )
-                                    Text(
-                                        text = "Last Tag: $lastDetectedSpeaker → $lastAssignedVoiceName",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color.White
-                                    )
-                                    Text(
-                                        text = "Matched Rule: $lastHeuristicRule",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = ElectricCyan
-                                    )
-                                }
-                                Switch(
-                                    checked = multiSpeakerEnabled,
-                                    onCheckedChange = { enabled ->
-                                        VoiceProfileRepository.setMultiSpeakerEnabled(context, enabled)
-                                    },
-                                    modifier = Modifier.testTag("voice_screen_multi_speaker_switch")
-                                )
-                            }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-
-                            Text(
-                                text = "Active Character Slot Assignments (Mapped from Scan Tags):",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = Color.White
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                ),
+                                modifier = Modifier.testTag("voice_filter_chip_${filter.name.lowercase()}")
                             )
-
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                SpeakerRole.entries.forEach { role ->
-                                    val assignedVoice = remember(voices, roleVoiceAssignments, selectedVoiceId) {
-                                        VoiceProfileRepository.getVoiceForRole(role)
-                                    }
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .background(SlateSurfaceVariant)
-                                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = role.displayLabel,
-                                                style = MaterialTheme.typography.labelMedium,
-                                                color = ElectricCyan,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Text(
-                                                text = "${assignedVoice.name} (${String.format(Locale.US, "%.2fx pitch • %.2fx rate", assignedVoice.pitch, assignedVoice.speechRate)})",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = Color.White
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = { onPlayVoicePreview(assignedVoice) },
-                                            modifier = Modifier.testTag("test_role_voice_${role.code}")
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.VolumeUp,
-                                                contentDescription = "Preview ${role.displayLabel}",
-                                                tint = NeonEmerald
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-
-                            // Custom Character Name Tag -> Selected Voice Binder
-                            val currentSelectedVoice = voices.find { it.id == selectedVoiceId } ?: voices.firstOrNull()
-                            Text(
-                                text = "Bind Custom Scan Tag (e.g. 'Character A:', 'Guard:') to Selected Voice (${currentSelectedVoice?.name ?: "Default"}):",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color.White
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                OutlinedTextField(
-                                    value = customCharacterTagInput,
-                                    onValueChange = { customCharacterTagInput = it },
-                                    placeholder = { Text("e.g. Character A:") },
-                                    singleLine = true,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .testTag("custom_character_tag_input")
-                                )
-                                Button(
-                                    onClick = {
-                                        val activeVoice = currentSelectedVoice ?: return@Button
-                                        if (customCharacterTagInput.isNotBlank()) {
-                                            VoiceProfileRepository.bindCustomCharacterTag(
-                                                context = context,
-                                                characterTag = customCharacterTagInput,
-                                                voiceId = activeVoice.id
-                                            )
-                                            val tagLabel = customCharacterTagInput.trim()
-                                            customCharacterTagInput = ""
-                                            coroutineScope.launch {
-                                                snackbarHostState.showSnackbar(
-                                                    "Mapped scan tag '$tagLabel' → ${activeVoice.name}"
-                                                )
-                                            }
-                                        }
-                                    },
-                                    colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan),
-                                    modifier = Modifier.testTag("bind_character_tag_button")
-                                ) {
-                                    Text("Map Tag", color = ObsidianBg, fontWeight = FontWeight.Bold)
-                                }
-                            }
-
-                            if (customTagVoiceBindings.isNotEmpty()) {
-                                FlowRow(
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    customTagVoiceBindings.forEach { (tagKey, boundId) ->
-                                        val voiceName = voices.find { it.id == boundId }?.name ?: boundId
-                                        FilterChip(
-                                            selected = true,
-                                            onClick = {
-                                                VoiceProfileRepository.removeCustomCharacterTag(context, tagKey)
-                                            },
-                                            label = {
-                                                Text(
-                                                    text = "'$tagKey' → $voiceName (✕)",
-                                                    style = MaterialTheme.typography.labelSmall
-                                                )
-                                            },
-                                            colors = FilterChipDefaults.filterChipColors(
-                                                selectedContainerColor = SaffronGold.copy(alpha = 0.22f),
-                                                selectedLabelColor = SaffronGold
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-
-                            // Quick Heuristic Scan Tester
-                            Text(
-                                text = "Test Scan Tag Heuristic Detection:",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = SaffronGold
-                            )
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                listOf(
-                                    "Character A: Hold the northern gate!",
-                                    "[Character B] The ancient portal is open.",
-                                    "Character C: You dare challenge the Eternal Flame?",
-                                    "System: Security override complete."
-                                ).forEachIndexed { idx, sampleScan ->
-                                    OutlinedButton(
-                                        onClick = {
-                                            val parsed = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(sampleScan)
-                                            onPlayVoicePreview(parsed.assignedVoice)
-                                            coroutineScope.launch {
-                                                snackbarHostState.showSnackbar(
-                                                    "Tag '${parsed.speakerName}' → ${parsed.assignedVoice.name}"
-                                                )
-                                            }
-                                        },
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                        modifier = Modifier.testTag("test_heuristic_sample_$idx")
-                                    ) {
-                                        Text(
-                                            text = sampleScan.substringBefore(" ").trimEnd(':') + " Test",
-                                            color = ElectricCyan,
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
-                                    }
-                                }
-                            }
                         }
                     }
                 }
 
-                // 2. Filter Chips (All Voices, Custom Cloned, Character A/B/C, Narrator)
-                item {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Available Voice Profiles (${filteredVoices.size})",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
-                            TextButton(
-                                onClick = { showAddVoiceCloneDialog = true },
-                                modifier = Modifier.testTag("voice_screen_header_add_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Mic,
-                                    contentDescription = null,
-                                    tint = ElectricCyan,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Clone 3–5s Voice", color = ElectricCyan)
-                            }
-                        }
-
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            VoiceListFilter.entries.forEach { filter ->
-                                val selected = activeFilter == filter
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = { activeFilter = filter },
-                                    label = {
-                                        Text(
-                                            text = filter.label,
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
-                                    },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = ElectricCyan,
-                                        selectedLabelColor = ObsidianBg
-                                    ),
-                                    modifier = Modifier.testTag("voice_filter_chip_${filter.name.lowercase()}")
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // 3. Empty State when filtering Custom Cloned voices and none exist yet
                 if (filteredVoices.isEmpty()) {
                     item {
-                        Surface(
-                            color = SlateSurface,
-                            shape = RoundedCornerShape(16.dp),
+                        Card(
+                            shape = RoundedCornerShape(18.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surface
+                            ),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("empty_voice_list_card")
                         ) {
                             Column(
-                                modifier = Modifier.padding(24.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(24.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.RecordVoiceOver,
                                     contentDescription = null,
-                                    tint = ElectricCyan,
+                                    tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(36.dp)
                                 )
                                 Text(
-                                    text = "No Voice Profiles in '${activeFilter.label}'",
+                                    text = "No ${activeFilter.label} voices yet",
                                     style = MaterialTheme.typography.titleMedium,
-                                    color = Color.White
-                                )
-                                Text(
-                                    text = "Tap 'Add / Clone Voice' below to record 3–5 seconds of audio or upload an audio clip to create a custom character voice profile.",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Button(
                                     onClick = { showAddVoiceCloneDialog = true },
-                                    colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan),
                                     modifier = Modifier.testTag("empty_state_add_voice_button")
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Add,
                                         contentDescription = null,
-                                        tint = ObsidianBg
+                                        modifier = Modifier.size(18.dp)
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Create Custom Voice Profile",
-                                        color = ObsidianBg,
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                    Text("Add Voice")
                                 }
                             }
                         }
                     }
                 } else {
-                    // 4. Voice Profile Cards with Play, Select, and Delete controls
                     items(filteredVoices, key = { it.id }) { voice ->
                         val isSelected = voice.id == selectedVoiceId
-                        VoiceScreenProfileCard(
+                        CleanVoiceCard(
                             voice = voice,
                             isSelected = isSelected,
                             canDelete = voices.size > 1,
-                            onPlayTtsPreview = {
-                                onPlayVoicePreview(voice)
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Playing Hindi preview: ${voice.name}")
-                                }
-                            },
-                            onPlayRecordedSample = {
+                            onPlay = {
                                 val path = voice.sampleAudioPath
                                 if (path != null) {
                                     VoiceProfileRepository.playRecordedReferenceSample(path) {
@@ -593,36 +305,34 @@ fun VoiceManagerScreen(
                                 } else {
                                     onPlayVoicePreview(voice)
                                 }
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("Playing ${voice.name}")
+                                }
                             },
                             onSelect = {
                                 VoiceProfileRepository.selectVoice(context, voice)
                                 onSelectVoice(voice)
                                 coroutineScope.launch {
-                                    snackbarHostState.showSnackbar(
-                                        "Selected '${voice.name}' for ${voice.assignedRole.displayLabel}"
-                                    )
+                                    snackbarHostState.showSnackbar("Active voice: ${voice.name}")
                                 }
                             },
-                            onRequestDelete = {
+                            onDelete = {
                                 if (voice.isCustomCloned) {
                                     voicePendingDeletion = voice
                                 } else {
                                     VoiceProfileRepository.deleteVoice(context, voice.id)
                                     coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Removed '${voice.name}'. Tap Restore in top bar anytime.")
+                                        snackbarHostState.showSnackbar("Deleted ${voice.name}")
                                     }
                                 }
                             }
                         )
                     }
                 }
-
-                item { Spacer(modifier = Modifier.height(88.dp)) }
             }
         }
     }
 
-    // Add / Clone Custom Voice Modal Dialog
     if (showAddVoiceCloneDialog) {
         AddClonedVoiceDialog(
             onDismiss = { showAddVoiceCloneDialog = false },
@@ -634,29 +344,28 @@ fun VoiceManagerScreen(
                 onSelectVoice(savedProfile)
                 onPlayVoicePreview(savedProfile)
                 coroutineScope.launch {
-                    snackbarHostState.showSnackbar("Custom voice '${savedProfile.name}' saved locally!")
+                    snackbarHostState.showSnackbar("Saved '${savedProfile.name}'")
                 }
             }
         )
     }
 
-    // Confirmation Dialog for Deleting a Custom Cloned Voice Profile
     voicePendingDeletion?.let { targetVoice ->
         AlertDialog(
             onDismissRequest = { voicePendingDeletion = null },
-            containerColor = SlateSurface,
+            containerColor = MaterialTheme.colorScheme.surface,
             title = {
                 Text(
-                    text = "Delete Custom Voice Profile?",
+                    text = "Delete Voice?",
                     style = MaterialTheme.typography.titleMedium,
-                    color = CrimsonAlert
+                    color = MaterialTheme.colorScheme.error
                 )
             },
             text = {
                 Text(
-                    text = "Are you sure you want to delete '${targetVoice.name}' and its locally saved voice sample?",
+                    text = "Delete '${targetVoice.name}' from your saved voices?",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             },
             confirmButton = {
@@ -665,13 +374,16 @@ fun VoiceManagerScreen(
                         VoiceProfileRepository.deleteVoice(context, targetVoice.id)
                         voicePendingDeletion = null
                         coroutineScope.launch {
-                            snackbarHostState.showSnackbar("Deleted custom voice '${targetVoice.name}'")
+                            snackbarHostState.showSnackbar("Deleted '${targetVoice.name}'")
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
                     modifier = Modifier.testTag("confirm_delete_custom_voice_button")
                 ) {
-                    Text("Delete Voice", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("Delete", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
@@ -687,31 +399,40 @@ fun VoiceManagerScreen(
 }
 
 @Composable
-private fun VoiceScreenProfileCard(
+private fun CleanVoiceCard(
     voice: VoiceProfile,
     isSelected: Boolean,
     canDelete: Boolean,
-    onPlayTtsPreview: () -> Unit,
-    onPlayRecordedSample: () -> Unit,
+    onPlay: () -> Unit,
     onSelect: () -> Unit,
-    onRequestDelete: () -> Unit
+    onDelete: () -> Unit
 ) {
-    Surface(
-        color = if (isSelected) SlateCardElevated else SlateSurface,
-        shape = RoundedCornerShape(16.dp),
+    val isFemale = voice.gender == SpeakerGender.FEMALE_18
+    val genderLabel = if (isFemale) "Female" else "Male"
+    val genderIcon = if (isFemale) Icons.Default.Female else Icons.Default.Male
+
+    val borderStroke = if (isSelected) {
+        BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+    } else {
+        BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    }
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        border = borderStroke,
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 2.dp else 1.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .border(
-                width = if (isSelected) 1.5.dp else 1.dp,
-                color = if (isSelected) NeonEmerald else ElectricCyan.copy(alpha = 0.32f),
-                shape = RoundedCornerShape(16.dp)
-            )
             .testTag("voice_screen_card_${voice.id}")
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            // Header: Gender Icon + Voice Name + Active Badge
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -723,154 +444,173 @@ private fun VoiceScreenProfileCard(
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(42.dp)
+                            .size(44.dp)
                             .clip(CircleShape)
                             .background(
-                                if (isSelected) NeonEmerald.copy(alpha = 0.22f)
-                                else ElectricCyan.copy(alpha = 0.16f)
+                                if (isSelected) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                }
                             ),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Default.GraphicEq,
-                            contentDescription = null,
-                            tint = if (isSelected) NeonEmerald else ElectricCyan,
-                            modifier = Modifier.size(22.dp)
+                            imageVector = genderIcon,
+                            contentDescription = genderLabel,
+                            tint = if (isSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.size(24.dp)
                         )
                     }
+
                     Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                text = voice.name,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold
-                            )
-                            if (voice.isCustomCloned) {
-                                Badge(
-                                    containerColor = SaffronGold.copy(alpha = 0.22f),
-                                    contentColor = SaffronGold
-                                ) {
-                                    Text(
-                                        text = "CUSTOM CLONE",
-                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                    )
-                                }
-                            } else {
-                                Badge(
-                                    containerColor = ElectricCyan.copy(alpha = 0.18f),
-                                    contentColor = ElectricCyan
-                                ) {
-                                    Text(
-                                        text = "PRESET",
-                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                    )
-                                }
-                            }
-                        }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = voice.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "${voice.assignedRole.displayLabel} • Pitch ${String.format(Locale.US, "%.2fx", voice.pitch)} • Speed ${String.format(Locale.US, "%.2fx", voice.speechRate)}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = ElectricCyan
+                            text = String.format(
+                                Locale.US,
+                                "%s • Pitch %.2fx • Speed %.2fx",
+                                genderLabel,
+                                voice.pitch,
+                                voice.speechRate
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
 
-                // Delete control
-                if (canDelete) {
-                    IconButton(
-                        onClick = onRequestDelete,
-                        modifier = Modifier.testTag("voice_screen_delete_button_${voice.id}")
+                if (isSelected) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        shape = RoundedCornerShape(50)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.DeleteOutline,
-                            contentDescription = "Delete ${voice.name}",
-                            tint = CrimsonAlert
+                        Text(
+                            text = "Active",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                         )
                     }
                 }
             }
 
-            Text(
-                text = voice.description,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            // Controls Row: Play, Optional Recorded Sample Playback, and Select
+            // 3 Clean Actions Row: Play | Select | Delete (Red)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedButton(
-                    onClick = onPlayTtsPreview,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    onClick = onPlay,
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     modifier = Modifier
                         .weight(1f)
+                        .height(48.dp)
                         .testTag("voice_screen_play_button_${voice.id}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Play Voice Preview",
-                        tint = ElectricCyan,
+                        contentDescription = "Play ${voice.name}",
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Play", color = ElectricCyan, fontWeight = FontWeight.SemiBold)
-                }
-
-                if (voice.sampleAudioPath != null) {
-                    OutlinedButton(
-                        onClick = onPlayRecordedSample,
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-                        modifier = Modifier.testTag("voice_screen_play_sample_button_${voice.id}")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Mic,
-                            contentDescription = "Play Recorded Audio Sample",
-                            tint = SaffronGold,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Sample", color = SaffronGold)
-                    }
+                    Text(
+                        text = "Play",
+                        maxLines = 1,
+                        style = MaterialTheme.typography.labelLarge
+                    )
                 }
 
                 Button(
                     onClick = onSelect,
+                    shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isSelected) NeonEmerald else SlateSurfaceVariant
+                        containerColor = if (isSelected) {
+                            MaterialTheme.colorScheme.secondary
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        contentColor = if (isSelected) {
+                            MaterialTheme.colorScheme.onSecondary
+                        } else {
+                            MaterialTheme.colorScheme.onPrimary
+                        }
                     ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     modifier = Modifier
                         .weight(1f)
+                        .height(48.dp)
                         .testTag("voice_screen_select_button_${voice.id}")
                 ) {
                     if (isSelected) {
                         Icon(
-                            imageVector = Icons.Default.CheckCircle,
+                            imageVector = Icons.Default.Check,
                             contentDescription = null,
-                            tint = ObsidianBg,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Selected",
-                            color = ObsidianBg,
-                            fontWeight = FontWeight.Bold
-                        )
-                    } else {
-                        Text(
-                            text = "Select",
-                            color = Color.White,
-                            fontWeight = FontWeight.SemiBold
-                        )
                     }
+                    Text(
+                        text = if (isSelected) "Selected" else "Select",
+                        maxLines = 1,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onDelete,
+                    enabled = canDelete,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = if (canDelete) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.outlineVariant
+                        }
+                    ),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("voice_screen_delete_button_${voice.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteOutline,
+                        contentDescription = "Delete ${voice.name}",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Delete",
+                        maxLines = 1,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
         }

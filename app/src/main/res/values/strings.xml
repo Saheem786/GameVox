@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">GameVox Hindi</string>
+    <string name="app_name">GameVox</string>
     <string name="hero_subtitle">Real-Time Game Screen OCR, Accessibility Reader &amp; Hindi Voice Dubber</string>
     <string name="accessibility_service_description">Reads English subtitles and on-screen text from running games using Accessibility &amp; OCR, translates them to Hindi, and speaks them out loud via TextToSpeech.</string>
     <string name="overlay_permission_title">Floating Overlay Permission</string>

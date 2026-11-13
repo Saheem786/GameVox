@@ -403,19 +403,19 @@ class FloatingOverlayController(
         }
         overlayParams = params
 
-        // Clean Circular Floating Icon ONLY
-        val bubbleSize = dpToPx(54)
+        // Modern Sleek Circular Floating Icon
+        val bubbleSize = dpToPx(46)
         val bubbleFrame = FrameLayout(context).apply {
             layoutParams = FrameLayout.LayoutParams(bubbleSize, bubbleSize)
             background = createBubbleDrawable(isActive = isBoxVisible)
-            elevation = dpToPx(10).toFloat()
+            elevation = dpToPx(8).toFloat()
         }
 
         val currentLang = TranslatorStateRepository.state.value.targetLanguage
         val glyphText = TextView(context).apply {
             text = if (isVoiceMuted) "🔇" else currentLang.glyphBadge
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
@@ -425,7 +425,7 @@ class FloatingOverlayController(
         }
         bubbleFrame.addView(glyphText)
 
-        val dotSize = dpToPx(12)
+        val dotSize = dpToPx(10)
         val statusDot = View(context).apply {
             layoutParams = FrameLayout.LayoutParams(dotSize, dotSize).apply {
                 gravity = Gravity.BOTTOM or Gravity.END
@@ -436,12 +436,12 @@ class FloatingOverlayController(
                 shape = GradientDrawable.OVAL
                 setColor(
                     when {
-                        isVoiceMuted -> Color.parseColor("#FF5252")
-                        isBoxVisible -> Color.parseColor("#00E676")
-                        else -> Color.parseColor("#FFB300")
+                        isVoiceMuted -> Color.parseColor("#EF4444")
+                        isBoxVisible -> Color.parseColor("#10B981")
+                        else -> Color.parseColor("#60A5FA")
                     }
                 )
-                setStroke(dpToPx(2), Color.parseColor("#090D16"))
+                setStroke(dpToPx(2), Color.parseColor("#1E242B"))
             }
         }
         bubbleFrame.addView(statusDot)
@@ -732,13 +732,13 @@ class FloatingOverlayController(
     private inner class CornerResizeGripView(context: Context) : View(context) {
         private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = Color.argb(220, 0, 229, 255)
+            color = Color.argb(175, 16, 185, 129)
         }
         private val gripLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = dpToPx(2).toFloat().coerceAtLeast(3f)
             strokeCap = Paint.Cap.ROUND
-            color = Color.parseColor("#090D16")
+            color = Color.WHITE
         }
         private val cornerPath = Path()
 
@@ -808,15 +808,15 @@ class FloatingOverlayController(
                 maxLines = 4
                 ellipsize = TextUtils.TruncateAt.END
                 gravity = Gravity.CENTER
-                setPadding(dpToPx(14), dpToPx(8), dpToPx(14), dpToPx(8))
+                setPadding(dpToPx(16), dpToPx(10), dpToPx(16), dpToPx(10))
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dpToPx(12).toFloat()
-                    setColor(Color.argb(215, 10, 15, 26))
-                    setStroke(dpToPx(1), Color.parseColor("#00E5FF"))
+                    cornerRadius = dpToPx(14).toFloat()
+                    setColor(Color.argb(175, 17, 24, 39))
+                    setStroke(dpToPx(1), Color.argb(45, 255, 255, 255))
                 }
                 text = latestHindiOnlyText
                 visibility = if (latestHindiOnlyText.isBlank()) View.GONE else View.VISIBLE
@@ -917,12 +917,12 @@ class FloatingOverlayController(
             shape = GradientDrawable.OVAL
             setColor(
                 when {
-                    isVoiceMuted -> Color.parseColor("#FF5252")
-                    isActive -> Color.parseColor("#00E676")
-                    else -> Color.parseColor("#FFB300")
+                    isVoiceMuted -> Color.parseColor("#EF4444")
+                    isActive -> Color.parseColor("#10B981")
+                    else -> Color.parseColor("#60A5FA")
                 }
             )
-            setStroke(dpToPx(2), Color.parseColor("#090D16"))
+            setStroke(dpToPx(2), Color.parseColor("#1E242B"))
         }
     }
 
@@ -1301,20 +1301,14 @@ class FloatingOverlayController(
     private fun createBubbleDrawable(isActive: Boolean): GradientDrawable {
         return GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            colors = if (isActive) {
-                intArrayOf(
-                    Color.parseColor("#004D40"),
-                    Color.parseColor("#00251A")
-                )
-            } else {
-                intArrayOf(
-                    Color.parseColor("#1A2744"),
-                    Color.parseColor("#0D1322")
-                )
-            }
+            setColor(Color.argb(225, 26, 31, 38))
             setStroke(
                 dpToPx(2),
-                if (isActive) Color.parseColor("#00E676") else Color.parseColor("#00E5FF")
+                when {
+                    isVoiceMuted -> Color.parseColor("#EF4444")
+                    isActive -> Color.parseColor("#10B981")
+                    else -> Color.parseColor("#60A5FA")
+                }
             )
         }
     }
@@ -1322,11 +1316,11 @@ class FloatingOverlayController(
     private fun createTargetBoxDrawable(isScanning: Boolean): GradientDrawable {
         return GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
-            cornerRadius = dpToPx(10).toFloat()
-            setColor(Color.argb(22, 0, 230, 118))
+            cornerRadius = dpToPx(12).toFloat()
+            setColor(Color.argb(10, 16, 185, 129))
             setStroke(
                 dpToPx(2),
-                if (isScanning) Color.parseColor("#00E676") else Color.parseColor("#00C853")
+                if (isScanning) Color.parseColor("#10B981") else Color.argb(165, 16, 185, 129)
             )
         }
     }
