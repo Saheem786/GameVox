@@ -3,17 +3,14 @@ package com.example.service
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.util.Base64
 import android.util.Log
 import com.example.BuildConfig
 import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.engine.EmotionAnalysisResult
 import com.example.engine.SpeechEmotion
-import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -67,17 +64,18 @@ enum class CloudTtsProvider(
 object CloudTtsService {
 
     private const val TAG = "CloudTtsService"
-    private const val GOOGLE_CLOUD_TTS_ENDPOINT =
-        "https://texttospeech.googleapis.com/v1/text:synthesize"
     private const val OPENAI_TTS_ENDPOINT =
         "https://api.openai.com/v1/audio/speech"
 
     @Volatile
     private var activeMediaPlayer: MediaPlayer? = null
 
+    private val googleCloudTtsService: GoogleCloudTtsService by lazy {
+        GoogleCloudTtsService()
+    }
+
     fun hasGoogleCloudKey(): Boolean {
-        val key = BuildConfig.GOOGLE_CLOUD_TTS_API_KEY.trim()
-        return key.isNotEmpty() && !key.startsWith("MY_")
+        return GoogleCloudTtsService.hasValidApiKey(BuildConfig.GOOGLE_CLOUD_TTS_API_KEY)
     }
 
     fun hasOpenAiKey(): Boolean {
@@ -106,8 +104,8 @@ object CloudTtsService {
     }
 
     /**
-     * Synthesizes [emotionResult] using Google Cloud TTS (Neural2/WaveNet) or OpenAI TTS (`gpt-4o-mini-tts`)
-     * and plays the resulting MP3 audio via [MediaPlayer].
+     * Synthesizes [emotionResult] using [GoogleCloudTtsService] (Neural2/WaveNet) or OpenAI TTS
+     * (`gpt-4o-mini-tts`) and plays the resulting MP3 audio via [MediaPlayer].
      *
      * Returns `true` if cloud audio synthesis & playback started, or `false` if no valid key is configured
      * or the network request failed (so the caller can seamlessly fallback to Android's SSML TTS engine).
@@ -125,12 +123,20 @@ object CloudTtsService {
         val mp3Result: Pair<ByteArray, String>? = when (provider) {
             CloudTtsProvider.GOOGLE_CLOUD_TTS -> {
                 if (!hasGoogleCloudKey()) return@withContext false
-                synthesizeViaGoogleCloudTts(
-                    apiKey = BuildConfig.GOOGLE_CLOUD_TTS_API_KEY.trim(),
-                    targetLanguage = targetLanguage,
-                    gender = gender,
-                    emotionResult = emotionResult
-                )
+                when (
+                    val result = googleCloudTtsService.synthesizeWithEmotionResult(
+                        targetLanguage = targetLanguage,
+                        gender = gender,
+                        emotionResult = emotionResult,
+                        audioEncoding = CloudAudioEncoding.MP3
+                    )
+                ) {
+                    is CloudTtsSynthesisResult.Success -> result.audioBytes to result.voiceName
+                    is CloudTtsSynthesisResult.Failure -> {
+                        Log.w(TAG, "Google Cloud TTS fallback triggered: ${result.message}")
+                        null
+                    }
+                }
             }
             CloudTtsProvider.OPENAI_TTS -> {
                 if (!hasOpenAiKey()) return@withContext false
@@ -173,119 +179,6 @@ object CloudTtsService {
             outFile.delete()
             Log.w(TAG, "Cloud TTS playback setup failed", e)
             false
-        }
-    }
-
-    /**
-     * Calls Google Cloud Text-to-Speech API (`v1/text:synthesize`) with W3C SSML and selects
-     * Neural2 (with WaveNet fallback) female/male Hindi voices:
-     * - Female (18yo Girl / Jenny): `hi-IN-Neural2-A` / `hi-IN-Wavenet-A`
-     * - Male (18yo Boy / Anon): `hi-IN-Neural2-B` / `hi-IN-Wavenet-B`
-     */
-    private fun synthesizeViaGoogleCloudTts(
-        apiKey: String,
-        targetLanguage: TargetLanguage,
-        gender: SpeakerGender,
-        emotionResult: EmotionAnalysisResult
-    ): Pair<ByteArray, String>? {
-        val voiceCandidates = selectGoogleCloudVoiceNames(targetLanguage, gender)
-        for (voiceName in voiceCandidates) {
-            val bytes = requestGoogleCloudSynthesize(
-                apiKey = apiKey,
-                languageCode = targetLanguage.ttsLocaleTag,
-                voiceName = voiceName,
-                gender = gender,
-                emotionResult = emotionResult
-            )
-            if (bytes != null) {
-                return bytes to voiceName
-            }
-        }
-        return null
-    }
-
-    private fun selectGoogleCloudVoiceNames(
-        targetLanguage: TargetLanguage,
-        gender: SpeakerGender
-    ): List<String> {
-        val langTag = targetLanguage.ttsLocaleTag
-        return when (targetLanguage) {
-            TargetLanguage.HINDI -> when (gender) {
-                SpeakerGender.FEMALE_18 -> listOf("hi-IN-Neural2-A", "hi-IN-Neural2-D", "hi-IN-Wavenet-A")
-                SpeakerGender.MALE_18 -> listOf("hi-IN-Neural2-B", "hi-IN-Neural2-C", "hi-IN-Wavenet-B")
-            }
-            else -> when (gender) {
-                SpeakerGender.FEMALE_18 -> listOf("$langTag-Neural2-A", "$langTag-Wavenet-A")
-                SpeakerGender.MALE_18 -> listOf("$langTag-Neural2-B", "$langTag-Wavenet-B")
-            }
-        }
-    }
-
-    private fun requestGoogleCloudSynthesize(
-        apiKey: String,
-        languageCode: String,
-        voiceName: String,
-        gender: SpeakerGender,
-        emotionResult: EmotionAnalysisResult
-    ): ByteArray? {
-        var connection: HttpURLConnection? = null
-        return try {
-            val url = URL("$GOOGLE_CLOUD_TTS_ENDPOINT?key=$apiKey")
-            connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 5000
-                readTimeout = 8000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            }
-
-            val genderPitchOffset = if (gender == SpeakerGender.FEMALE_18) 1.5 else -1.5
-            val totalPitchSemitones = (emotionResult.emotion.cloudPitchSemitones + genderPitchOffset)
-                .coerceIn(-12.0, 12.0)
-
-            val payload = JSONObject().apply {
-                put("input", JSONObject().apply {
-                    put("ssml", emotionResult.ssmlMarkup)
-                })
-                put("voice", JSONObject().apply {
-                    put("languageCode", languageCode)
-                    put("name", voiceName)
-                    put("ssmlGender", if (gender == SpeakerGender.FEMALE_18) "FEMALE" else "MALE")
-                })
-                put("audioConfig", JSONObject().apply {
-                    put("audioEncoding", "MP3")
-                    put("speakingRate", emotionResult.emotion.cloudSpeakingRate.coerceIn(0.6, 1.5))
-                    put("pitch", totalPitchSemitones)
-                    put("volumeGainDb", emotionResult.emotion.cloudVolumeGainDb)
-                })
-            }
-
-            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(payload.toString())
-            }
-
-            if (connection.responseCode in 200..299) {
-                val responseBody = BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8))
-                    .use { it.readText() }
-                val json = JSONObject(responseBody)
-                val base64Audio = json.optString("audioContent", "")
-                if (base64Audio.isNotBlank()) {
-                    Base64.decode(base64Audio, Base64.DEFAULT)
-                } else {
-                    null
-                }
-            } else {
-                Log.w(TAG, "Google Cloud TTS HTTP ${connection.responseCode} for $voiceName")
-                null
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Google Cloud TTS request failed for $voiceName", e)
-            null
-        } finally {
-            try {
-                connection?.disconnect()
-            } catch (_: Exception) {
-            }
         }
     }
 
