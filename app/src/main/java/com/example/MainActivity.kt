@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -67,8 +68,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -99,16 +102,22 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.SubtitleTranslationEntry
+import com.example.data.TargetLanguage
 import com.example.data.TranslatorAppState
 import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
+import com.example.data.VoiceProfileRepository
 import com.example.engine.BitmapInverter
 import com.example.engine.OcrTranslationPipeline
+import com.example.service.ForegroundTtsManager
 import com.example.service.GameVoxAccessibilityService
 import com.example.service.ScreenTranslatorService
 import com.example.ui.GAME_SCENE_PRESETS
 import com.example.ui.GameSimulatorSection
 import com.example.ui.SettingsBottomSheet
+import com.example.ui.TtsAudioVisualizerCard
+import com.example.ui.VoiceManagerScreen
+import com.example.ui.VoiceManagerSection
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
@@ -128,6 +137,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         TranslatorStateRepository.loadPreferences(applicationContext)
+        VoiceProfileRepository.initialize(applicationContext)
         localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
 
         if (TranslatorStateRepository.state.value.originalFramePreview == null) {
@@ -171,6 +181,8 @@ fun GameVoxHindiDashboard(
     val snackbarHostState = remember { SnackbarHostState() }
 
     val state by TranslatorStateRepository.state.collectAsStateWithLifecycle()
+
+    var showVoiceManagerScreen by remember { mutableStateOf(false) }
 
     var hasOverlayPermission by remember {
         mutableStateOf(Settings.canDrawOverlays(context))
@@ -216,6 +228,71 @@ fun GameVoxHindiDashboard(
         TranslatorStateRepository.setAccessibilityConnected(isAccessibilityEnabled)
     }
 
+    val checkTtsDataLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val isInstalled = localPipeline.ttsManager.handleCheckTtsDataResult(result.resultCode, result.data)
+        if (!isInstalled) {
+            localPipeline.promptInstallHindiTtsData(context, openSystemInstaller = true)
+        }
+    }
+
+    // Register VoiceDataDownloadListener to react when Hindi or target high-quality voice packs are missing or installed
+    DisposableEffect(localPipeline) {
+        val voiceListener = object : ForegroundTtsManager.VoiceDataDownloadListener {
+            override fun onHighQualityNetworkVoiceAvailable(
+                language: TargetLanguage,
+                voiceName: String,
+                quality: Int
+            ) {
+                // High-quality network voice pack is active
+            }
+
+            override fun onVoiceDataMissing(
+                language: TargetLanguage,
+                missingVoiceNames: List<String>,
+                reason: String
+            ) {
+                coroutineScope.launch {
+                    val result = snackbarHostState.showSnackbar(
+                        message = "${language.displayName} HD Voice Data missing. Download now?",
+                        actionLabel = "Download",
+                        duration = SnackbarDuration.Short
+                    )
+                    if (result == SnackbarResult.ActionPerformed) {
+                        try {
+                            val checkIntent = Intent(TextToSpeech.Engine.ACTION_CHECK_TTS_DATA).apply {
+                                setPackage(ForegroundTtsManager.GOOGLE_TTS_PACKAGE)
+                            }
+                            checkTtsDataLauncher.launch(checkIntent)
+                        } catch (_: Exception) {
+                            localPipeline.promptInstallHindiTtsData(context, openSystemInstaller = true)
+                        }
+                    }
+                }
+            }
+
+            override fun onVoiceDataDownloadStarted(language: TargetLanguage) {
+                // Background voice pack download initiated
+            }
+
+            override fun onVoiceDataInstalled(
+                language: TargetLanguage,
+                installedVoiceName: String
+            ) {
+                coroutineScope.launch {
+                    snackbarHostState.showSnackbar(
+                        "${language.displayName} HD Voice Ready ($installedVoiceName)"
+                    )
+                }
+            }
+        }
+        localPipeline.ttsManager.addVoiceDataDownloadListener(voiceListener)
+        onDispose {
+            localPipeline.ttsManager.removeVoiceDataDownloadListener(voiceListener)
+        }
+    }
+
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -230,6 +307,22 @@ fun GameVoxHindiDashboard(
                 snackbarHostState.showSnackbar("Floating Translator & 2s Screen Capture Started!")
             }
         }
+    }
+
+    if (showVoiceManagerScreen) {
+        VoiceManagerScreen(
+            onNavigateBack = { showVoiceManagerScreen = false },
+            onPlayVoicePreview = { voiceProfile ->
+                localPipeline.previewVoiceProfile(voiceProfile)
+            },
+            onSelectVoice = { voiceProfile ->
+                TranslatorStateRepository.updateTtsPitch(context, voiceProfile.pitch)
+                TranslatorStateRepository.updateTtsSpeechRate(context, voiceProfile.speechRate)
+                localPipeline.refreshTtsConfiguration()
+                localPipeline.previewVoiceProfile(voiceProfile)
+            }
+        )
+        return
     }
 
     Scaffold(
@@ -273,6 +366,16 @@ fun GameVoxHindiDashboard(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { showVoiceManagerScreen = true },
+                        modifier = Modifier.testTag("open_voice_studio_top_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RecordVoiceOver,
+                            contentDescription = "Open Voice Studio Screen",
+                            tint = NeonEmerald
+                        )
+                    }
                     IconButton(
                         onClick = { TranslatorStateRepository.setShowSettingsBottomSheet(true) },
                         modifier = Modifier.testTag("open_settings_sheet_button")
@@ -364,6 +467,41 @@ fun GameVoxHindiDashboard(
                                 action = ScreenTranslatorService.ACTION_STOP_SERVICE
                             }
                             context.startService(intent)
+                        }
+                    )
+                }
+
+                // 1a. Real-Time Canvas TTS Audio Visualizer (Synced with ForegroundTtsManager)
+                item {
+                    TtsAudioVisualizerCard(
+                        ttsManager = localPipeline.ttsManager,
+                        fallbackTextToSpeak = state.lastTranslatedHindi,
+                        onSpeakSample = {
+                            localPipeline.speakHindiNonBlocking(
+                                hindiText = state.lastTranslatedHindi,
+                                forceSpeakEvenIfRepeat = true
+                            )
+                        }
+                    )
+                }
+
+                // 1b. Multi-Voice Manager UI (Voice List, Voice Cloning Recorder/Uploader & Multi-Speaker Assignments)
+                item {
+                    VoiceManagerSection(
+                        onPlayVoicePreview = { voiceProfile ->
+                            localPipeline.previewVoiceProfile(voiceProfile)
+                        },
+                        onSelectVoice = { voiceProfile ->
+                            TranslatorStateRepository.updateTtsPitch(context, voiceProfile.pitch)
+                            TranslatorStateRepository.updateTtsSpeechRate(context, voiceProfile.speechRate)
+                            localPipeline.refreshTtsConfiguration()
+                            localPipeline.previewVoiceProfile(voiceProfile)
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar("Selected voice: ${voiceProfile.name}")
+                            }
+                        },
+                        onOpenFullScreen = {
+                            showVoiceManagerScreen = true
                         }
                     )
                 }
@@ -569,11 +707,26 @@ fun GameVoxHindiDashboard(
                 )
             },
             onRefreshTtsStatus = {
-                localPipeline.refreshTtsConfiguration()
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                        action = ScreenTranslatorService.ACTION_REFRESH_TTS
+                    }
+                    context.startService(intent)
+                } else {
+                    localPipeline.refreshTtsConfiguration()
+                }
             },
             onInstallHindiVoiceData = {
                 TranslatorStateRepository.setShowSettingsBottomSheet(false)
-                localPipeline.promptInstallHindiTtsData(context)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                        action = ScreenTranslatorService.ACTION_DOWNLOAD_VOICE_DATA
+                        putExtra(ScreenTranslatorService.EXTRA_OPEN_SYSTEM_TTS_INSTALLER, true)
+                    }
+                    context.startService(intent)
+                } else {
+                    localPipeline.promptInstallHindiTtsData(context, openSystemInstaller = true)
+                }
             },
             onResetAntiRepeat = {
                 localPipeline.resetAntiRepeatMemory()
@@ -671,7 +824,7 @@ private fun HeroControlBanner(
                         color = Color.White
                     )
                     Text(
-                        text = "Drag & Resize Scan Box Over Subtitles • Tap Icon: Start/Stop • Hold: Settings",
+                        text = "Double-Tap Floating Icon: Show/Hide Scan Box • Hold: Settings",
                         style = MaterialTheme.typography.bodyMedium,
                         color = ElectricCyan
                     )
@@ -754,7 +907,7 @@ private fun HeroControlBanner(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (state.isCapturingOcr) "Pause Reading" else "Start Reading",
+                                text = if (state.showTargetBoxOverlay) "Hide Scan Box" else "Show Scan Box",
                                 color = ObsidianBg,
                                 fontWeight = FontWeight.Bold
                             )
@@ -967,54 +1120,25 @@ private fun LiveOcrDebugMonitorCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Floating Debug TextView Readout",
+                    text = "Hindi Translation Box",
                     style = MaterialTheme.typography.titleMedium,
                     color = ElectricCyan
                 )
-                Badge(
-                    containerColor = SaffronGold.copy(alpha = 0.2f),
-                    contentColor = SaffronGold
-                ) {
-                    Text(
-                        text = "Anti-Repeat Skips: ${state.duplicateSkippedCount}",
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                }
             }
 
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
                     .background(ObsidianBg)
                     .border(1.dp, ElectricCyan.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
-                    .padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = "EXTRACTED GAME TEXT (ACCESSIBILITY / OCR):",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = ElectricCyan
-                )
-                Text(
-                    text = state.lastExtractedEnglish,
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color.White,
-                    modifier = Modifier.testTag("debug_ocr_english_text")
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = "HINDI TRANSLATION (SPOKEN VIA HI-IN TTS):",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = SaffronGold
-                )
                 Text(
                     text = state.lastTranslatedHindi,
                     style = MaterialTheme.typography.titleMedium,
-                    color = SaffronGold,
+                    color = Color.White,
                     modifier = Modifier.testTag("debug_translated_hindi_text")
                 )
             }

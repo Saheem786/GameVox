@@ -1,23 +1,16 @@
 package com.example.engine
 
-import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Rect
-import android.media.AudioAttributes
-import android.media.AudioManager
-import android.os.Bundle
-import android.speech.tts.TextToSpeech
-import android.speech.tts.Voice
-import android.util.Log
 import com.example.data.ModelDownloadStatus
 import com.example.data.TranslatorStateRepository
-import com.example.data.TtsEngineStatus
+import com.example.data.VoiceProfile
+import com.example.data.VoiceProfileRepository
+import com.example.service.ForegroundTtsManager
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -25,19 +18,16 @@ import kotlinx.coroutines.withContext
  * Process-wide Singleton coordinating:
  * 1. [ImageProcessor] Target Bounding Box Cropping + Grayscale + ColorMatrix Inversion + ML Kit OCR
  * 2. AccessibilityService bounding-box node & screenshot overlay extraction
- * 3. Google Translate Neural API + Offline English -> Hindi Translation + Anti-Repeat check (lastSpokenText)
- * 4. High-Quality Network Voice Android TextToSpeech (`com.google.android.tts`, `KEY_FEATURE_NETWORK_SYNTHESIS`,
- *    highest-quality neural `Voice` selection, `USAGE_MEDIA` audio stream).
+ * 3. Multi-Speaker Character Detection ([VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle])
+ * 4. Google Translate Neural API + Offline English -> Hindi Translation + Anti-Repeat check (lastSpokenText)
+ * 5. [ForegroundTtsManager] for Multi-Voice & High-Quality Network Voice TextToSpeech.
  */
 class OcrTranslationPipeline private constructor(context: Context) {
 
     private val appContext: Context = context.applicationContext
 
     companion object {
-        private const val TAG = "OcrTranslationPipeline"
-        private const val GOOGLE_TTS_PACKAGE = "com.google.android.tts"
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
-        private val INDIAN_ENGLISH_LOCALE: Locale = Locale.forLanguageTag("en-IN")
 
         @Volatile
         private var INSTANCE: OcrTranslationPipeline? = null
@@ -53,13 +43,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
         ImageProcessor()
     }
 
-    @Volatile
-    private var isTtsReady: Boolean = false
-
-    @Volatile
-    private var pendingSpeechText: String? = null
-
-    private var tts: TextToSpeech? = null
+    val ttsManager: ForegroundTtsManager by lazy {
+        ForegroundTtsManager.getInstance(appContext)
+    }
 
     /**
      * Anti-Repeat state variable:
@@ -75,194 +61,21 @@ class OcrTranslationPipeline private constructor(context: Context) {
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     init {
+        VoiceProfileRepository.initialize(appContext)
         initializeTtsAsync()
         ensureTranslationModelDownloaded()
     }
 
     /**
-     * Initializes Android's [TextToSpeech] preferring Google Speech Services (`com.google.android.tts`)
-     * so high-quality neural network Hindi voices (`hi-in-x-hie-network`, `hi-in-x-hid-network`, etc.)
-     * are available, falling back to the system default engine if Google TTS is not installed.
+     * Initializes [ForegroundTtsManager] asynchronously without blocking OCR or translation.
      */
-    @Synchronized
     fun initializeTtsAsync() {
-        if (tts != null && isTtsReady) {
-            refreshTtsConfiguration()
-            return
-        }
-        TranslatorStateRepository.setTtsStatus(TtsEngineStatus.INITIALIZING)
-        try {
-            tts?.shutdown()
-            tts = TextToSpeech(
-                appContext,
-                { status ->
-                    if (status == TextToSpeech.SUCCESS) {
-                        val engine = tts ?: return@TextToSpeech
-                        configureTtsEngine(engine)
-                        flushPendingSpeechIfAny()
-                    } else {
-                        // Fallback to default TTS engine constructor if explicit package binding failed
-                        initializeDefaultTtsFallback()
-                    }
-                },
-                GOOGLE_TTS_PACKAGE
-            )
-        } catch (e: Exception) {
-            initializeDefaultTtsFallback()
-        }
-    }
-
-    private fun initializeDefaultTtsFallback() {
-        try {
-            tts?.shutdown()
-            tts = TextToSpeech(appContext) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    val engine = tts ?: return@TextToSpeech
-                    configureTtsEngine(engine)
-                    flushPendingSpeechIfAny()
-                } else {
-                    isTtsReady = false
-                    TranslatorStateRepository.setTtsStatus(TtsEngineStatus.ERROR)
-                    Log.w(TAG, "TextToSpeech initialization returned status: $status")
-                }
-            }
-        } catch (e: Exception) {
-            isTtsReady = false
-            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.ERROR)
-            Log.w(TAG, "Unable to initialize fallback TextToSpeech", e)
-        }
-    }
-
-    private fun flushPendingSpeechIfAny() {
-        val queued = pendingSpeechText
-        if (!queued.isNullOrBlank()) {
-            pendingSpeechText = null
-            speakHindiNonBlocking(queued, forceSpeakEvenIfRepeat = true)
-        }
-    }
-
-    /**
-     * Configures [engine] to use `USAGE_MEDIA` audio attributes and selects the highest-quality
-     * neural/network [Voice] available for the target language so speech sounds natural rather than robotic.
-     */
-    private fun configureTtsEngine(engine: TextToSpeech) {
-        val currentState = TranslatorStateRepository.state.value
-
-        try {
-            val audioAttrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-            engine.setAudioAttributes(audioAttrs)
-        } catch (_: Exception) {
-        }
-
-        engine.setPitch(currentState.ttsPitch)
-        engine.setSpeechRate(currentState.ttsSpeechRate)
-
-        val targetLang = currentState.targetLanguage
-        val primaryLocale = targetLang.locale
-        val genericLocale = Locale.forLanguageTag(targetLang.code)
-
-        val primaryResult = engine.setLanguage(primaryLocale)
-        val langAvailable = primaryResult != TextToSpeech.LANG_MISSING_DATA &&
-            primaryResult != TextToSpeech.LANG_NOT_SUPPORTED
-
-        if (!langAvailable) {
-            val genericResult = engine.setLanguage(genericLocale)
-            if (genericResult == TextToSpeech.LANG_MISSING_DATA || genericResult == TextToSpeech.LANG_NOT_SUPPORTED) {
-                val enInResult = engine.setLanguage(INDIAN_ENGLISH_LOCALE)
-                if (enInResult == TextToSpeech.LANG_MISSING_DATA || enInResult == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    engine.setLanguage(Locale.getDefault())
-                }
-                engine.setLanguage(primaryLocale)
-            }
-        }
-
-        // Select the best High-Quality Network Voice from engine.voices
-        val selectedVoice = selectBestVoiceForLanguage(
-            engine = engine,
-            langCode = targetLang.code,
-            preferNetworkVoice = currentState.useHighQualityNetworkVoice
-        )
-
-        if (selectedVoice != null) {
-            try {
-                engine.voice = selectedVoice
-                val qualityBadge = if (selectedVoice.isNetworkConnectionRequired ||
-                    selectedVoice.name.contains("network", ignoreCase = true) ||
-                    selectedVoice.quality >= Voice.QUALITY_HIGH
-                ) {
-                    "HD Neural (${selectedVoice.name})"
-                } else {
-                    "Local (${selectedVoice.name})"
-                }
-                TranslatorStateRepository.setActiveVoiceName(qualityBadge)
-                TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
-            } catch (_: Exception) {
-                TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
-            }
-        } else {
-            TranslatorStateRepository.setActiveVoiceName(
-                if (currentState.useHighQualityNetworkVoice) {
-                    "Google Network Synthesis (${targetLang.ttsLocaleTag})"
-                } else {
-                    "Standard (${targetLang.ttsLocaleTag})"
-                }
-            )
-            TranslatorStateRepository.setTtsStatus(
-                if (langAvailable) TtsEngineStatus.READY else TtsEngineStatus.FALLBACK_VOICE_READY
-            )
-        }
-
-        isTtsReady = true
-    }
-
-    /**
-     * Searches `engine.voices` for the most natural, high-quality voice matching [langCode].
-     * Prioritizes neural/network voices (`isNetworkConnectionRequired`, `-network`, `wavenet`,
-     * `QUALITY_VERY_HIGH`, `QUALITY_HIGH`) when [preferNetworkVoice] is true.
-     */
-    private fun selectBestVoiceForLanguage(
-        engine: TextToSpeech,
-        langCode: String,
-        preferNetworkVoice: Boolean
-    ): Voice? {
-        return try {
-            val availableVoices = engine.voices ?: return null
-            val matchingVoices = availableVoices.filter { voice ->
-                voice.locale != null &&
-                    voice.locale.language.equals(langCode, ignoreCase = true) &&
-                    !voice.features.orEmpty().contains("notInstalled")
-            }
-            if (matchingVoices.isEmpty()) return null
-
-            matchingVoices.maxWithOrNull(
-                compareBy<Voice> { voice ->
-                    val isNetwork = voice.isNetworkConnectionRequired ||
-                        voice.name.contains("network", ignoreCase = true) ||
-                        voice.name.contains("wavenet", ignoreCase = true)
-                    if (preferNetworkVoice) {
-                        if (isNetwork) 2 else 1
-                    } else {
-                        if (!isNetwork) 2 else 1
-                    }
-                }
-                    .thenBy { it.quality }
-                    .thenBy { -it.latency }
-            )
-        } catch (e: Exception) {
-            null
-        }
+        ttsManager.registerTtsDataBroadcastReceiver()
+        ttsManager.initializeAsync()
     }
 
     fun refreshTtsConfiguration() {
-        val engine = tts
-        if (engine == null) {
-            initializeTtsAsync()
-            return
-        }
-        configureTtsEngine(engine)
+        ttsManager.refreshVoiceConfiguration()
     }
 
     fun ensureTranslationModelDownloaded() {
@@ -282,7 +95,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
         if (extractedEnglish.isBlank()) {
             return@withContext "" to ""
         }
-        handleExtractedSubtitle(extractedEnglish, startTime, onDebugTextUpdate)
+        handleExtractedSubtitle(rawEnglishText, extractedEnglish, startTime, onDebugTextUpdate)
     }
 
     /**
@@ -290,8 +103,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
      * 1. Crops [rawBitmap] strictly to [targetRegionScreenRect] (the user's Draggable Overlay Box)
      * 2. Applies Grayscale + Color-Inversion
      * 3. Extracts text from the cropped box via Google ML Kit Text Recognition
-     * 4. Translates English -> selected TargetLanguage via Google Translate API + Offline fallback
-     * 5. Checks Anti-Repeat [lastSpokenText] and speaks via High-Quality Network TTS.
+     * 4. Runs [SpeakerHeuristicEngine] to detect character name tags (`"Character A:"`, etc.) and map to [VoiceProfile]
+     * 5. Translates clean dialogue -> selected TargetLanguage via Google Translate API + Offline fallback
+     * 6. Checks Anti-Repeat [lastSpokenText] and speaks via the assigned character's [VoiceProfile].
      */
     suspend fun processCapturedFrame(
         rawBitmap: Bitmap,
@@ -319,26 +133,27 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
         val extractedEnglish = cleanExtractedSubtitle(extractionResult.extractedText)
         if (extractedEnglish.isBlank()) {
-            withContext(Dispatchers.Main) {
-                onDebugTextUpdate?.invoke(
-                    "No text inside Scan Box",
-                    TranslatorStateRepository.state.value.lastTranslatedHindi,
-                    "Drag Box over Game Text"
-                )
-            }
             return@withContext "" to ""
         }
 
-        handleExtractedSubtitle(extractedEnglish, startTime, onDebugTextUpdate)
+        handleExtractedSubtitle(extractionResult.extractedText, extractedEnglish, startTime, onDebugTextUpdate)
     }
 
     private suspend fun handleExtractedSubtitle(
+        rawScanText: String,
         extractedEnglish: String,
         startTime: Long,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?
     ): Pair<String, String> {
         val targetLang = TranslatorStateRepository.state.value.targetLanguage
-        val translatedText = translateEnglishToHindi(extractedEnglish)
+
+        // Analyze scan result via SpeakerHeuristicEngine to identify character name tags (e.g., "Character A:")
+        // and map them to the corresponding VoiceProfile selected in the Voice Manager
+        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(rawScanText)
+        val assignedVoice = parsedDialogue.assignedVoice
+        val dialogueToTranslate = parsedDialogue.spokenDialogue.ifBlank { extractedEnglish }
+
+        val translatedText = translateEnglishToHindi(dialogueToTranslate)
         val elapsedMs = System.currentTimeMillis() - startTime
         val timestamp = timeFormatter.format(Date())
 
@@ -370,8 +185,17 @@ class OcrTranslationPipeline private constructor(context: Context) {
         lastSpokenText = normalizedTranslated
         lastExtractedNormalized = normalizedEnglish
 
-        val spokenSuccess = speakHindiNonBlocking(translatedText)
-        val skipNote = if (spokenSuccess) null else "TTS Queued / Warming Up"
+        val spokenSuccess = speakHindiNonBlocking(
+            hindiText = translatedText,
+            forceSpeakEvenIfRepeat = false,
+            voiceProfile = assignedVoice
+        )
+        val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
+        val skipNote = if (spokenSuccess) {
+            "$speakerTag → ${assignedVoice.name}"
+        } else {
+            "TTS Queued / Downloading Voice Async"
+        }
 
         TranslatorStateRepository.recordTranslationResult(
             english = extractedEnglish,
@@ -386,7 +210,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
             onDebugTextUpdate?.invoke(
                 extractedEnglish,
                 translatedText,
-                if (spokenSuccess) "Speaking ${targetLang.displayName} (HD)" else (skipNote ?: "Translated")
+                if (spokenSuccess) "Speaking ${targetLang.displayName} ($speakerTag → ${assignedVoice.name})" else skipNote
             )
         }
 
@@ -399,42 +223,35 @@ class OcrTranslationPipeline private constructor(context: Context) {
     }
 
     /**
-     * Speaks [hindiText] using Android's [TextToSpeech] with `KEY_FEATURE_NETWORK_SYNTHESIS = "true"`
-     * enabled so Google TTS synthesizes natural, non-robotic neural speech.
+     * Speaks [hindiText] using [ForegroundTtsManager] with the specified character's [voiceProfile]
+     * (or the default selected voice if null).
      */
-    fun speakHindiNonBlocking(hindiText: String, forceSpeakEvenIfRepeat: Boolean = false): Boolean {
+    fun speakHindiNonBlocking(
+        hindiText: String,
+        forceSpeakEvenIfRepeat: Boolean = false,
+        voiceProfile: VoiceProfile? = null
+    ): Boolean {
         if (hindiText.isBlank()) return false
         if (forceSpeakEvenIfRepeat) {
             lastSpokenText = hindiText.trim()
         }
-
-        val engine = tts
-        if (engine == null || !isTtsReady) {
-            pendingSpeechText = hindiText
-            if (engine == null) {
-                initializeTtsAsync()
-            }
-            return false
+        val activeProfile = voiceProfile ?: VoiceProfileRepository.voices.value.find {
+            it.id == VoiceProfileRepository.selectedVoiceId.value
         }
+        return ttsManager.speakNonBlocking(hindiText, voiceProfile = activeProfile)
+    }
 
-        val state = TranslatorStateRepository.state.value
-        return try {
-            engine.setPitch(state.ttsPitch)
-            engine.setSpeechRate(state.ttsSpeechRate)
-            val params = Bundle().apply {
-                putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
-                putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
-                if (state.useHighQualityNetworkVoice) {
-                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
-                }
-            }
-            val utteranceId = "gamevox_${UUID.randomUUID()}"
-            val result = engine.speak(hindiText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-            result == TextToSpeech.SUCCESS
-        } catch (e: Exception) {
-            Log.w(TAG, "Error speaking Hindi text", e)
-            false
+    /**
+     * Plays a preview of [voiceProfile] in the active target language so the user can hear
+     * its cloned pitch, speech rate, and timbre from the Voice List UI.
+     */
+    fun previewVoiceProfile(voiceProfile: VoiceProfile) {
+        val lang = TranslatorStateRepository.state.value.targetLanguage
+        val previewLine = when (lang.code) {
+            "hi" -> "नमस्ते! यह ${voiceProfile.name} की आवाज़ है। गेम के डायलॉग इसी आवाज़ में बोले जाएंगे।"
+            else -> lang.sampleGreeting
         }
+        ttsManager.speakNonBlocking(previewLine, voiceProfile = voiceProfile)
     }
 
     fun resetAntiRepeatMemory() {
@@ -443,22 +260,14 @@ class OcrTranslationPipeline private constructor(context: Context) {
         TranslatorStateRepository.clearLastSpokenMemory()
     }
 
-    fun promptInstallHindiTtsData(context: Context) {
-        try {
-            val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(installIntent)
-        } catch (e: ActivityNotFoundException) {
-            try {
-                val settingsIntent = Intent("com.android.settings.TTS_SETTINGS").apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(settingsIntent)
-            } catch (ex: Exception) {
-                Log.w(TAG, "Unable to launch TTS installation or settings intent", ex)
-            }
-        }
+    /**
+     * Triggers an asynchronous language data download and warm-up via [ForegroundTtsManager].
+     */
+    fun promptInstallHindiTtsData(context: Context, openSystemInstaller: Boolean = true) {
+        ttsManager.requestAsyncLanguageDataDownload(
+            context = context,
+            openSystemInstaller = openSystemInstaller
+        )
     }
 
     private fun cleanExtractedSubtitle(rawText: String): String {

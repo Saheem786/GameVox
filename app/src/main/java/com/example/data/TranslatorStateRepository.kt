@@ -114,9 +114,10 @@ enum class TargetLanguage(
 
 enum class TtsEngineStatus(val label: String) {
     INITIALIZING("Initializing High-Quality TTS..."),
+    DOWNLOADING_VOICE_DATA("Downloading Voice Pack Async..."),
     READY("HD Network Voice Ready"),
     FALLBACK_VOICE_READY("TTS Ready (Standard Voice)"),
-    MISSING_HINDI_DATA("Voice Data Missing"),
+    MISSING_HINDI_DATA("Voice Data Missing — Tap to Download"),
     ERROR("TTS Engine Unavailable")
 }
 
@@ -148,6 +149,8 @@ data class TranslatorAppState(
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val useHighQualityNetworkVoice: Boolean = true,
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
+    val availableVoicesCount: Int = 0,
+    val voiceDownloadMessage: String = "HD Network Synthesis Active",
     val ttsPitch: Float = 0.95f,
     val ttsSpeechRate: Float = 0.95f,
     val invertColorsEnabled: Boolean = true,
@@ -227,6 +230,20 @@ object TranslatorStateRepository {
 
     fun setActiveVoiceName(voiceName: String) {
         _state.update { it.copy(activeVoiceName = voiceName) }
+    }
+
+    fun updateVoiceTelemetry(
+        activeVoiceName: String,
+        availableVoicesCount: Int,
+        voiceDownloadMessage: String
+    ) {
+        _state.update {
+            it.copy(
+                activeVoiceName = activeVoiceName,
+                availableVoicesCount = availableVoicesCount,
+                voiceDownloadMessage = voiceDownloadMessage
+            )
+        }
     }
 
     fun updateShowTargetBoxOverlay(context: Context, show: Boolean) {

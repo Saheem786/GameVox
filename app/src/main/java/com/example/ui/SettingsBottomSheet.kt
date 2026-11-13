@@ -271,6 +271,11 @@ fun SettingsBottomSheet(
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = ElectricCyan
                                 )
+                                Text(
+                                    text = state.voiceDownloadMessage,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
 

@@ -60,6 +60,8 @@ class ScreenTranslatorService : Service() {
         const val ACTION_TOGGLE_SCANNING = "com.example.action.TOGGLE_SCANNING"
         const val ACTION_TOGGLE_TARGET_BOX = "com.example.action.TOGGLE_TARGET_BOX"
         const val ACTION_PROCESS_SIMULATED_FRAME = "com.example.action.PROCESS_SIMULATED_FRAME"
+        const val ACTION_INIT_TTS = "com.example.action.INIT_TTS"
+        const val ACTION_DOWNLOAD_VOICE_DATA = "com.example.action.DOWNLOAD_VOICE_DATA"
         const val ACTION_TEST_TTS = "com.example.action.TEST_TTS"
         const val ACTION_REFRESH_TTS = "com.example.action.REFRESH_TTS"
         const val ACTION_STOP_SERVICE = "com.example.action.STOP_SERVICE"
@@ -68,12 +70,14 @@ class ScreenTranslatorService : Service() {
         const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_SIMULATED_SPEAKER = "extra_simulated_speaker"
         const val EXTRA_SIMULATED_SUBTITLE = "extra_simulated_subtitle"
+        const val EXTRA_OPEN_SYSTEM_TTS_INSTALLER = "extra_open_system_tts_installer"
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var captureLoopJob: Job? = null
 
     private lateinit var pipeline: OcrTranslationPipeline
+    private lateinit var ttsManager: ForegroundTtsManager
     private var overlayController: FloatingOverlayController? = null
 
     private var mediaProjectionManager: MediaProjectionManager? = null
@@ -104,32 +108,88 @@ class ScreenTranslatorService : Service() {
         }
     }
 
+    private val serviceVoiceDataListener = object : ForegroundTtsManager.VoiceDataDownloadListener {
+        override fun onHighQualityNetworkVoiceAvailable(
+            language: com.example.data.TargetLanguage,
+            voiceName: String,
+            quality: Int
+        ) {
+            Log.i(TAG, "High-quality network voice ready for ${language.displayName}: $voiceName (quality=$quality)")
+            updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+        }
+
+        override fun onVoiceDataMissing(
+            language: com.example.data.TargetLanguage,
+            missingVoiceNames: List<String>,
+            reason: String
+        ) {
+            Log.w(TAG, "Voice data missing for ${language.displayName}: $reason (missing=$missingVoiceNames)")
+            updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+            // Start background async download watcher automatically
+            ttsManager.startAsyncLanguageDataDownloadWatcher(
+                targetLang = language,
+                speakConfirmationWhenReady = false
+            )
+        }
+
+        override fun onVoiceDataDownloadStarted(language: com.example.data.TargetLanguage) {
+            Log.i(TAG, "Asynchronous voice data download started for ${language.displayName}")
+            updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+        }
+
+        override fun onVoiceDataInstalled(
+            language: com.example.data.TargetLanguage,
+            installedVoiceName: String
+        ) {
+            Log.i(TAG, "Voice data installed for ${language.displayName}: $installedVoiceName")
+            updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         TranslatorStateRepository.loadPreferences(applicationContext)
         createNotificationChannel()
         computeCaptureMetrics()
 
+        // Initialize ForegroundTtsManager inside the Foreground Service for High-Quality Network Voices
+        // and Asynchronous Language Data Downloads
+        ttsManager = ForegroundTtsManager.getInstance(applicationContext)
+        ttsManager.addVoiceDataDownloadListener(serviceVoiceDataListener)
+        ttsManager.registerTtsDataBroadcastReceiver()
+        ttsManager.initializeAsync()
+
         pipeline = OcrTranslationPipeline.getInstance(applicationContext)
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         overlayController = FloatingOverlayController(
             context = applicationContext,
-            onSingleTapToggleCapture = { handleToggleCapture() },
+            onBoxVisibilityToggled = { visible ->
+                handleBoxesVisibilityToggled(visible)
+            },
             onTestHindiSpeech = {
                 val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
                 pipeline.speakHindiNonBlocking(greeting, forceSpeakEvenIfRepeat = true)
             },
             onInstallHindiVoiceData = {
-                pipeline.promptInstallHindiTtsData(applicationContext)
+                ttsManager.requestAsyncLanguageDataDownload(
+                    context = applicationContext,
+                    openSystemInstaller = true
+                )
             },
             onRefreshTtsCheck = {
-                pipeline.refreshTtsConfiguration()
+                ttsManager.refreshVoiceConfiguration()
             },
             onStopServiceRequested = {
                 stopTranslatorServiceCleanly()
             }
         )
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        computeCaptureMetrics()
+        overlayController?.onScreenOrientationChanged()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -142,29 +202,39 @@ class ScreenTranslatorService : Service() {
             }
 
             ACTION_TOGGLE_SCANNING -> {
-                handleToggleCapture()
+                overlayController?.toggleBoxesVisibilityOnDoubleTap()
                 return START_STICKY
             }
 
             ACTION_TOGGLE_TARGET_BOX -> {
                 val showBox = TranslatorStateRepository.state.value.showTargetBoxOverlay
-                if (showBox) {
-                    overlayController?.showDraggableTargetBox()
-                } else {
-                    overlayController?.hideDraggableTargetBox()
-                }
+                overlayController?.setBoxesVisibility(showBox, notifyCallback = true)
+                return START_STICKY
+            }
+
+            ACTION_INIT_TTS -> {
+                ttsManager.initializeAsync(forceRebind = true)
+                return START_STICKY
+            }
+
+            ACTION_DOWNLOAD_VOICE_DATA -> {
+                val openInstaller = intent?.getBooleanExtra(EXTRA_OPEN_SYSTEM_TTS_INSTALLER, true) ?: true
+                ttsManager.requestAsyncLanguageDataDownload(
+                    context = applicationContext,
+                    openSystemInstaller = openInstaller
+                )
                 return START_STICKY
             }
 
             ACTION_TEST_TTS -> {
-                pipeline.refreshTtsConfiguration()
+                ttsManager.refreshVoiceConfiguration()
                 val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
                 pipeline.speakHindiNonBlocking(greeting, forceSpeakEvenIfRepeat = true)
                 return START_STICKY
             }
 
             ACTION_REFRESH_TTS -> {
-                pipeline.refreshTtsConfiguration()
+                ttsManager.refreshVoiceConfiguration()
                 return START_STICKY
             }
 
@@ -199,37 +269,37 @@ class ScreenTranslatorService : Service() {
                     intent?.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
 
+                TranslatorStateRepository.updateShowTargetBoxOverlay(applicationContext, true)
                 overlayController?.showFloatingOverlay()
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
                     setupMediaProjection(resultCode, resultData)
                     TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = false)
-                    TranslatorStateRepository.setCapturingOcr(true)
-                    overlayController?.updateScanningState(true)
-                    startCaptureLoop()
+                    handleBoxesVisibilityToggled(true)
                 } else {
                     TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = true)
+                    handleBoxesVisibilityToggled(true)
                 }
             }
 
             ACTION_START_DEMO_OVERLAY -> {
-                promoteToForeground(isScanning = false, withMediaProjectionType = false)
+                val initialVisible = TranslatorStateRepository.state.value.showTargetBoxOverlay
+                promoteToForeground(isScanning = initialVisible, withMediaProjectionType = false)
                 overlayController?.showFloatingOverlay()
                 TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = true)
-                TranslatorStateRepository.setCapturingOcr(false)
-                overlayController?.updateScanningState(false)
+                handleBoxesVisibilityToggled(initialVisible)
             }
         }
 
         return START_STICKY
     }
 
-    private fun handleToggleCapture() {
-        val nowScanning = TranslatorStateRepository.toggleCapturingOcr()
-        overlayController?.updateScanningState(nowScanning)
-        updateNotification(nowScanning)
+    private fun handleBoxesVisibilityToggled(isVisible: Boolean) {
+        TranslatorStateRepository.setCapturingOcr(isVisible)
+        overlayController?.updateScanningState(isVisible)
+        updateNotification(isVisible)
 
-        if (nowScanning) {
+        if (isVisible) {
             pipeline.resetAntiRepeatMemory()
             startCaptureLoop()
         } else {
@@ -267,12 +337,14 @@ class ScreenTranslatorService : Service() {
                             ?: a11yService?.captureScreenBitmapViaAccessibility()
 
                         if (capturedBitmap != null) {
+                            val (liveW, liveH) = overlayController?.getLiveScreenSize()
+                                ?: (rawScreenWidth to rawScreenHeight)
                             pipeline.processCapturedFrame(
                                 rawBitmap = capturedBitmap,
                                 excludeOverlayRect = overlayRect,
                                 targetRegionScreenRect = targetBoxRect,
-                                rawScreenWidth = rawScreenWidth,
-                                rawScreenHeight = rawScreenHeight,
+                                rawScreenWidth = liveW,
+                                rawScreenHeight = liveH,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
@@ -531,6 +603,9 @@ class ScreenTranslatorService : Service() {
 
     override fun onDestroy() {
         stopCaptureLoop()
+        if (::ttsManager.isInitialized) {
+            ttsManager.removeVoiceDataDownloadListener(serviceVoiceDataListener)
+        }
         overlayController?.destroyOverlay()
         teardownVirtualDisplay()
         try {

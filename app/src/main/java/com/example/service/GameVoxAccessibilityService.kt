@@ -68,17 +68,14 @@ class GameVoxAccessibilityService : AccessibilityService() {
                 pipeline.processExtractedRawText(extractedNodeText)
             }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val metrics = resources.displayMetrics
-            val rawW = metrics.widthPixels
-            val rawH = metrics.heightPixels
             a11yScope.launch {
                 val screenBitmap = captureScreenBitmapViaAccessibility()
                 if (screenBitmap != null) {
                     pipeline.processCapturedFrame(
                         rawBitmap = screenBitmap,
                         targetRegionScreenRect = targetBoxRect,
-                        rawScreenWidth = rawW,
-                        rawScreenHeight = rawH
+                        rawScreenWidth = screenBitmap.width,
+                        rawScreenHeight = screenBitmap.height
                     )
                 }
             }
