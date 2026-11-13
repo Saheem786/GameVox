@@ -145,6 +145,8 @@ data class TranslatorAppState(
     val isOverlayDemoActive: Boolean = false,
     val isCapturingOcr: Boolean = false,
     val showTargetBoxOverlay: Boolean = true,
+    val isSubtitleVisible: Boolean = true,
+    val isVoiceMuted: Boolean = false,
     val targetBoxScreenRect: Rect? = null,
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val useHighQualityNetworkVoice: Boolean = true,
@@ -173,6 +175,7 @@ object TranslatorStateRepository {
     private const val KEY_TARGET_LANG = "target_lang_code"
     private const val KEY_NETWORK_VOICE = "use_hq_network_voice"
     private const val KEY_SHOW_SCAN_BOX = "show_target_box_overlay"
+    private const val KEY_VOICE_MUTED = "is_voice_muted_v1"
     private const val KEY_PITCH = "tts_pitch_v2"
     private const val KEY_RATE = "tts_speech_rate_v2"
     private const val KEY_INVERT = "invert_colors_enabled"
@@ -190,6 +193,7 @@ object TranslatorStateRepository {
         val targetLang = TargetLanguage.fromCode(langCode)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
+        val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
         val pitch = prefs.getFloat(KEY_PITCH, 0.95f).coerceIn(0.4f, 1.8f)
         val rate = prefs.getFloat(KEY_RATE, 0.95f).coerceIn(0.4f, 1.8f)
         val invert = prefs.getBoolean(KEY_INVERT, true)
@@ -199,6 +203,8 @@ object TranslatorStateRepository {
                 targetLanguage = targetLang,
                 useHighQualityNetworkVoice = useHqVoice,
                 showTargetBoxOverlay = showScanBox,
+                isSubtitleVisible = showScanBox,
+                isVoiceMuted = voiceMuted,
                 ttsPitch = pitch,
                 ttsSpeechRate = rate,
                 invertColorsEnabled = invert,
@@ -251,7 +257,55 @@ object TranslatorStateRepository {
             .edit()
             .putBoolean(KEY_SHOW_SCAN_BOX, show)
             .apply()
-        _state.update { it.copy(showTargetBoxOverlay = show) }
+        _state.update {
+            it.copy(
+                showTargetBoxOverlay = show,
+                isSubtitleVisible = show
+            )
+        }
+    }
+
+    /**
+     * Toggles ONLY the Voice (TTS Mute/Unmute) state on Single Tap (`onTap`).
+     * Does NOT affect [isSubtitleVisible] or OCR scanning!
+     */
+    fun toggleVoiceMuted(context: Context): Boolean {
+        val newMuted = !_state.value.isVoiceMuted
+        setVoiceMuted(context, newMuted)
+        return newMuted
+    }
+
+    fun setVoiceMuted(context: Context, muted: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_VOICE_MUTED, muted)
+            .apply()
+        _state.update { it.copy(isVoiceMuted = muted) }
+    }
+
+    /**
+     * Toggles ONLY the Subtitle/Translation Box & Scan Box visibility (`isSubtitleVisible`)
+     * and pauses/resumes OCR scanning on Double Tap (`onDoubleTap`).
+     * Does NOT affect [isVoiceMuted]!
+     */
+    fun toggleSubtitleVisible(context: Context): Boolean {
+        val newVisible = !_state.value.isSubtitleVisible
+        setSubtitleVisible(context, newVisible)
+        return newVisible
+    }
+
+    fun setSubtitleVisible(context: Context, visible: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SHOW_SCAN_BOX, visible)
+            .apply()
+        _state.update {
+            it.copy(
+                isSubtitleVisible = visible,
+                showTargetBoxOverlay = visible,
+                isCapturingOcr = if (!visible) false else true
+            )
+        }
     }
 
     fun updateTargetBoxScreenRect(rect: Rect?) {

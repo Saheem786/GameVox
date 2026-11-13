@@ -167,6 +167,17 @@ class ScreenTranslatorService : Service() {
             onBoxVisibilityToggled = { visible ->
                 handleBoxesVisibilityToggled(visible)
             },
+            onVoiceMuteToggled = { muted ->
+                if (muted) {
+                    ttsManager.stopSpeaking()
+                } else {
+                    val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
+                    if (latestHindi.isNotBlank() && latestHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
+                        pipeline.speakHindiNonBlocking(latestHindi, forceSpeakEvenIfRepeat = true)
+                    }
+                }
+                updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+            },
             onTestHindiSpeech = {
                 val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
                 pipeline.speakHindiNonBlocking(greeting, forceSpeakEvenIfRepeat = true)
@@ -311,6 +322,12 @@ class ScreenTranslatorService : Service() {
         captureLoopJob?.cancel()
         captureLoopJob = serviceScope.launch {
             while (isActive && TranslatorStateRepository.state.value.isCapturingOcr) {
+                // Wait until the current utterance finishes speaking completely before triggering a new scan
+                if (pipeline.isTtsSpeakingNow()) {
+                    delay(400L)
+                    continue
+                }
+
                 val intervalMs = TranslatorStateRepository.state.value.captureIntervalMs
                 try {
                     val a11yService = GameVoxAccessibilityService.instance
@@ -351,8 +368,9 @@ class ScreenTranslatorService : Service() {
                             )
                         } else {
                             // Priority 3: Interactive Game Subtitle Simulator fallback
+                            // Keep the active simulated subtitle stable so it speaks once in full,
+                            // waits 30 seconds after onDone(), and only repeats after 30 seconds if still on screen.
                             val (speaker, line) = builtInGameDialogues[simulatedPresetIndex % builtInGameDialogues.size]
-                            simulatedPresetIndex++
                             val simBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, line)
                             pipeline.processCapturedFrame(
                                 rawBitmap = simBitmap,
@@ -365,7 +383,7 @@ class ScreenTranslatorService : Service() {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Error in 2-second screen capture OCR loop", e)
+                    Log.w(TAG, "Error in screen capture OCR loop", e)
                 }
                 delay(intervalMs)
             }

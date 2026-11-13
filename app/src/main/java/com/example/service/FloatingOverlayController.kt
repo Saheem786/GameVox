@@ -63,6 +63,7 @@ import kotlin.math.abs
 class FloatingOverlayController(
     private val context: Context,
     private val onBoxVisibilityToggled: (Boolean) -> Unit,
+    private val onVoiceMuteToggled: (Boolean) -> Unit = {},
     private val onTestHindiSpeech: () -> Unit,
     private val onInstallHindiVoiceData: () -> Unit,
     private val onRefreshTtsCheck: () -> Unit,
@@ -98,9 +99,17 @@ class FloatingOverlayController(
     private var translationBoxParams: WindowManager.LayoutParams? = null
     private var latestHindiOnlyText: String = ""
 
-    // Boolean state toggled via GestureDetector.onDoubleTap()
+    // Boolean state toggled via Double Tap (onDoubleTap) — controls ONLY Subtitle/Scan Box visibility & OCR scanning
     @Volatile
     var isBoxVisible: Boolean = true
+        private set
+
+    val isSubtitleVisible: Boolean
+        get() = isBoxVisible
+
+    // Boolean state toggled via Single Tap (onSingleTapConfirmed) — controls ONLY Voice (TTS Mute/Unmute)
+    @Volatile
+    var isVoiceMuted: Boolean = false
         private set
 
     // 4. Guarded Settings Sheet
@@ -212,9 +221,30 @@ class FloatingOverlayController(
     }
 
     /**
-     * Toggles [isBoxVisible] on Double Tap of the floating icon:
-     * - When `true`: adds the Scan Box and Hindi-Only Translation Box via `WindowManager.addView()`.
-     * - When `false`: removes both views via `WindowManager.removeView()`.
+     * Toggles ONLY [isVoiceMuted] on Single Tap of the floating icon:
+     * - When `true`: mutes/pauses TTS voice output immediately while keeping Subtitle Box & OCR scanning active.
+     * - When `false`: unmutes/resumes TTS voice output.
+     */
+    fun toggleVoiceMuteOnSingleTap() {
+        setVoiceMutedState(!isVoiceMuted, notifyCallback = true)
+    }
+
+    fun setVoiceMutedState(muted: Boolean, notifyCallback: Boolean = false) {
+        mainHandler.post {
+            isVoiceMuted = muted
+            TranslatorStateRepository.setVoiceMuted(context, muted)
+            updateFloatingIconAppearance(isBoxVisible)
+            if (notifyCallback) {
+                onVoiceMuteToggled(muted)
+            }
+        }
+    }
+
+    /**
+     * Toggles ONLY [isBoxVisible] / [isSubtitleVisible] on Double Tap of the floating icon:
+     * - When `true`: shows the Subtitle/Translation Box and Scan Box via `WindowManager.addView()` and resumes scanning.
+     * - When `false`: hides both views via `WindowManager.removeView()` and pauses scanning.
+     * - Does NOT affect [isVoiceMuted] (Voice ON/OFF state remains unchanged).
      */
     fun toggleBoxesVisibilityOnDoubleTap() {
         setBoxesVisibility(!isBoxVisible, notifyCallback = true)
@@ -223,7 +253,7 @@ class FloatingOverlayController(
     fun setBoxesVisibility(visible: Boolean, notifyCallback: Boolean = false) {
         mainHandler.post {
             isBoxVisible = visible
-            TranslatorStateRepository.updateShowTargetBoxOverlay(context, visible)
+            TranslatorStateRepository.setSubtitleVisible(context, visible)
             if (visible) {
                 showDraggableTargetBox()
                 showHindiTranslationBox()
@@ -299,7 +329,8 @@ class FloatingOverlayController(
     @SuppressLint("ClickableViewAccessibility", "RtlHardcoded")
     fun showFloatingOverlay(): Boolean {
         if (!Settings.canDrawOverlays(context)) return false
-        isBoxVisible = TranslatorStateRepository.state.value.showTargetBoxOverlay
+        isBoxVisible = TranslatorStateRepository.state.value.isSubtitleVisible
+        isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
 
         if (rootOverlayView != null) {
             if (isBoxVisible) {
@@ -309,6 +340,7 @@ class FloatingOverlayController(
                 hideDraggableTargetBox()
                 hideHindiTranslationBox()
             }
+            updateFloatingIconAppearance(isBoxVisible)
             return true
         }
 
@@ -343,7 +375,7 @@ class FloatingOverlayController(
 
         val currentLang = TranslatorStateRepository.state.value.targetLanguage
         val glyphText = TextView(context).apply {
-            text = currentLang.glyphBadge
+            text = if (isVoiceMuted) "🔇" else currentLang.glyphBadge
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -365,7 +397,11 @@ class FloatingOverlayController(
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(
-                    if (isBoxVisible) Color.parseColor("#00E676") else Color.parseColor("#FFB300")
+                    when {
+                        isVoiceMuted -> Color.parseColor("#FF5252")
+                        isBoxVisible -> Color.parseColor("#00E676")
+                        else -> Color.parseColor("#FFB300")
+                    }
                 )
                 setStroke(dpToPx(2), Color.parseColor("#090D16"))
             }
@@ -385,11 +421,17 @@ class FloatingOverlayController(
                 override fun onDown(e: MotionEvent): Boolean = true
 
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    // Single tap intentionally does nothing
+                    // Single Tap: ONLY toggles Voice (TTS Mute/Unmute). Does NOT stop translation or hide Subtitle Box!
+                    if (!isDragging) {
+                        bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        toggleVoiceMuteOnSingleTap()
+                    }
                     return true
                 }
 
                 override fun onDoubleTap(e: MotionEvent): Boolean {
+                    // Double Tap: ONLY hides/shows Subtitle Box & Scan Box and pauses/resumes scanning.
+                    // Does NOT affect Voice (isVoiceMuted)!
                     if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                         toggleBoxesVisibilityOnDoubleTap()
@@ -822,13 +864,19 @@ class FloatingOverlayController(
     }
 
     private fun updateFloatingIconAppearance(isActive: Boolean) {
-        val lang = TranslatorStateRepository.state.value.targetLanguage
+        val state = TranslatorStateRepository.state.value
+        val lang = state.targetLanguage
+        isVoiceMuted = state.isVoiceMuted
         circularBubbleView?.background = createBubbleDrawable(isActive)
-        bubbleLabelView?.text = lang.glyphBadge
+        bubbleLabelView?.text = if (isVoiceMuted) "🔇" else lang.glyphBadge
         bubbleStatusDot?.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(
-                if (isActive) Color.parseColor("#00E676") else Color.parseColor("#FFB300")
+                when {
+                    isVoiceMuted -> Color.parseColor("#FF5252")
+                    isActive -> Color.parseColor("#00E676")
+                    else -> Color.parseColor("#FFB300")
+                }
             )
             setStroke(dpToPx(2), Color.parseColor("#090D16"))
         }

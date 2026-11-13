@@ -44,12 +44,21 @@ class OcrTranslationPipeline private constructor(context: Context) {
     }
 
     val ttsManager: ForegroundTtsManager by lazy {
-        ForegroundTtsManager.getInstance(appContext)
+        ForegroundTtsManager.getInstance(appContext).also { manager ->
+            manager.onThirtySecondPostSpeechDelayCompleted = {
+                // 30 seconds after UtteranceProgressListener.onDone() finished speaking the full sentence,
+                // clear lastSpokenText so if the same text is still on the screen, the next scan speaks it again.
+                lastSpokenText = ""
+                lastExtractedNormalized = ""
+            }
+        }
     }
 
     /**
      * Anti-Repeat state variable:
-     * If the newly translated Hindi text is identical to [lastSpokenText], skip speaking it again.
+     * Holds the last spoken text while TTS is speaking and during the 30-second post-speech wait window
+     * after `UtteranceProgressListener.onDone()`. If scanned text matches [lastSpokenText], it is not
+     * spoken again until the 30-second post-speech delay expires.
      */
     @Volatile
     var lastSpokenText: String = ""
@@ -64,6 +73,14 @@ class OcrTranslationPipeline private constructor(context: Context) {
         VoiceProfileRepository.initialize(appContext)
         initializeTtsAsync()
         ensureTranslationModelDownloaded()
+    }
+
+    /**
+     * Returns true if the TTS engine is currently speaking an utterance.
+     * Used by the background scan loops so no new scan is triggered until the current text finishes speaking.
+     */
+    fun isTtsSpeakingNow(): Boolean {
+        return ttsManager.isSpeakingNow()
     }
 
     /**
@@ -157,10 +174,11 @@ class OcrTranslationPipeline private constructor(context: Context) {
         val elapsedMs = System.currentTimeMillis() - startTime
         val timestamp = timeFormatter.format(Date())
 
-        val normalizedTranslated = translatedText.trim()
-        val normalizedEnglish = extractedEnglish.trim().lowercase(Locale.ROOT)
+        val normalizedTranslated = normalizeForComparison(translatedText)
+        val normalizedLastSpoken = normalizeForComparison(lastSpokenText)
+        val normalizedEnglish = normalizeForComparison(extractedEnglish)
 
-        val isRepeat = (normalizedTranslated.isNotEmpty() && normalizedTranslated == lastSpokenText) ||
+        val isRepeat = (normalizedTranslated.isNotEmpty() && normalizedTranslated == normalizedLastSpoken) ||
             (normalizedEnglish.isNotEmpty() && normalizedEnglish == lastExtractedNormalized && lastSpokenText.isNotEmpty())
 
         if (isRepeat) {
@@ -168,7 +186,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 english = extractedEnglish,
                 hindi = translatedText,
                 wasSpoken = false,
-                skippedReason = "Anti-Repeat: Identical to lastSpokenText",
+                skippedReason = "Anti-Repeat: Waiting 30s after onDone() before repeating same text",
                 processingTimeMs = elapsedMs,
                 timestamp = timestamp
             )
@@ -176,25 +194,30 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 onDebugTextUpdate?.invoke(
                     extractedEnglish,
                     translatedText,
-                    "Skipped (Anti-Repeat)"
+                    "Skipped (30s Anti-Repeat Window)"
                 )
             }
             return extractedEnglish to translatedText
         }
 
-        lastSpokenText = normalizedTranslated
+        lastSpokenText = translatedText.trim()
         lastExtractedNormalized = normalizedEnglish
 
-        val spokenSuccess = speakHindiNonBlocking(
-            hindiText = translatedText,
-            forceSpeakEvenIfRepeat = false,
-            voiceProfile = assignedVoice
-        )
-        val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
-        val skipNote = if (spokenSuccess) {
-            "$speakerTag → ${assignedVoice.name}"
+        val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
+        val spokenSuccess = if (isVoiceMuted) {
+            false
         } else {
-            "TTS Queued / Downloading Voice Async"
+            speakHindiNonBlocking(
+                hindiText = translatedText,
+                forceSpeakEvenIfRepeat = false,
+                voiceProfile = assignedVoice
+            )
+        }
+        val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
+        val skipNote = when {
+            isVoiceMuted -> "Voice Muted (Single-Tap Icon to Unmute) • $speakerTag"
+            spokenSuccess -> "$speakerTag → ${assignedVoice.name}"
+            else -> "TTS Queued / Downloading Voice Async"
         }
 
         TranslatorStateRepository.recordTranslationResult(
@@ -217,6 +240,24 @@ class OcrTranslationPipeline private constructor(context: Context) {
         return extractedEnglish to translatedText
     }
 
+    /**
+     * Toggles ONLY the Voice (TTS Mute/Unmute) state when the user Single-Taps the Floating Icon:
+     * - When muted (`true`): immediately pauses/stops TTS output while keeping Subtitle translation & scanning active.
+     * - When unmuted (`false`): resumes TTS voice and speaks the current subtitle if one is on screen.
+     */
+    fun toggleVoiceMuteOnSingleTap(): Boolean {
+        val nowMuted = TranslatorStateRepository.toggleVoiceMuted(appContext)
+        if (nowMuted) {
+            ttsManager.stopSpeaking()
+        } else {
+            val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
+            if (latestHindi.isNotBlank() && latestHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
+                speakHindiNonBlocking(latestHindi, forceSpeakEvenIfRepeat = true)
+            }
+        }
+        return nowMuted
+    }
+
     suspend fun translateEnglishToHindi(englishText: String): String = withContext(Dispatchers.IO) {
         val targetLang = TranslatorStateRepository.state.value.targetLanguage
         HindiTranslationEngine.translate(englishText, targetLang)
@@ -232,9 +273,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
         voiceProfile: VoiceProfile? = null
     ): Boolean {
         if (hindiText.isBlank()) return false
-        if (forceSpeakEvenIfRepeat) {
-            lastSpokenText = hindiText.trim()
+        if (!forceSpeakEvenIfRepeat && TranslatorStateRepository.state.value.isVoiceMuted) {
+            return false
         }
+        lastSpokenText = hindiText.trim()
         val activeProfile = voiceProfile ?: VoiceProfileRepository.voices.value.find {
             it.id == VoiceProfileRepository.selectedVoiceId.value
         }
@@ -248,16 +290,25 @@ class OcrTranslationPipeline private constructor(context: Context) {
     fun previewVoiceProfile(voiceProfile: VoiceProfile) {
         val lang = TranslatorStateRepository.state.value.targetLanguage
         val previewLine = when (lang.code) {
-            "hi" -> "नमस्ते! यह ${voiceProfile.name} की आवाज़ है। गेम के डायलॉग इसी आवाज़ में बोले जाएंगे।"
+            "hi" -> "हे गेमर! यह ${voiceProfile.name} की आवाज़ है। गेम के डायलॉग इसी आवाज़ में बोले जाएंगे।"
             else -> lang.sampleGreeting
         }
         ttsManager.speakNonBlocking(previewLine, voiceProfile = voiceProfile)
     }
 
     fun resetAntiRepeatMemory() {
+        ttsManager.cancelThirtySecondRepeatTimer()
         lastSpokenText = ""
         lastExtractedNormalized = ""
         TranslatorStateRepository.clearLastSpokenMemory()
+    }
+
+    private fun normalizeForComparison(text: String): String {
+        return text
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^\\p{L}\\p{N}\\s]"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
     /**

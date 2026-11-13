@@ -112,6 +112,7 @@ import com.example.engine.OcrTranslationPipeline
 import com.example.service.ForegroundTtsManager
 import com.example.service.GameVoxAccessibilityService
 import com.example.service.ScreenTranslatorService
+import com.example.ui.FloatingIconGestureOverlayCard
 import com.example.ui.GAME_SCENE_PRESETS
 import com.example.ui.GameSimulatorSection
 import com.example.ui.SettingsBottomSheet
@@ -471,6 +472,56 @@ fun GameVoxHindiDashboard(
                     )
                 }
 
+                // 1.05. Jetpack Compose Floating Icon Tap Controls (`Modifier.pointerInput` + `detectTapGestures`)
+                // - Single Tap (`onTap`): Toggles ONLY `isVoiceMuted` (TTS Mute/Unmute)
+                // - Double Tap (`onDoubleTap`): Toggles ONLY `isSubtitleVisible` (Show/Hide Subtitle Box & Scan)
+                item {
+                    FloatingIconGestureOverlayCard(
+                        state = state,
+                        onSingleTapVoiceMuteChanged = { muted ->
+                            TranslatorStateRepository.setVoiceMuted(context, muted)
+                            if (muted) {
+                                localPipeline.ttsManager.stopSpeaking()
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("Voice Muted (Single Tap) — Subtitles still active")
+                                }
+                            } else {
+                                val currentHindi = state.lastTranslatedHindi
+                                if (currentHindi.isNotBlank() && currentHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
+                                    localPipeline.speakHindiNonBlocking(currentHindi, forceSpeakEvenIfRepeat = true)
+                                }
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("Voice Unmuted (Single Tap)")
+                                }
+                            }
+                        },
+                        onDoubleTapSubtitleVisibilityChanged = { visible ->
+                            TranslatorStateRepository.setSubtitleVisible(context, visible)
+                            if (state.isServiceRunning) {
+                                val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                                    action = ScreenTranslatorService.ACTION_TOGGLE_TARGET_BOX
+                                }
+                                context.startService(intent)
+                            }
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar(
+                                    if (visible) "Subtitle Box Shown & Scanning Resumed (Double Tap)"
+                                    else "Subtitle Box Hidden & Scanning Paused (Double Tap)"
+                                )
+                            }
+                        },
+                        onLongPressOpenSettings = {
+                            TranslatorStateRepository.setShowSettingsBottomSheet(true)
+                        },
+                        onTestCasualHindiTranslation = { sampleEng ->
+                            localPipeline.resetAntiRepeatMemory()
+                            coroutineScope.launch {
+                                localPipeline.processExtractedRawText(sampleEng)
+                            }
+                        }
+                    )
+                }
+
                 // 1a. Real-Time Canvas TTS Audio Visualizer (Synced with ForegroundTtsManager)
                 item {
                     TtsAudioVisualizerCard(
@@ -824,7 +875,7 @@ private fun HeroControlBanner(
                         color = Color.White
                     )
                     Text(
-                        text = "Double-Tap Floating Icon: Show/Hide Scan Box • Hold: Settings",
+                        text = "1-Tap Icon: Voice Mute/Unmute • 2-Tap: Show/Hide Subtitle Box",
                         style = MaterialTheme.typography.bodyMedium,
                         color = ElectricCyan
                     )

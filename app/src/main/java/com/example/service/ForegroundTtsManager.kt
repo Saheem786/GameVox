@@ -142,7 +142,21 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private var asyncDownloadWatcherJob: Job? = null
     private var visualizerSyncJob: Job? = null
+    private var thirtySecondRepeatDelayJob: Job? = null
     private var isReceiverRegistered: Boolean = false
+
+    @Volatile
+    var isSpeakingUtterance: Boolean = false
+        private set
+
+    @Volatile
+    private var activeUtteranceId: String? = null
+
+    /**
+     * Callback invoked 30 seconds (`delay(30000)`) after [UtteranceProgressListener.onDone]
+     * finishes speaking a full sentence/paragraph, allowing the same on-screen text to be spoken again.
+     */
+    var onThirtySecondPostSpeechDelayCompleted: ((completedUtteranceId: String) -> Unit)? = null
 
     private val _visualizerState = MutableStateFlow(TtsVisualizerState())
     val visualizerState: StateFlow<TtsVisualizerState> = _visualizerState.asStateFlow()
@@ -287,15 +301,43 @@ class ForegroundTtsManager private constructor(context: Context) {
     }
 
     /**
+     * Returns true if the TTS engine is currently speaking an utterance (`onStart` .. `onDone`),
+     * preventing background scan loops from interrupting ongoing speech mid-sentence.
+     */
+    fun isSpeakingNow(): Boolean {
+        val engineSpeaking = try {
+            tts?.isSpeaking == true
+        } catch (_: Exception) {
+            false
+        }
+        return isSpeakingUtterance || engineSpeaking
+    }
+
+    /**
+     * Cancels any active 30-second post-speech wait timer when genuinely new text arrives
+     * or when anti-repeat memory is manually reset.
+     */
+    fun cancelThirtySecondRepeatTimer() {
+        thirtySecondRepeatDelayJob?.cancel()
+        thirtySecondRepeatDelayJob = null
+    }
+
+    /**
      * Attaches an [UtteranceProgressListener] that:
      * 1. Synchronizes real-time TTS playback events (`onStart`, `onRangeStart`, `onAudioAvailable`,
      *    `onDone`, `onStop`, `onError`) with [visualizerState] for the Jetpack Compose Canvas Audio Visualizer.
-     * 2. Automatically retries using local synthesis if a network voice call times out or errors.
+     * 2. In [onDone], starts a 30-second coroutine (`delay(30000)`) only AFTER the complete sentence/paragraph
+     *    has finished speaking, then invokes [onThirtySecondPostSpeechDelayCompleted] so if the same text
+     *    remains on screen after 30 seconds, it will be spoken again.
+     * 3. Automatically retries using local synthesis if a network voice call fails.
      */
     private fun attachUtteranceProgressListener(engine: TextToSpeech) {
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 if (utteranceId == null || utteranceId == "warmup_async_voice_download") return
+                isSpeakingUtterance = true
+                activeUtteranceId = utteranceId
+                thirtySecondRepeatDelayJob?.cancel()
                 _visualizerState.update { current ->
                     current.copy(
                         isSpeaking = true,
@@ -306,6 +348,7 @@ class ForegroundTtsManager private constructor(context: Context) {
 
             override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
                 if (utteranceId == null || utteranceId == "warmup_async_voice_download") return
+                isSpeakingUtterance = true
                 _visualizerState.update { current ->
                     val len = current.spokenText.length.coerceAtLeast(1)
                     val safeStart = start.coerceIn(0, len)
@@ -341,15 +384,32 @@ class ForegroundTtsManager private constructor(context: Context) {
                         }
                         return
                     }
+                    if (activeUtteranceId == utteranceId) {
+                        isSpeakingUtterance = false
+                        activeUtteranceId = null
+                    }
                     if (_visualizerState.value.utteranceId == utteranceId) {
                         stopVisualizerSync()
+                    }
+                    // Start exact 30-second coroutine delay ONLY after full text speech finishes in onDone()
+                    thirtySecondRepeatDelayJob?.cancel()
+                    thirtySecondRepeatDelayJob = managerScope.launch {
+                        delay(30000L)
+                        onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
                     }
                 }
             }
 
             override fun onStop(utteranceId: String?, interrupted: Boolean) {
-                if (utteranceId != null && _visualizerState.value.utteranceId == utteranceId) {
-                    stopVisualizerSync()
+                if (utteranceId != null) {
+                    activeNetworkUtterances.remove(utteranceId)
+                    if (activeUtteranceId == utteranceId) {
+                        isSpeakingUtterance = false
+                        activeUtteranceId = null
+                    }
+                    if (_visualizerState.value.utteranceId == utteranceId) {
+                        stopVisualizerSync()
+                    }
                 }
             }
 
@@ -375,8 +435,14 @@ class ForegroundTtsManager private constructor(context: Context) {
                     allowNetworkSynthesis = false
                 )
             }
-        } else if (_visualizerState.value.utteranceId == utteranceId) {
-            stopVisualizerSync()
+        } else {
+            if (activeUtteranceId == utteranceId) {
+                isSpeakingUtterance = false
+                activeUtteranceId = null
+            }
+            if (_visualizerState.value.utteranceId == utteranceId) {
+                stopVisualizerSync()
+            }
         }
     }
 
@@ -868,7 +934,18 @@ class ForegroundTtsManager private constructor(context: Context) {
     ): Boolean {
         val engine = tts ?: return false
         val state = TranslatorStateRepository.state.value
+        // Normalize line breaks into single spaces so the entire sentence/paragraph is spoken in one uninterrupted utterance
+        val fullContinuousText = text
+            .replace(Regex("[\\r\\n]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (fullContinuousText.isEmpty()) return false
+
         return try {
+            // Cancel any pending 30-second repeat timer because a new utterance is starting now
+            thirtySecondRepeatDelayJob?.cancel()
+            thirtySecondRepeatDelayJob = null
+
             // If a specific character VoiceProfile is provided, select its distinct engine voice variant if available
             if (voiceProfile != null) {
                 selectIndexedVoiceForProfile(engine, state.targetLanguage, voiceProfile.engineVoiceIndex, allowNetworkSynthesis)
@@ -885,25 +962,33 @@ class ForegroundTtsManager private constructor(context: Context) {
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
                 if (allowNetworkSynthesis) {
                     putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
-                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_TIMEOUT_MS, "3500")
-                    activeNetworkUtterances[utteranceId] = text
+                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_TIMEOUT_MS, "12000")
+                    activeNetworkUtterances[utteranceId] = fullContinuousText
                 } else {
                     putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "false")
                 }
             }
 
-            val result = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+            isSpeakingUtterance = true
+            activeUtteranceId = utteranceId
+
+            // Flush any previous audio (QUEUE_FLUSH) and speak the full new text in one complete pass
+            val result = engine.speak(fullContinuousText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
                 activeNetworkUtterances.remove(utteranceId)
+                isSpeakingUtterance = false
+                activeUtteranceId = null
             } else {
                 startRealtimeVisualizerSync(
                     utteranceId = utteranceId,
-                    text = text,
+                    text = fullContinuousText,
                     voiceProfile = voiceProfile
                 )
             }
             result == TextToSpeech.SUCCESS
         } catch (e: Exception) {
+            isSpeakingUtterance = false
+            activeUtteranceId = null
             Log.w(TAG, "Error speaking text via ForegroundTtsManager", e)
             false
         }
@@ -946,10 +1031,10 @@ class ForegroundTtsManager private constructor(context: Context) {
         visualizerSyncJob = managerScope.launch {
             val cleanText = text.trim()
             val words = cleanText.split(Regex("\\s+")).filter { it.isNotEmpty() }
-            // Estimate natural speaking duration in ms (~68ms per char scaled by speechRate, min 1800ms)
+            // Estimate natural speaking duration in ms (~68ms per char scaled by speechRate, min 1800ms, max 30000ms for full paragraphs)
             val estimatedDurationMs = ((cleanText.length.coerceAtLeast(12) * 68f) / activeRate.coerceAtLeast(0.55f))
                 .toLong()
-                .coerceIn(1800L, 14000L)
+                .coerceIn(1800L, 30000L)
 
             val startMs = System.currentTimeMillis()
             var frameIndex = 0
@@ -1026,6 +1111,16 @@ class ForegroundTtsManager private constructor(context: Context) {
                 }
             }
 
+            if (activeUtteranceId == utteranceId) {
+                isSpeakingUtterance = false
+                activeUtteranceId = null
+                if (thirtySecondRepeatDelayJob?.isActive != true) {
+                    thirtySecondRepeatDelayJob = managerScope.launch {
+                        delay(30000L)
+                        onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
+                    }
+                }
+            }
             stopVisualizerSync()
         }
     }
@@ -1091,7 +1186,9 @@ class ForegroundTtsManager private constructor(context: Context) {
             )
             if (installedForLang.isNotEmpty()) {
                 val chosen = installedForLang[voiceIndex.coerceAtLeast(0) % installedForLang.size]
-                engine.voice = chosen
+                if (engine.voice?.name != chosen.name) {
+                    engine.voice = chosen
+                }
             }
         } catch (_: Exception) {
         }
@@ -1106,6 +1203,10 @@ class ForegroundTtsManager private constructor(context: Context) {
     }
 
     fun stopSpeaking() {
+        thirtySecondRepeatDelayJob?.cancel()
+        thirtySecondRepeatDelayJob = null
+        isSpeakingUtterance = false
+        activeUtteranceId = null
         try {
             tts?.stop()
         } catch (_: Exception) {

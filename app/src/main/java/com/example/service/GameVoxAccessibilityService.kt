@@ -53,6 +53,7 @@ class GameVoxAccessibilityService : AccessibilityService() {
         if (event == null) return
         val state = TranslatorStateRepository.state.value
         if (!state.isCapturingOcr) return
+        if (::pipeline.isInitialized && pipeline.isTtsSpeakingNow()) return
 
         val eventPkg = event.packageName?.toString().orEmpty()
         if (eventPkg == packageName) return
