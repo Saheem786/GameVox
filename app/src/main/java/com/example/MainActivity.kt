@@ -740,6 +740,13 @@ fun GameVoxHindiDashboard(
                 TranslatorStateRepository.updateUseHighQualityNetworkVoice(context, enabled)
                 localPipeline.refreshTtsConfiguration()
             },
+            onSsmlEnabledChange = { enabled ->
+                TranslatorStateRepository.updateSsmlEnabledOnDevice(context, enabled)
+            },
+            onCloudTtsProviderChange = { provider ->
+                TranslatorStateRepository.updateCloudTtsProvider(context, provider)
+                localPipeline.ttsManager.stopSpeaking()
+            },
             onShowTargetBoxChange = { showBox ->
                 TranslatorStateRepository.updateShowTargetBoxOverlay(context, showBox)
                 if (state.isServiceRunning) {

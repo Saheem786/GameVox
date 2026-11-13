@@ -364,7 +364,7 @@ fun FloatingIconGestureOverlayCard(
                 }
             }
 
-            // Quick Character Name & Gender Voice Switch Test Row (Jenny = 18yo Girl Voice, Anon = 18yo Boy Voice)
+            // Quick Character Name, Gender & Emotion SSML Test Row (Jenny = 18yo Girl, Anon = 18yo Boy)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -373,12 +373,24 @@ fun FloatingIconGestureOverlayCard(
                     .padding(10.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(
-                    text = "Smart Name Strip & 18yo Gender Voice Switch (Name Not Spoken)",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = NeonEmerald,
-                    fontWeight = FontWeight.Bold
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Name Strip, Gender & Emotion SSML Test",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NeonEmerald,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = state.lastDetectedEmotion.displayLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -400,7 +412,7 @@ fun FloatingIconGestureOverlayCard(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "Test 'Jenny' (Girl 18y)",
+                            text = "Jenny (Girl 18y)",
                             color = ElectricCyan,
                             style = MaterialTheme.typography.labelSmall
                         )
@@ -423,9 +435,66 @@ fun FloatingIconGestureOverlayCard(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "Test 'Anon' (Boy 18y)",
+                            text = "Anon (Boy 18y)",
                             color = NeonEmerald,
                             style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+
+                // Emotion-specific quick triggers: Excited (!), Sad (...), Whisper
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            onTestCasualHindiTranslation("Jenny\nHold on! Wait for me!")
+                        },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_emotion_excited_button")
+                    ) {
+                        Text(
+                            text = "Excited (!)",
+                            color = SaffronGold,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            onTestCasualHindiTranslation("Anon\nI am so sad... why did you leave...")
+                        },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_emotion_sad_button")
+                    ) {
+                        Text(
+                            text = "Sad (...)",
+                            color = Color(0xFF7C9EFF),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            onTestCasualHindiTranslation("Jenny\n*whispers* Don't make a sound... stay quiet.")
+                        },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_emotion_whisper_button")
+                    ) {
+                        Text(
+                            text = "Whisper",
+                            color = Color(0xFFCE93D8),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }

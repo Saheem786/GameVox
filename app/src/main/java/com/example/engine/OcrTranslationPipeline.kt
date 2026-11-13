@@ -235,7 +235,8 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 speakHindiNonBlocking(
                     hindiText = translatedText,
                     forceSpeakEvenIfRepeat = false,
-                    voiceProfile = assignedVoice
+                    voiceProfile = assignedVoice,
+                    sourceEnglishText = dialogueToTranslate
                 )
             }
         }
@@ -278,8 +279,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
             ttsManager.stopSpeaking()
         } else {
             val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
+            val latestEnglish = TranslatorStateRepository.state.value.lastExtractedEnglish
             if (latestHindi.isNotBlank() && latestHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
-                speakHindiNonBlocking(latestHindi, forceSpeakEvenIfRepeat = true)
+                speakHindiNonBlocking(
+                    hindiText = latestHindi,
+                    forceSpeakEvenIfRepeat = true,
+                    sourceEnglishText = latestEnglish
+                )
             }
         }
         return nowMuted
@@ -292,12 +298,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
     /**
      * Speaks [hindiText] using [ForegroundTtsManager] with the specified character's [voiceProfile]
-     * (or the default selected voice if null).
+     * (or the default selected voice if null) and [sourceEnglishText] for emotion analysis.
      */
     fun speakHindiNonBlocking(
         hindiText: String,
         forceSpeakEvenIfRepeat: Boolean = false,
-        voiceProfile: VoiceProfile? = null
+        voiceProfile: VoiceProfile? = null,
+        sourceEnglishText: String = ""
     ): Boolean {
         if (hindiText.isBlank()) return false
         if (!forceSpeakEvenIfRepeat && TranslatorStateRepository.state.value.isVoiceMuted) {
@@ -307,7 +314,11 @@ class OcrTranslationPipeline private constructor(context: Context) {
         val activeProfile = voiceProfile ?: VoiceProfileRepository.voices.value.find {
             it.id == VoiceProfileRepository.selectedVoiceId.value
         }
-        return ttsManager.speakNonBlocking(hindiText, voiceProfile = activeProfile)
+        return ttsManager.speakNonBlocking(
+            text = hindiText,
+            voiceProfile = activeProfile,
+            sourceEnglishText = sourceEnglishText
+        )
     }
 
     /**

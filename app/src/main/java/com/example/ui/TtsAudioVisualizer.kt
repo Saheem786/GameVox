@@ -47,11 +47,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.engine.SpeechEmotion
 import com.example.service.ForegroundTtsManager
 import com.example.service.TtsVisualizerState
 import com.example.ui.theme.CrimsonAlert
@@ -134,9 +136,10 @@ fun TtsAudioVisualizerCard(
                             text = "${visualizerState.activeSpeakerRoleLabel} • ${visualizerState.activeVoiceName} (${
                                 String.format(
                                     Locale.US,
-                                    "%.2fx pitch • %.2fx rate",
+                                    "%.2fx pitch • %.2fx rate • %d%% vol",
                                     visualizerState.activePitch,
-                                    visualizerState.activeSpeechRate
+                                    visualizerState.activeSpeechRate,
+                                    (visualizerState.activeVolume * 100).toInt()
                                 )
                             })",
                             style = MaterialTheme.typography.labelSmall,
@@ -169,6 +172,54 @@ fun TtsAudioVisualizerCard(
                             style = MaterialTheme.typography.labelSmall,
                             color = if (visualizerState.isSpeaking) NeonEmerald else Color.White,
                             fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // Emotion Modulation Telemetry Pill + Live SSML Markup Badge
+            val emotionTint = when (visualizerState.activeEmotion) {
+                SpeechEmotion.EXCITED -> SaffronGold
+                SpeechEmotion.ANGRY -> CrimsonAlert
+                SpeechEmotion.SAD -> Color(0xFF7C9EFF)
+                SpeechEmotion.WHISPER -> Color(0xFFCE93D8)
+                SpeechEmotion.NEUTRAL -> NeonEmerald
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    color = emotionTint.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier
+                        .border(1.dp, emotionTint.copy(alpha = 0.55f), RoundedCornerShape(50))
+                        .testTag("visualizer_emotion_badge")
+                ) {
+                    Text(
+                        text = "Emotion: ${visualizerState.activeEmotion.displayLabel}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = emotionTint,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+                if (visualizerState.ssmlPreview.isNotBlank()) {
+                    Surface(
+                        color = ObsidianBg,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("visualizer_ssml_badge")
+                    ) {
+                        Text(
+                            text = visualizerState.ssmlPreview,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = ElectricCyan.copy(alpha = 0.90f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                         )
                     }
                 }

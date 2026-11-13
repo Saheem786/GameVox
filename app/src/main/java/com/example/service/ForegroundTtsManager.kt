@@ -19,6 +19,9 @@ import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
+import com.example.engine.EmotionAnalysisResult
+import com.example.engine.EmotionSpeechEngine
+import com.example.engine.SpeechEmotion
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -53,8 +56,11 @@ data class TtsVisualizerState(
     val spokenText: String = "",
     val activeVoiceName: String = "Vikram • Character A (Hero)",
     val activeSpeakerRoleLabel: String = "Character A",
-    val activePitch: Float = 0.96f,
-    val activeSpeechRate: Float = 0.96f,
+    val activeEmotion: SpeechEmotion = SpeechEmotion.NEUTRAL,
+    val activePitch: Float = 1.0f,
+    val activeSpeechRate: Float = 1.0f,
+    val activeVolume: Float = 1.0f,
+    val ssmlPreview: String = "",
     val currentRangeStart: Int = 0,
     val currentRangeEnd: Int = 0,
     val progressFraction: Float = 0f,
@@ -165,10 +171,12 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private data class PendingNetworkUtterance(
         val text: String,
-        val voiceProfile: VoiceProfile?
+        val sourceEnglishText: String,
+        val voiceProfile: VoiceProfile?,
+        val usedSsml: Boolean
     )
 
-    // Maps utteranceId -> spoken text & profile so network synthesis failures can auto-fallback to local/default voice
+    // Maps utteranceId -> spoken text & profile so SSML or network synthesis failures can auto-fallback to plain/local voice
     private val activeNetworkUtterances = ConcurrentHashMap<String, PendingNetworkUtterance>()
 
     @Volatile
@@ -334,7 +342,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         } catch (_: Exception) {
             false
         }
-        return isSpeakingUtterance || engineSpeaking
+        return isSpeakingUtterance || engineSpeaking || CloudTtsService.isPlaying()
     }
 
     /**
@@ -454,12 +462,14 @@ class ForegroundTtsManager private constructor(context: Context) {
             stopVisualizerSync()
         }
 
-        // If a High-Quality Network voice failed (e.g. offline), auto-fallback once to local/default voice
+        // If SSML or High-Quality Network voice failed on this device, auto-fallback cleanly to plain local/default voice
         if (failedNetworkUtterance != null) {
             managerScope.launch {
                 speakInternal(
                     text = failedNetworkUtterance.text,
+                    sourceEnglishText = failedNetworkUtterance.sourceEnglishText,
                     allowNetworkSynthesis = false,
+                    allowSsml = false,
                     voiceProfile = failedNetworkUtterance.voiceProfile
                 )
             }
@@ -954,14 +964,126 @@ class ForegroundTtsManager private constructor(context: Context) {
     }
 
     /**
-     * Speaks [text] non-blockingly using the configured High-Quality Network Voice or a specific
-     * character's [com.example.data.VoiceProfile] (applying its custom pitch, speechRate, and engine voice variant).
+     * Speaks [text] non-blockingly using:
+     * 1. [EmotionSpeechEngine] to analyze punctuation (`!`, `...`, whisper cues) & convert to SSML
+     * 2. Selected [CloudTtsProvider] (Google Cloud Neural2/WaveNet or OpenAI `gpt-4o-mini-tts` if key configured)
+     * 3. Android [TextToSpeech] with SSML `<speak><prosody ...>` + Female/Male voice switching & pitch/rate/volume.
      */
     fun speakNonBlocking(
         text: String,
-        voiceProfile: com.example.data.VoiceProfile? = null
+        voiceProfile: com.example.data.VoiceProfile? = null,
+        sourceEnglishText: String = ""
     ): Boolean {
         if (text.isBlank()) return false
+
+        val state = TranslatorStateRepository.state.value
+        val targetGender = voiceProfile?.gender
+            ?: VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
+            ?: SpeakerGender.MALE_18
+
+        val emotionResult = EmotionSpeechEngine.analyzeEmotionAndBuildSsml(
+            spokenText = text,
+            sourceEnglishText = sourceEnglishText,
+            gender = targetGender,
+            profilePitchOverride = if (voiceProfile?.isCustomCloned == true) voiceProfile.pitch else null,
+            profileRateOverride = if (voiceProfile?.isCustomCloned == true) voiceProfile.speechRate else null
+        )
+
+        TranslatorStateRepository.updateEmotionTelemetry(
+            emotion = emotionResult.emotion,
+            reason = emotionResult.analysisReason,
+            ssmlPreview = emotionResult.ssmlMarkup
+        )
+
+        // Try Cloud AI TTS (Google Cloud Neural2/WaveNet or OpenAI gpt-4o-mini-tts) when selected and key is configured
+        val useCloudProvider = state.cloudTtsProvider != CloudTtsProvider.ANDROID_SSML_NETWORK &&
+            ((state.cloudTtsProvider == CloudTtsProvider.GOOGLE_CLOUD_TTS && CloudTtsService.hasGoogleCloudKey()) ||
+                (state.cloudTtsProvider == CloudTtsProvider.OPENAI_TTS && CloudTtsService.hasOpenAiKey()))
+
+        if (useCloudProvider) {
+            val cloudUtteranceId = "cloud_${UUID.randomUUID()}"
+            thirtySecondRepeatDelayJob?.cancel()
+            thirtySecondRepeatDelayJob = null
+            // Interrupt any ongoing Android TTS utterance cleanly before Cloud audio starts
+            try {
+                tts?.stop()
+            } catch (_: Exception) {
+            }
+            CloudTtsService.stopPlayback()
+            isSpeakingUtterance = true
+            activeUtteranceId = cloudUtteranceId
+
+            managerScope.launch {
+                val started = CloudTtsService.synthesizeAndPlay(
+                    context = appContext,
+                    provider = state.cloudTtsProvider,
+                    targetLanguage = state.targetLanguage,
+                    gender = targetGender,
+                    emotionResult = emotionResult,
+                    onStarted = { cloudModelName ->
+                        TranslatorStateRepository.setActiveVoiceName(cloudModelName)
+                        startRealtimeVisualizerSync(
+                            utteranceId = cloudUtteranceId,
+                            text = emotionResult.cleanSpokenText,
+                            voiceProfile = voiceProfile,
+                            emotionResult = emotionResult,
+                            overrideVoiceName = cloudModelName
+                        )
+                    },
+                    onCompleted = {
+                        isSpeakingUtterance = false
+                        if (activeUtteranceId == cloudUtteranceId) {
+                            activeUtteranceId = null
+                        }
+                        if (_visualizerState.value.utteranceId == cloudUtteranceId) {
+                            stopVisualizerSync()
+                        }
+                        thirtySecondRepeatDelayJob?.cancel()
+                        thirtySecondRepeatDelayJob = managerScope.launch {
+                            delay(30000L)
+                            onThirtySecondPostSpeechDelayCompleted?.invoke(cloudUtteranceId)
+                        }
+                    },
+                    onError = {
+                        // Cloud playback failed -> fallback smoothly to Android SSML + HD Network TTS
+                        isSpeakingUtterance = false
+                        if (activeUtteranceId == cloudUtteranceId) {
+                            activeUtteranceId = null
+                        }
+                        speakOnAndroidTts(
+                            text = text,
+                            sourceEnglishText = sourceEnglishText,
+                            voiceProfile = voiceProfile
+                        )
+                    }
+                )
+                if (!started) {
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == cloudUtteranceId) {
+                        activeUtteranceId = null
+                    }
+                    speakOnAndroidTts(
+                        text = text,
+                        sourceEnglishText = sourceEnglishText,
+                        voiceProfile = voiceProfile
+                    )
+                }
+            }
+            return true
+        }
+
+        return speakOnAndroidTts(
+            text = text,
+            sourceEnglishText = sourceEnglishText,
+            voiceProfile = voiceProfile
+        )
+    }
+
+    private fun speakOnAndroidTts(
+        text: String,
+        sourceEnglishText: String,
+        voiceProfile: com.example.data.VoiceProfile?
+    ): Boolean {
         val engine = tts
         if (engine == null || !isTtsReady) {
             pendingSubtitleToSpeak = text
@@ -970,19 +1092,20 @@ class ForegroundTtsManager private constructor(context: Context) {
             }
             return false
         }
-        val preferNetwork = TranslatorStateRepository.state.value.useHighQualityNetworkVoice
+        val state = TranslatorStateRepository.state.value
         return speakInternal(
             text = text,
-            allowNetworkSynthesis = preferNetwork,
+            sourceEnglishText = sourceEnglishText,
+            allowNetworkSynthesis = state.useHighQualityNetworkVoice,
+            allowSsml = state.ssmlEnabledOnDevice,
             voiceProfile = voiceProfile
         )
     }
 
     /**
      * Converts multi-sentence or multi-line game text into a single uninterrupted utterance string
-     * by replacing internal sentence-splitting punctuation (`।`, `.`, `!`, `?`, `:`, `;`, newlines)
-     * with soft comma pauses (`, `). This prevents Android's TTS synthesizer from stopping after
-     * the first clause or sentence and guarantees the entire paragraph is spoken in one pass.
+     * by replacing internal single sentence-splitting punctuation (`।`, `.`, `:`, `;`, newlines)
+     * with soft comma pauses while preserving ellipsis (`...`) and exclamation (`!`) for Emotion Analysis.
      */
     private fun prepareSingleContinuousUtterance(rawText: String): String {
         val collapsed = rawText
@@ -991,14 +1114,20 @@ class ForegroundTtsManager private constructor(context: Context) {
             .trim()
         if (collapsed.isEmpty()) return ""
 
-        val trailingPunct = collapsed.lastOrNull()?.takeIf { it == '।' || it == '.' || it == '!' || it == '?' }
-        val body = if (trailingPunct != null) collapsed.dropLast(1).trim() else collapsed
+        // Preserve ellipsis "..." temporarily so internal-sentence regex doesn't collapse it
+        val ellipsisToken = " __ELLIPSIS__ "
+        val protectedEllipsis = collapsed
+            .replace("...", ellipsisToken)
+            .replace("…", ellipsisToken)
 
-        // Replace internal sentence-ending punctuation with a natural comma pause so TTS speaks the whole text continuously
+        val trailingPunct = protectedEllipsis.lastOrNull()?.takeIf { it == '।' || it == '.' || it == '!' || it == '?' }
+        val body = if (trailingPunct != null) protectedEllipsis.dropLast(1).trim() else protectedEllipsis
+
         val smoothBody = body
-            .replace(Regex("[।.!?]+\\s+"), ", ")
+            .replace(Regex("[।.]+\\s+"), ", ")
             .replace(Regex("[:;]+\\s*"), ", ")
             .replace(Regex(",(\\s*,)+"), ",")
+            .replace(ellipsisToken, "... ")
             .replace(Regex("\\s+"), " ")
             .trim()
             .trimEnd(',')
@@ -1015,7 +1144,9 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private fun speakInternal(
         text: String,
+        sourceEnglishText: String = "",
         allowNetworkSynthesis: Boolean,
+        allowSsml: Boolean = TranslatorStateRepository.state.value.ssmlEnabledOnDevice,
         voiceProfile: com.example.data.VoiceProfile? = null
     ): Boolean {
         val engine = tts ?: return false
@@ -1027,11 +1158,27 @@ class ForegroundTtsManager private constructor(context: Context) {
             // Cancel any pending 30-second repeat timer because a genuinely new utterance is starting now
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
+            CloudTtsService.stopPlayback()
 
             val effectiveProfile = voiceProfile
             val targetGender = effectiveProfile?.gender
                 ?: VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
                 ?: SpeakerGender.MALE_18
+
+            // Analyze emotion (! -> Excited/Angry, ... -> Sad/Hesitant, whisper -> Whisper) and build SSML
+            val emotionResult = EmotionSpeechEngine.analyzeEmotionAndBuildSsml(
+                spokenText = fullContinuousText,
+                sourceEnglishText = sourceEnglishText,
+                gender = targetGender,
+                profilePitchOverride = if (effectiveProfile?.isCustomCloned == true) effectiveProfile.pitch else null,
+                profileRateOverride = if (effectiveProfile?.isCustomCloned == true) effectiveProfile.speechRate else null
+            )
+
+            TranslatorStateRepository.updateEmotionTelemetry(
+                emotion = emotionResult.emotion,
+                reason = emotionResult.analysisReason,
+                ssmlPreview = emotionResult.ssmlMarkup
+            )
 
             // Select High-Quality Female (Jenny) or Male (Anon) voice from tts.voices, or default voice if unavailable
             val appliedVoice = selectGenderBasedTtsVoice(
@@ -1042,20 +1189,9 @@ class ForegroundTtsManager private constructor(context: Context) {
                 preferNetworkVoice = allowNetworkSynthesis
             )
 
-            // Apply 18-Year-Old Natural Pitch & Normal Speed (1.0f):
-            // - Girl (Jenny): pitch ~1.18f (1.15f - 1.2f range), speechRate = 1.0f
-            // - Boy (Anon): pitch ~0.90f, speechRate = 1.0f
-            val appliedPitch = when {
-                effectiveProfile != null -> effectiveProfile.pitch
-                else -> targetGender.defaultPitch18Yo
-            }
-            val appliedSpeechRate = when {
-                effectiveProfile != null -> effectiveProfile.speechRate
-                else -> targetGender.defaultSpeechRate18Yo
-            }
-
-            engine.setPitch(appliedPitch)
-            engine.setSpeechRate(appliedSpeechRate)
+            // Apply Gender + Emotion Pitch, SpeechRate, and Volume
+            engine.setPitch(emotionResult.effectivePitch)
+            engine.setSpeechRate(emotionResult.effectiveSpeechRate)
 
             if (appliedVoice != null) {
                 val qualityTag = if (isNetworkHighQualityVoice(appliedVoice)) "HD Network" else "Standard"
@@ -1066,43 +1202,55 @@ class ForegroundTtsManager private constructor(context: Context) {
             val useNetworkBundle = allowNetworkSynthesis &&
                 (appliedVoice == null || isNetworkHighQualityVoice(appliedVoice))
 
+            // Wrap spoken text in SSML (<speak><prosody ...>...</prosody></speak>) when enabled
+            val utterancePayload = if (allowSsml) {
+                emotionResult.ssmlMarkup
+            } else {
+                emotionResult.cleanSpokenText
+            }
+
             val params = Bundle().apply {
                 putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
-                putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, emotionResult.effectiveVolume)
                 if (useNetworkBundle) {
                     putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
                     putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_TIMEOUT_MS, "4000")
                 }
             }
 
-            if (useNetworkBundle) {
+            if (useNetworkBundle || allowSsml) {
                 activeNetworkUtterances[utteranceId] = PendingNetworkUtterance(
                     text = fullContinuousText,
-                    voiceProfile = voiceProfile
+                    sourceEnglishText = sourceEnglishText,
+                    voiceProfile = voiceProfile,
+                    usedSsml = allowSsml
                 )
             }
 
             isSpeakingUtterance = true
             activeUtteranceId = utteranceId
 
-            // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak the complete new text
-            val result = engine.speak(fullContinuousText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+            // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak the SSML / modulated text
+            val result = engine.speak(utterancePayload, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
                 activeNetworkUtterances.remove(utteranceId)
                 isSpeakingUtterance = false
                 activeUtteranceId = null
-                if (useNetworkBundle) {
+                if (useNetworkBundle || allowSsml) {
                     return speakInternal(
                         text = text,
+                        sourceEnglishText = sourceEnglishText,
                         allowNetworkSynthesis = false,
+                        allowSsml = false,
                         voiceProfile = voiceProfile
                     )
                 }
             } else {
                 startRealtimeVisualizerSync(
                     utteranceId = utteranceId,
-                    text = fullContinuousText,
-                    voiceProfile = voiceProfile
+                    text = emotionResult.cleanSpokenText,
+                    voiceProfile = voiceProfile,
+                    emotionResult = emotionResult
                 )
             }
             result == TextToSpeech.SUCCESS
@@ -1122,12 +1270,15 @@ class ForegroundTtsManager private constructor(context: Context) {
     private fun startRealtimeVisualizerSync(
         utteranceId: String,
         text: String,
-        voiceProfile: VoiceProfile?
+        voiceProfile: VoiceProfile?,
+        emotionResult: EmotionAnalysisResult? = null,
+        overrideVoiceName: String? = null
     ) {
         val state = TranslatorStateRepository.state.value
-        val activePitch = voiceProfile?.pitch ?: state.ttsPitch
-        val activeRate = voiceProfile?.speechRate ?: state.ttsSpeechRate
-        val voiceName = voiceProfile?.name ?: state.activeVoiceName
+        val activePitch = emotionResult?.effectivePitch ?: voiceProfile?.pitch ?: state.ttsPitch
+        val activeRate = emotionResult?.effectiveSpeechRate ?: voiceProfile?.speechRate ?: state.ttsSpeechRate
+        val activeVolume = emotionResult?.effectiveVolume ?: 1.0f
+        val voiceName = overrideVoiceName ?: voiceProfile?.name ?: state.activeVoiceName
         val roleLabel = voiceProfile?.assignedRole?.displayLabel?.substringBefore(" (")
             ?: VoiceProfileRepository.lastDetectedSpeaker.value
 
@@ -1137,12 +1288,15 @@ class ForegroundTtsManager private constructor(context: Context) {
             spokenText = text,
             activeVoiceName = voiceName,
             activeSpeakerRoleLabel = roleLabel,
+            activeEmotion = emotionResult?.emotion ?: SpeechEmotion.NEUTRAL,
             activePitch = activePitch,
             activeSpeechRate = activeRate,
+            activeVolume = activeVolume,
+            ssmlPreview = emotionResult?.ssmlMarkup.orEmpty(),
             currentRangeStart = 0,
             currentRangeEnd = minOf(text.length, 4),
             progressFraction = 0.02f,
-            rmsAmplitude = 0.45f,
+            rmsAmplitude = 0.45f * activeVolume,
             phaseRadians = 0f,
             frequencyBands = List(24) { 0.18f }
         )
@@ -1490,6 +1644,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         thirtySecondRepeatDelayJob = null
         isSpeakingUtterance = false
         activeUtteranceId = null
+        CloudTtsService.stopPlayback()
         try {
             tts?.stop()
         } catch (_: Exception) {

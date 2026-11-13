@@ -58,7 +58,15 @@ object HindiTranslationEngine {
             "hold the northern gate!" to
                 "नॉर्थ वाला गेट संभाल के रखो!",
             "the ancient portal is open." to
-                "पुराना पोर्टल खुल गया है।"
+                "पुराना पोर्टल खुल गया है।",
+            "hold on! wait for me!" to
+                "अरे रुको! मेरा वेट करो!",
+            "stop! get out right now!" to
+                "रुको! अभी के अभी बाहर निकलो!",
+            "i am so sad... why did you leave..." to
+                "मैं बहुत दुखी हूँ... तुम क्यों चले गए...",
+            "don't make a sound... stay quiet." to
+                "कोई आवाज़ मत करना... बिल्कुल चुप रहो।"
         ),
         TargetLanguage.MARATHI to mapOf(
             "alert! target secured in sector 7. engage protocols." to
@@ -337,6 +345,11 @@ object HindiTranslationEngine {
         "eight" to "आठ", "nine" to "नौ", "ten" to "दस", "twenty" to "बीस", "thirty" to "तीस"
     )
 
+    private val STAGE_DIRECTION_PREFIX_REGEX = Regex(
+        "(\\*\\s*whisper(?:s|ing)?\\s*\\*|\\[\\s*whisper(?:s|ing)?\\s*\\]|\\(\\s*(?:whisper(?:s|ing)?|quietly|softly)\\s*\\))",
+        RegexOption.IGNORE_CASE
+    )
+
     /**
      * Translates [englishText] into [targetLanguage] (Hindi by default), converting any formal
      * Sanskritized Hindi into natural, daily-use modern Hindi (casual Bolchal / Hinglish).
@@ -345,11 +358,12 @@ object HindiTranslationEngine {
         englishText: String,
         targetLanguage: TargetLanguage = TargetLanguage.HINDI
     ): String {
-        val clean = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
+        val withoutSpeaker = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
+        val clean = STAGE_DIRECTION_PREFIX_REGEX.replace(withoutSpeaker, "").replace(Regex("\\s+"), " ").trim()
         if (clean.isEmpty()) return ""
 
         val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
-        val cacheKey = "${targetLanguage.code}_casual_v3:$normalized"
+        val cacheKey = "${targetLanguage.code}_casual_v4:$normalized"
 
         translationCache.get(cacheKey)?.let { return it }
 

@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Download
@@ -52,11 +53,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorAppState
 import com.example.data.TtsEngineStatus
+import com.example.service.CloudTtsProvider
+import com.example.service.CloudTtsService
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.NeonEmerald
@@ -74,6 +78,8 @@ fun SettingsBottomSheet(
     onDismiss: () -> Unit,
     onTargetLanguageChange: (TargetLanguage) -> Unit,
     onHighQualityVoiceChange: (Boolean) -> Unit,
+    onSsmlEnabledChange: (Boolean) -> Unit,
+    onCloudTtsProviderChange: (CloudTtsProvider) -> Unit,
     onShowTargetBoxChange: (Boolean) -> Unit,
     onPitchChange: (Float) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
@@ -362,6 +368,140 @@ fun SettingsBottomSheet(
                 }
             }
 
+            // 2b. Emotion SSML & Cloud AI Voice Engine Card (Google Cloud Neural2 / OpenAI TTS)
+            Surface(
+                color = SlateCardElevated,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.dp,
+                        color = SaffronGold.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CloudQueue,
+                                contentDescription = "Emotion SSML and Cloud TTS",
+                                tint = SaffronGold,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "SSML Emotion Markup (<speak><prosody>)",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "Auto-detects '!' (Excited/Angry), '...' (Sad), and Whisper cues for dynamic pitch, speed & pauses.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = state.ssmlEnabledOnDevice,
+                            onCheckedChange = onSsmlEnabledChange,
+                            modifier = Modifier.testTag("ssml_emotion_switch")
+                        )
+                    }
+
+                    if (state.lastSsmlPreview.isNotBlank()) {
+                        Surface(
+                            color = ObsidianBg,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = state.lastSsmlPreview,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = ElectricCyan,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                    Text(
+                        text = "Voice Synthesis Engine (On-Device SSML or Cloud AI)",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("cloud_tts_provider_group")
+                    ) {
+                        CloudTtsProvider.entries.forEach { provider ->
+                            val isSelected = state.cloudTtsProvider == provider
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { onCloudTtsProviderChange(provider) },
+                                label = {
+                                    Text(
+                                        text = provider.displayLabel,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = SaffronGold,
+                                    selectedLabelColor = ObsidianBg
+                                ),
+                                modifier = Modifier.testTag("cloud_provider_chip_${provider.code}")
+                            )
+                        }
+                    }
+
+                    val googleKeyReady = CloudTtsService.hasGoogleCloudKey()
+                    val openAiKeyReady = CloudTtsService.hasOpenAiKey()
+                    val statusNote = when (state.cloudTtsProvider) {
+                        CloudTtsProvider.ANDROID_SSML_NETWORK ->
+                            "Active: Built-in Android SSML + High-Quality Network voices (hi-in-x-hif-network / hi-in-x-him-network)."
+                        CloudTtsProvider.GOOGLE_CLOUD_TTS -> if (googleKeyReady) {
+                            "Google Cloud TTS API Key Ready! Using Neural2 / WaveNet SSML voices with instant on-device fallback."
+                        } else {
+                            "GOOGLE_CLOUD_TTS_API_KEY not set in AI Studio Secrets panel — falling back seamlessly to Android SSML + Network."
+                        }
+                        CloudTtsProvider.OPENAI_TTS -> if (openAiKeyReady) {
+                            "OpenAI TTS API Key Ready! Using gpt-4o-mini-tts expressive voices with instant on-device fallback."
+                        } else {
+                            "OPENAI_TTS_API_KEY not set in AI Studio Secrets panel — falling back seamlessly to Android SSML + Network."
+                        }
+                    }
+                    Text(
+                        text = statusNote,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (
+                            (state.cloudTtsProvider == CloudTtsProvider.GOOGLE_CLOUD_TTS && !googleKeyReady) ||
+                            (state.cloudTtsProvider == CloudTtsProvider.OPENAI_TTS && !openAiKeyReady)
+                        ) {
+                            SaffronGold
+                        } else {
+                            NeonEmerald
+                        }
+                    )
+                }
+            }
+
             // 3. Draggable & Resizable Target Scan Box Card
             Surface(
                 color = SlateCardElevated,
@@ -451,8 +591,8 @@ fun SettingsBottomSheet(
                             )
                         }
                         AssistChip(
-                            onClick = { onPitchChange(0.95f) },
-                            label = { Text("Natural 0.95f") },
+                            onClick = { onPitchChange(1.0f) },
+                            label = { Text("Natural 1.00f") },
                             modifier = Modifier.testTag("reset_pitch_chip")
                         )
                     }
@@ -469,7 +609,7 @@ fun SettingsBottomSheet(
                 }
             }
 
-            // 5. TTS Speech Rate Slider (Default 0.95f)
+            // 5. TTS Speech Rate Slider (Default 1.00f)
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -495,8 +635,8 @@ fun SettingsBottomSheet(
                             )
                         }
                         AssistChip(
-                            onClick = { onSpeechRateChange(0.95f) },
-                            label = { Text("Natural 0.95f") },
+                            onClick = { onSpeechRateChange(1.0f) },
+                            label = { Text("Natural 1.00f") },
                             modifier = Modifier.testTag("reset_rate_chip")
                         )
                     }

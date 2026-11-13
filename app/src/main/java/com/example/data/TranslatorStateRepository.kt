@@ -3,6 +3,8 @@ package com.example.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
+import com.example.engine.SpeechEmotion
+import com.example.service.CloudTtsProvider
 import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -150,9 +152,14 @@ data class TranslatorAppState(
     val targetBoxScreenRect: Rect? = null,
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val useHighQualityNetworkVoice: Boolean = true,
+    val ssmlEnabledOnDevice: Boolean = true,
+    val cloudTtsProvider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
     val availableVoicesCount: Int = 0,
     val voiceDownloadMessage: String = "HD Network Synthesis Active",
+    val lastDetectedEmotion: SpeechEmotion = SpeechEmotion.NEUTRAL,
+    val lastEmotionReason: String = "Normal sentence → Neutral (18yo natural baseline)",
+    val lastSsmlPreview: String = "",
     val ttsPitch: Float = 1.0f,
     val ttsSpeechRate: Float = 1.0f,
     val invertColorsEnabled: Boolean = true,
@@ -181,6 +188,8 @@ object TranslatorStateRepository {
     private const val KEY_RATE = "tts_speech_rate_v3"
     private const val KEY_INVERT = "invert_colors_enabled"
     private const val KEY_INTERVAL = "capture_interval_ms"
+    private const val KEY_SSML_ENABLED = "ssml_enabled_on_device_v1"
+    private const val KEY_CLOUD_TTS_PROVIDER = "cloud_tts_provider_v1"
 
     private val _state = MutableStateFlow(TranslatorAppState())
     val state: StateFlow<TranslatorAppState> = _state.asStateFlow()
@@ -193,6 +202,10 @@ object TranslatorStateRepository {
         val langCode = prefs.getString(KEY_TARGET_LANG, TargetLanguage.HINDI.code)
         val targetLang = TargetLanguage.fromCode(langCode)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
+        val ssmlEnabled = prefs.getBoolean(KEY_SSML_ENABLED, true)
+        val cloudProvider = CloudTtsProvider.fromCode(
+            prefs.getString(KEY_CLOUD_TTS_PROVIDER, CloudTtsProvider.ANDROID_SSML_NETWORK.code)
+        )
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
         val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
         // Voice is ON (unmuted = false) by default
@@ -205,6 +218,8 @@ object TranslatorStateRepository {
             it.copy(
                 targetLanguage = targetLang,
                 useHighQualityNetworkVoice = useHqVoice,
+                ssmlEnabledOnDevice = ssmlEnabled,
+                cloudTtsProvider = cloudProvider,
                 showTargetBoxOverlay = showScanBox,
                 isSubtitleVisible = showSubtitleBox,
                 isVoiceMuted = voiceMuted,
@@ -235,6 +250,36 @@ object TranslatorStateRepository {
             .putBoolean(KEY_NETWORK_VOICE, enabled)
             .apply()
         _state.update { it.copy(useHighQualityNetworkVoice = enabled) }
+    }
+
+    fun updateSsmlEnabledOnDevice(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SSML_ENABLED, enabled)
+            .apply()
+        _state.update { it.copy(ssmlEnabledOnDevice = enabled) }
+    }
+
+    fun updateCloudTtsProvider(context: Context, provider: CloudTtsProvider) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CLOUD_TTS_PROVIDER, provider.code)
+            .apply()
+        _state.update { it.copy(cloudTtsProvider = provider) }
+    }
+
+    fun updateEmotionTelemetry(
+        emotion: SpeechEmotion,
+        reason: String,
+        ssmlPreview: String
+    ) {
+        _state.update {
+            it.copy(
+                lastDetectedEmotion = emotion,
+                lastEmotionReason = reason,
+                lastSsmlPreview = ssmlPreview
+            )
+        }
     }
 
     fun setActiveVoiceName(voiceName: String) {
