@@ -12,6 +12,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -25,6 +27,7 @@ import kotlinx.coroutines.withContext
 class OcrTranslationPipeline private constructor(context: Context) {
 
     private val appContext: Context = context.applicationContext
+    private val scanMutex = Mutex()
 
     companion object {
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
@@ -107,12 +110,20 @@ class OcrTranslationPipeline private constructor(context: Context) {
         rawEnglishText: String,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
-        val startTime = System.currentTimeMillis()
-        val extractedEnglish = cleanExtractedSubtitle(rawEnglishText)
-        if (extractedEnglish.isBlank()) {
+        if (isTtsSpeakingNow()) {
             return@withContext "" to ""
         }
-        handleExtractedSubtitle(rawEnglishText, extractedEnglish, startTime, onDebugTextUpdate)
+        scanMutex.withLock {
+            if (isTtsSpeakingNow()) {
+                return@withLock "" to ""
+            }
+            val startTime = System.currentTimeMillis()
+            val extractedEnglish = cleanExtractedSubtitle(rawEnglishText)
+            if (extractedEnglish.isBlank()) {
+                return@withLock "" to ""
+            }
+            handleExtractedSubtitle(rawEnglishText, extractedEnglish, startTime, onDebugTextUpdate)
+        }
     }
 
     /**
@@ -132,28 +143,36 @@ class OcrTranslationPipeline private constructor(context: Context) {
         rawScreenHeight: Int = 0,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
-        val startTime = System.currentTimeMillis()
-        val appState = TranslatorStateRepository.state.value
-
-        val extractionResult = imageProcessor.extractTextFromOverlayBitmap(
-            source = rawBitmap,
-            enableColorInversion = appState.invertColorsEnabled,
-            excludeOverlayRect = excludeOverlayRect,
-            targetRegionScreenRect = targetRegionScreenRect,
-            rawScreenWidth = rawScreenWidth,
-            rawScreenHeight = rawScreenHeight
-        )
-
-        val origThumb = BitmapInverter.createPreviewThumbnail(extractionResult.croppedOriginalBitmap)
-        val invThumb = BitmapInverter.createPreviewThumbnail(extractionResult.processedBitmap)
-        TranslatorStateRepository.updateFramePreviews(origThumb, invThumb)
-
-        val extractedEnglish = cleanExtractedSubtitle(extractionResult.extractedText)
-        if (extractedEnglish.isBlank()) {
+        if (isTtsSpeakingNow()) {
             return@withContext "" to ""
         }
+        scanMutex.withLock {
+            if (isTtsSpeakingNow()) {
+                return@withLock "" to ""
+            }
+            val startTime = System.currentTimeMillis()
+            val appState = TranslatorStateRepository.state.value
 
-        handleExtractedSubtitle(extractionResult.extractedText, extractedEnglish, startTime, onDebugTextUpdate)
+            val extractionResult = imageProcessor.extractTextFromOverlayBitmap(
+                source = rawBitmap,
+                enableColorInversion = appState.invertColorsEnabled,
+                excludeOverlayRect = excludeOverlayRect,
+                targetRegionScreenRect = targetRegionScreenRect,
+                rawScreenWidth = rawScreenWidth,
+                rawScreenHeight = rawScreenHeight
+            )
+
+            val origThumb = BitmapInverter.createPreviewThumbnail(extractionResult.croppedOriginalBitmap)
+            val invThumb = BitmapInverter.createPreviewThumbnail(extractionResult.processedBitmap)
+            TranslatorStateRepository.updateFramePreviews(origThumb, invThumb)
+
+            val extractedEnglish = cleanExtractedSubtitle(extractionResult.extractedText)
+            if (extractedEnglish.isBlank()) {
+                return@withLock "" to ""
+            }
+
+            handleExtractedSubtitle(extractionResult.extractedText, extractedEnglish, startTime, onDebugTextUpdate)
+        }
     }
 
     private suspend fun handleExtractedSubtitle(
@@ -164,26 +183,30 @@ class OcrTranslationPipeline private constructor(context: Context) {
     ): Pair<String, String> {
         val targetLang = TranslatorStateRepository.state.value.targetLanguage
 
-        // Analyze scan result via SpeakerHeuristicEngine to identify character name tags (e.g., "Character A:")
-        // and map them to the corresponding VoiceProfile selected in the Voice Manager
+        // 1. Sentence Parsing Logic: Separate Line 1 (Character Name like "Jenny" or "Anon") from the dialogue,
+        // detect Gender & Age (18yo Girl vs 18yo Boy), and map to the corresponding VoiceProfile.
         val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(rawScanText)
         val assignedVoice = parsedDialogue.assignedVoice
-        val dialogueToTranslate = parsedDialogue.spokenDialogue.ifBlank { extractedEnglish }
+
+        // 2. Do NOT read the character name: Only translate and speak the dialogue after the name!
+        val dialogueToTranslate = parsedDialogue.spokenDialogue.trim()
+        if (dialogueToTranslate.isBlank()) {
+            return "" to ""
+        }
 
         val translatedText = translateEnglishToHindi(dialogueToTranslate)
+        if (translatedText.isBlank()) {
+            return "" to ""
+        }
         val elapsedMs = System.currentTimeMillis() - startTime
         val timestamp = timeFormatter.format(Date())
 
-        val normalizedTranslated = normalizeForComparison(translatedText)
-        val normalizedLastSpoken = normalizeForComparison(lastSpokenText)
-        val normalizedEnglish = normalizeForComparison(extractedEnglish)
-
-        val isRepeat = (normalizedTranslated.isNotEmpty() && normalizedTranslated == normalizedLastSpoken) ||
-            (normalizedEnglish.isNotEmpty() && normalizedEnglish == lastExtractedNormalized && lastSpokenText.isNotEmpty())
+        val isRepeat = isSameOrSimilarSubtitle(translatedText, lastSpokenText) ||
+            isSameOrSimilarSubtitle(dialogueToTranslate, lastExtractedNormalized)
 
         if (isRepeat) {
             TranslatorStateRepository.recordTranslationResult(
-                english = extractedEnglish,
+                english = dialogueToTranslate,
                 hindi = translatedText,
                 wasSpoken = false,
                 skippedReason = "Anti-Repeat: Waiting 30s after onDone() before repeating same text",
@@ -192,36 +215,40 @@ class OcrTranslationPipeline private constructor(context: Context) {
             )
             withContext(Dispatchers.Main) {
                 onDebugTextUpdate?.invoke(
-                    extractedEnglish,
+                    dialogueToTranslate,
                     translatedText,
                     "Skipped (30s Anti-Repeat Window)"
                 )
             }
-            return extractedEnglish to translatedText
+            return dialogueToTranslate to translatedText
         }
 
+        // Genuinely new text detected: update lastSpokenText and speak full text with QUEUE_FLUSH
         lastSpokenText = translatedText.trim()
-        lastExtractedNormalized = normalizedEnglish
+        lastExtractedNormalized = normalizeForComparison(dialogueToTranslate)
 
         val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
         val spokenSuccess = if (isVoiceMuted) {
             false
         } else {
-            speakHindiNonBlocking(
-                hindiText = translatedText,
-                forceSpeakEvenIfRepeat = false,
-                voiceProfile = assignedVoice
-            )
+            withContext(Dispatchers.Main) {
+                speakHindiNonBlocking(
+                    hindiText = translatedText,
+                    forceSpeakEvenIfRepeat = false,
+                    voiceProfile = assignedVoice
+                )
+            }
         }
         val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
+        val genderBadge = parsedDialogue.detectedGender.displayLabel
         val skipNote = when {
-            isVoiceMuted -> "Voice Muted (Single-Tap Icon to Unmute) • $speakerTag"
-            spokenSuccess -> "$speakerTag → ${assignedVoice.name}"
+            isVoiceMuted -> "Voice Muted (Long-Press Icon to Unmute) • $speakerTag ($genderBadge)"
+            spokenSuccess -> "$speakerTag ($genderBadge) → ${assignedVoice.name}"
             else -> "TTS Queued / Downloading Voice Async"
         }
 
         TranslatorStateRepository.recordTranslationResult(
-            english = extractedEnglish,
+            english = dialogueToTranslate,
             hindi = translatedText,
             wasSpoken = spokenSuccess,
             skippedReason = skipNote,
@@ -231,13 +258,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
         withContext(Dispatchers.Main) {
             onDebugTextUpdate?.invoke(
-                extractedEnglish,
+                dialogueToTranslate,
                 translatedText,
-                if (spokenSuccess) "Speaking ${targetLang.displayName} ($speakerTag → ${assignedVoice.name})" else skipNote
+                if (spokenSuccess) "Speaking ${targetLang.displayName} ($speakerTag [$genderBadge] → ${assignedVoice.name})" else skipNote
             )
         }
 
-        return extractedEnglish to translatedText
+        return dialogueToTranslate to translatedText
     }
 
     /**
@@ -297,10 +324,42 @@ class OcrTranslationPipeline private constructor(context: Context) {
     }
 
     fun resetAntiRepeatMemory() {
+        ttsManager.stopSpeaking()
         ttsManager.cancelThirtySecondRepeatTimer()
         lastSpokenText = ""
         lastExtractedNormalized = ""
         TranslatorStateRepository.clearLastSpokenMemory()
+    }
+
+    /**
+     * Returns true if [candidate] is identical or near-identical (accounting for minor 1-2 character
+     * ML Kit OCR jitter across frames) to [reference]. Prevents the same on-screen subtitle from
+     * re-triggering TTS before the 30-second post-speech timer expires.
+     */
+    private fun isSameOrSimilarSubtitle(candidate: String, reference: String): Boolean {
+        val normA = normalizeForComparison(candidate)
+        val normB = normalizeForComparison(reference)
+        if (normA.isEmpty() || normB.isEmpty()) return false
+        if (normA == normB) return true
+
+        val shorterLen = minOf(normA.length, normB.length)
+        val longerLen = maxOf(normA.length, normB.length)
+        if (shorterLen >= 8 && (normA.contains(normB) || normB.contains(normA)) &&
+            shorterLen.toFloat() / longerLen.toFloat() >= 0.65f
+        ) {
+            return true
+        }
+
+        val wordsA = normA.split(" ").filter { it.isNotEmpty() }.toSet()
+        val wordsB = normB.split(" ").filter { it.isNotEmpty() }.toSet()
+        if (wordsA.isNotEmpty() && wordsB.isNotEmpty()) {
+            val intersection = wordsA.intersect(wordsB).size
+            val union = wordsA.union(wordsB).size.coerceAtLeast(1)
+            if (intersection.toFloat() / union.toFloat() >= 0.72f) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun normalizeForComparison(text: String): String {

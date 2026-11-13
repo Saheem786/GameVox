@@ -99,15 +99,17 @@ class FloatingOverlayController(
     private var translationBoxParams: WindowManager.LayoutParams? = null
     private var latestHindiOnlyText: String = ""
 
-    // Boolean state toggled via Double Tap (onDoubleTap) — controls ONLY Subtitle/Scan Box visibility & OCR scanning
+    // Boolean state toggled via Single Tap (onSingleTapConfirmed) — controls ONLY Green Scan Box visibility
     @Volatile
     var isBoxVisible: Boolean = true
         private set
 
-    val isSubtitleVisible: Boolean
-        get() = isBoxVisible
+    // Boolean state toggled via Double Tap (onDoubleTap) — controls ONLY Translated Captions Box (Hindi dark box) visibility
+    @Volatile
+    var isSubtitleVisible: Boolean = true
+        private set
 
-    // Boolean state toggled via Single Tap (onSingleTapConfirmed) — controls ONLY Voice (TTS Mute/Unmute)
+    // Boolean state toggled via Long Press (onLongPress) — controls Voice (TTS Mute/Unmute), default false (Voice ON)
     @Volatile
     var isVoiceMuted: Boolean = false
         private set
@@ -221,8 +223,9 @@ class FloatingOverlayController(
     }
 
     /**
-     * Toggles ONLY [isVoiceMuted] on Single Tap of the floating icon:
-     * - When `true`: mutes/pauses TTS voice output immediately while keeping Subtitle Box & OCR scanning active.
+     * Toggles ONLY [isVoiceMuted] (Voice ON/OFF) on Long Press of the floating icon:
+     * - Default is `false` (Voice ON).
+     * - When `true`: mutes/pauses TTS voice output immediately.
      * - When `false`: unmutes/resumes TTS voice output.
      */
     fun toggleVoiceMuteOnSingleTap() {
@@ -241,31 +244,62 @@ class FloatingOverlayController(
     }
 
     /**
-     * Toggles ONLY [isBoxVisible] / [isSubtitleVisible] on Double Tap of the floating icon:
-     * - When `true`: shows the Subtitle/Translation Box and Scan Box via `WindowManager.addView()` and resumes scanning.
-     * - When `false`: hides both views via `WindowManager.removeView()` and pauses scanning.
-     * - Does NOT affect [isVoiceMuted] (Voice ON/OFF state remains unchanged).
+     * Single Tap (`onSingleTapConfirmed`):
+     * Toggles ONLY [isBoxVisible] (Green Scan Box visibility).
+     * - When `true`: shows ONLY the Green Scan Box (`showDraggableTargetBox()`) and resumes scanning.
+     * - When `false`: hides ONLY the Green Scan Box (`hideDraggableTargetBox()`) and pauses scanning.
+     * - Does NOT affect [isSubtitleVisible] (Translated Captions Box stays as-is)!
      */
-    fun toggleBoxesVisibilityOnDoubleTap() {
-        setBoxesVisibility(!isBoxVisible, notifyCallback = true)
+    fun toggleScanBoxOnSingleTap() {
+        setScanBoxVisibility(!isBoxVisible, notifyCallback = true)
     }
 
-    fun setBoxesVisibility(visible: Boolean, notifyCallback: Boolean = false) {
+    fun setScanBoxVisibility(visible: Boolean, notifyCallback: Boolean = false) {
         mainHandler.post {
             isBoxVisible = visible
-            TranslatorStateRepository.setSubtitleVisible(context, visible)
+            TranslatorStateRepository.updateShowTargetBoxOverlay(context, visible)
             if (visible) {
                 showDraggableTargetBox()
-                showHindiTranslationBox()
             } else {
                 hideDraggableTargetBox()
-                hideHindiTranslationBox()
             }
             updateFloatingIconAppearance(visible)
             if (notifyCallback) {
                 onBoxVisibilityToggled(visible)
             }
         }
+    }
+
+    /**
+     * Double Tap (`onDoubleTap`):
+     * Toggles ONLY [isSubtitleVisible] (Translated Captions dark Hindi box on top).
+     * - When `true`: shows ONLY the Translated Captions Box (`showHindiTranslationBox()`).
+     * - When `false`: hides ONLY the Translated Captions Box (`hideHindiTranslationBox()`).
+     * - Does NOT affect [isBoxVisible] (Green Scan Box remains untouched)!
+     */
+    fun toggleSubtitleCaptionsOnDoubleTap() {
+        setSubtitleCaptionsVisibility(!isSubtitleVisible)
+    }
+
+    fun setSubtitleCaptionsVisibility(visible: Boolean) {
+        mainHandler.post {
+            isSubtitleVisible = visible
+            TranslatorStateRepository.setSubtitleVisible(context, visible)
+            if (visible) {
+                showHindiTranslationBox()
+            } else {
+                hideHindiTranslationBox()
+            }
+            updateFloatingIconAppearance(isBoxVisible)
+        }
+    }
+
+    fun toggleBoxesVisibilityOnDoubleTap() {
+        toggleSubtitleCaptionsOnDoubleTap()
+    }
+
+    fun setBoxesVisibility(visible: Boolean, notifyCallback: Boolean = false) {
+        setScanBoxVisibility(visible, notifyCallback = notifyCallback)
     }
 
     /**
@@ -329,15 +363,19 @@ class FloatingOverlayController(
     @SuppressLint("ClickableViewAccessibility", "RtlHardcoded")
     fun showFloatingOverlay(): Boolean {
         if (!Settings.canDrawOverlays(context)) return false
-        isBoxVisible = TranslatorStateRepository.state.value.isSubtitleVisible
+        isBoxVisible = TranslatorStateRepository.state.value.showTargetBoxOverlay
+        isSubtitleVisible = TranslatorStateRepository.state.value.isSubtitleVisible
         isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
 
         if (rootOverlayView != null) {
             if (isBoxVisible) {
                 showDraggableTargetBox()
-                showHindiTranslationBox()
             } else {
                 hideDraggableTargetBox()
+            }
+            if (isSubtitleVisible) {
+                showHindiTranslationBox()
+            } else {
                 hideHindiTranslationBox()
             }
             updateFloatingIconAppearance(isBoxVisible)
@@ -421,28 +459,30 @@ class FloatingOverlayController(
                 override fun onDown(e: MotionEvent): Boolean = true
 
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    // Single Tap: ONLY toggles Voice (TTS Mute/Unmute). Does NOT stop translation or hide Subtitle Box!
+                    // Single Tap: Strictly hides/shows ONLY the Green Scan Box (targetBoxView).
+                    // Does NOT hide or show the Translated Captions Box!
                     if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        toggleVoiceMuteOnSingleTap()
+                        toggleScanBoxOnSingleTap()
                     }
                     return true
                 }
 
                 override fun onDoubleTap(e: MotionEvent): Boolean {
-                    // Double Tap: ONLY hides/shows Subtitle Box & Scan Box and pauses/resumes scanning.
-                    // Does NOT affect Voice (isVoiceMuted)!
+                    // Double Tap: Strictly hides/shows ONLY the Translated Captions Box (translationBoxView).
+                    // Does NOT affect the Green Scan Box!
                     if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        toggleBoxesVisibilityOnDoubleTap()
+                        toggleSubtitleCaptionsOnDoubleTap()
                     }
                     return true
                 }
 
                 override fun onLongPress(e: MotionEvent) {
-                    if (!isDragging && !isDialogOpeningOrShown) {
+                    // Long Press: Toggles Voice ON/OFF (Mute/Unmute)
+                    if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        showOverlaySettingsBottomSheet()
+                        toggleVoiceMuteOnSingleTap()
                     }
                 }
             },
@@ -495,9 +535,13 @@ class FloatingOverlayController(
             false
         }
 
-        if (added && isBoxVisible) {
-            showDraggableTargetBox()
-            showHindiTranslationBox()
+        if (added) {
+            if (isBoxVisible) {
+                showDraggableTargetBox()
+            }
+            if (isSubtitleVisible) {
+                showHindiTranslationBox()
+            }
         }
 
         return added
@@ -899,7 +943,7 @@ class FloatingOverlayController(
             latestHindiOnlyText = cleanHindi
             translationBoxView?.apply {
                 text = cleanHindi
-                if (visibility != View.VISIBLE && isBoxVisible) {
+                if (visibility != View.VISIBLE && isSubtitleVisible) {
                     visibility = View.VISIBLE
                 }
             }
@@ -1279,10 +1323,10 @@ class FloatingOverlayController(
         return GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = dpToPx(10).toFloat()
-            setColor(Color.argb(18, 0, 229, 255))
+            setColor(Color.argb(22, 0, 230, 118))
             setStroke(
                 dpToPx(2),
-                if (isScanning) Color.parseColor("#00E676") else Color.parseColor("#00E5FF")
+                if (isScanning) Color.parseColor("#00E676") else Color.parseColor("#00C853")
             )
         }
     }

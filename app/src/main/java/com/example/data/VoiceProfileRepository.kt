@@ -29,11 +29,41 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * Gender & 18-year-old vocal profile classification used to automatically switch between
+ * Female TTS Voices (e.g. 'Jenny' -> 18yo Girl) and Male TTS Voices (e.g. 'Anon' -> 18yo Boy).
+ */
+enum class SpeakerGender(
+    val code: String,
+    val displayLabel: String,
+    val defaultPitch18Yo: Float,
+    val defaultSpeechRate18Yo: Float
+) {
+    FEMALE_18(
+        code = "female_18",
+        displayLabel = "18yo Girl (Female TTS Voice)",
+        defaultPitch18Yo = 1.22f,
+        defaultSpeechRate18Yo = 1.04f
+    ),
+    MALE_18(
+        code = "male_18",
+        displayLabel = "18yo Boy (Male TTS Voice)",
+        defaultPitch18Yo = 0.90f,
+        defaultSpeechRate18Yo = 1.02f
+    );
+
+    companion object {
+        fun fromCode(code: String?): SpeakerGender {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: MALE_18
+        }
+    }
+}
+
+/**
  * Character slot in the Multi-Speaker Dialogue system.
  */
 enum class SpeakerRole(val code: String, val displayLabel: String, val badgeColorHex: String) {
-    CHARACTER_A("char_a", "Character A (Lead / Hero)", "#00E5FF"),
-    CHARACTER_B("char_b", "Character B (Companion / NPC)", "#00E676"),
+    CHARACTER_A("char_a", "Anon / Male Lead (18yo Boy)", "#00E5FF"),
+    CHARACTER_B("char_b", "Jenny / Female Lead (18yo Girl)", "#00E676"),
     CHARACTER_C("char_c", "Character C (Boss / Villain)", "#FFB300"),
     NARRATOR("narrator", "Narrator / System AI", "#CE93D8");
 
@@ -46,17 +76,6 @@ enum class SpeakerRole(val code: String, val displayLabel: String, val badgeColo
 
 /**
  * Represents a built-in or user-cloned Custom TTS Voice Profile stored locally on device.
- *
- * @property id Unique identifier for the voice profile.
- * @property name User-visible name (e.g., "Aarav (Hero)", "My Cloned Voice").
- * @property description Short description of the acoustic profile or cloned sample.
- * @property pitch TTS pitch multiplier (`0.4f..1.8f`) derived from voice cloning or preset.
- * @property speechRate TTS speech rate multiplier (`0.4f..1.8f`).
- * @property engineVoiceIndex Index offset used to pick distinct underlying `android.speech.tts.Voice`
- *                            models from `TextToSpeech.getVoices()` so different characters sound distinct.
- * @property assignedRole Default multi-speaker slot assigned to this voice.
- * @property isCustomCloned Whether this voice was created by the user via 3-5s recording or audio upload.
- * @property sampleAudioPath Optional local file path in `filesDir/custom_voices/` for the recorded/uploaded reference audio.
  */
 data class VoiceProfile(
     val id: String,
@@ -66,6 +85,11 @@ data class VoiceProfile(
     val speechRate: Float,
     val engineVoiceIndex: Int = 0,
     val assignedRole: SpeakerRole = SpeakerRole.CHARACTER_A,
+    val gender: SpeakerGender = if (assignedRole == SpeakerRole.CHARACTER_B || assignedRole == SpeakerRole.NARRATOR || pitch >= 1.12f) {
+        SpeakerGender.FEMALE_18
+    } else {
+        SpeakerGender.MALE_18
+    },
     val isCustomCloned: Boolean = false,
     val sampleAudioPath: String? = null
 )
@@ -77,6 +101,7 @@ data class ParsedDialogueLine(
     val speakerName: String?,
     val spokenDialogue: String,
     val resolvedRole: SpeakerRole,
+    val detectedGender: SpeakerGender,
     val assignedVoice: VoiceProfile,
     val matchedHeuristicRule: String = ""
 )
@@ -102,42 +127,46 @@ object VoiceProfileRepository {
     private val defaultPresets = listOf(
         VoiceProfile(
             id = "preset_char_a_hero",
-            name = "Vikram • Character A (Hero)",
-            description = "Balanced, natural HD neural voice for lead characters",
-            pitch = 0.96f,
-            speechRate = 0.96f,
+            name = "Anon • 18yo Boy (Male Voice)",
+            description = "Natural 18-year-old young male TTS voice for Anon & male characters",
+            pitch = SpeakerGender.MALE_18.defaultPitch18Yo,
+            speechRate = SpeakerGender.MALE_18.defaultSpeechRate18Yo,
             engineVoiceIndex = 0,
             assignedRole = SpeakerRole.CHARACTER_A,
+            gender = SpeakerGender.MALE_18,
             isCustomCloned = false
         ),
         VoiceProfile(
             id = "preset_char_b_companion",
-            name = "Ananya • Character B (Companion)",
-            description = "Bright, expressive higher-pitch voice for companions & allies",
-            pitch = 1.24f,
-            speechRate = 1.02f,
+            name = "Jenny • 18yo Girl (Female Voice)",
+            description = "Bright, expressive 18-year-old young female TTS voice for Jenny & female characters",
+            pitch = SpeakerGender.FEMALE_18.defaultPitch18Yo,
+            speechRate = SpeakerGender.FEMALE_18.defaultSpeechRate18Yo,
             engineVoiceIndex = 1,
             assignedRole = SpeakerRole.CHARACTER_B,
+            gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
         ),
         VoiceProfile(
             id = "preset_char_c_boss",
-            name = "Kaal • Character C (Boss / Villain)",
-            description = "Deep, commanding bass-heavy voice for bosses, dragons & guards",
-            pitch = 0.68f,
-            speechRate = 0.86f,
+            name = "Kaal • Male Boss Voice",
+            description = "Deep male voice for bosses, guards & villains",
+            pitch = 0.76f,
+            speechRate = 0.94f,
             engineVoiceIndex = 2,
             assignedRole = SpeakerRole.CHARACTER_C,
+            gender = SpeakerGender.MALE_18,
             isCustomCloned = false
         ),
         VoiceProfile(
             id = "preset_narrator_ai",
-            name = "ira-AI • System / Narrator",
-            description = "Crisp, steady cadence for game terminals, quests & narration",
-            pitch = 1.08f,
-            speechRate = 1.06f,
+            name = "Ira-AI • Female Narrator",
+            description = "Crisp young female voice for game terminals, quests & narration",
+            pitch = 1.16f,
+            speechRate = 1.04f,
             engineVoiceIndex = 3,
             assignedRole = SpeakerRole.NARRATOR,
+            gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
         )
     )
@@ -159,6 +188,9 @@ object VoiceProfileRepository {
 
     private val _lastHeuristicRule = MutableStateFlow("Colon Prefix Tag ('Character A' → Character A)")
     val lastHeuristicRule: StateFlow<String> = _lastHeuristicRule.asStateFlow()
+
+    private val _lastParsedDialogue = MutableStateFlow<ParsedDialogueLine?>(null)
+    val lastParsedDialogue: StateFlow<ParsedDialogueLine?> = _lastParsedDialogue.asStateFlow()
 
     private val _roleVoiceAssignments = MutableStateFlow<Map<SpeakerRole, String>>(
         defaultPresets.associate { it.assignedRole to it.id }
@@ -540,13 +572,16 @@ object VoiceProfileRepository {
         _lastAssignedVoiceName.value = result.assignedVoice.name
         _lastHeuristicRule.value = result.matchedRuleDescription
 
-        return ParsedDialogueLine(
+        val parsedLine = ParsedDialogueLine(
             speakerName = result.detectedSpeakerTag ?: result.displaySpeakerName,
             spokenDialogue = result.cleanedDialogueText,
             resolvedRole = result.matchedRole,
+            detectedGender = result.detectedGender,
             assignedVoice = result.assignedVoice,
             matchedHeuristicRule = result.matchedRuleDescription
         )
+        _lastParsedDialogue.value = parsedLine
+        return parsedLine
     }
 
     fun getVoiceForRole(role: SpeakerRole): VoiceProfile {
@@ -679,6 +714,7 @@ object VoiceProfileRepository {
                 put("speechRate", v.speechRate.toDouble())
                 put("engineVoiceIndex", v.engineVoiceIndex)
                 put("assignedRole", v.assignedRole.code)
+                put("gender", v.gender.code)
                 put("isCustomCloned", v.isCustomCloned)
                 if (v.sampleAudioPath != null) {
                     put("sampleAudioPath", v.sampleAudioPath)
@@ -699,15 +735,23 @@ object VoiceProfileRepository {
             val list = mutableListOf<VoiceProfile>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
+                val role = SpeakerRole.fromCode(obj.optString("assignedRole", "char_a"))
+                val pitch = obj.optDouble("pitch", 0.95).toFloat().coerceIn(0.4f, 1.8f)
+                val defaultGenderCode = if (role == SpeakerRole.CHARACTER_B || role == SpeakerRole.NARRATOR || pitch >= 1.12f) {
+                    SpeakerGender.FEMALE_18.code
+                } else {
+                    SpeakerGender.MALE_18.code
+                }
                 list.add(
                     VoiceProfile(
                         id = obj.optString("id", "voice_$i"),
                         name = obj.optString("name", "Voice ${i + 1}"),
                         description = obj.optString("description", "Custom TTS Voice Profile"),
-                        pitch = obj.optDouble("pitch", 0.95).toFloat().coerceIn(0.4f, 1.8f),
+                        pitch = pitch,
                         speechRate = obj.optDouble("speechRate", 0.95).toFloat().coerceIn(0.4f, 1.8f),
                         engineVoiceIndex = obj.optInt("engineVoiceIndex", i % 4),
-                        assignedRole = SpeakerRole.fromCode(obj.optString("assignedRole", "char_a")),
+                        assignedRole = role,
+                        gender = SpeakerGender.fromCode(obj.optString("gender", defaultGenderCode)),
                         isCustomCloned = obj.optBoolean("isCustomCloned", false),
                         sampleAudioPath = obj.optString("sampleAudioPath", "").takeIf { it.isNotBlank() }
                     )

@@ -107,7 +107,7 @@ class GameVoxAccessibilityService : AccessibilityService() {
             .filter { it.length >= 2 }
             .distinct()
             .takeLast(4)
-            .joinToString(" ")
+            .joinToString("\n")
     }
 
     private fun collectNodeTextRecursive(

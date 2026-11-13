@@ -175,6 +175,7 @@ object TranslatorStateRepository {
     private const val KEY_TARGET_LANG = "target_lang_code"
     private const val KEY_NETWORK_VOICE = "use_hq_network_voice"
     private const val KEY_SHOW_SCAN_BOX = "show_target_box_overlay"
+    private const val KEY_SHOW_SUBTITLE_BOX = "show_subtitle_captions_box_v1"
     private const val KEY_VOICE_MUTED = "is_voice_muted_v1"
     private const val KEY_PITCH = "tts_pitch_v2"
     private const val KEY_RATE = "tts_speech_rate_v2"
@@ -193,6 +194,8 @@ object TranslatorStateRepository {
         val targetLang = TargetLanguage.fromCode(langCode)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
+        val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
+        // Voice is ON (unmuted = false) by default
         val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
         val pitch = prefs.getFloat(KEY_PITCH, 0.95f).coerceIn(0.4f, 1.8f)
         val rate = prefs.getFloat(KEY_RATE, 0.95f).coerceIn(0.4f, 1.8f)
@@ -203,7 +206,7 @@ object TranslatorStateRepository {
                 targetLanguage = targetLang,
                 useHighQualityNetworkVoice = useHqVoice,
                 showTargetBoxOverlay = showScanBox,
-                isSubtitleVisible = showScanBox,
+                isSubtitleVisible = showSubtitleBox,
                 isVoiceMuted = voiceMuted,
                 ttsPitch = pitch,
                 ttsSpeechRate = rate,
@@ -252,6 +255,16 @@ object TranslatorStateRepository {
         }
     }
 
+    /**
+     * Toggles ONLY the Green Scan Box visibility (`showTargetBoxOverlay`) on Single Tap (`onTap`).
+     * Does NOT affect [isSubtitleVisible] (Translated Captions Box)!
+     */
+    fun toggleScanBoxVisible(context: Context): Boolean {
+        val newVisible = !_state.value.showTargetBoxOverlay
+        updateShowTargetBoxOverlay(context, newVisible)
+        return newVisible
+    }
+
     fun updateShowTargetBoxOverlay(context: Context, show: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -260,14 +273,14 @@ object TranslatorStateRepository {
         _state.update {
             it.copy(
                 showTargetBoxOverlay = show,
-                isSubtitleVisible = show
+                isCapturingOcr = if (!show) false else true
             )
         }
     }
 
     /**
-     * Toggles ONLY the Voice (TTS Mute/Unmute) state on Single Tap (`onTap`).
-     * Does NOT affect [isSubtitleVisible] or OCR scanning!
+     * Toggles ONLY the Voice (TTS Mute/Unmute) state on Long Press (`onLongPress`).
+     * Voice is ON (`isVoiceMuted = false`) by default.
      */
     fun toggleVoiceMuted(context: Context): Boolean {
         val newMuted = !_state.value.isVoiceMuted
@@ -284,9 +297,8 @@ object TranslatorStateRepository {
     }
 
     /**
-     * Toggles ONLY the Subtitle/Translation Box & Scan Box visibility (`isSubtitleVisible`)
-     * and pauses/resumes OCR scanning on Double Tap (`onDoubleTap`).
-     * Does NOT affect [isVoiceMuted]!
+     * Toggles ONLY the Translated Captions Box visibility (`isSubtitleVisible`) on Double Tap (`onDoubleTap`).
+     * Does NOT affect [showTargetBoxOverlay] (Green Scan Box) or [isVoiceMuted]!
      */
     fun toggleSubtitleVisible(context: Context): Boolean {
         val newVisible = !_state.value.isSubtitleVisible
@@ -297,13 +309,11 @@ object TranslatorStateRepository {
     fun setSubtitleVisible(context: Context, visible: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(KEY_SHOW_SCAN_BOX, visible)
+            .putBoolean(KEY_SHOW_SUBTITLE_BOX, visible)
             .apply()
         _state.update {
             it.copy(
-                isSubtitleVisible = visible,
-                showTargetBoxOverlay = visible,
-                isCapturingOcr = if (!visible) false else true
+                isSubtitleVisible = visible
             )
         }
     }

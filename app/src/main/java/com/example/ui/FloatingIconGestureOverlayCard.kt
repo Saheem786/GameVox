@@ -22,9 +22,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CropFree
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.SubtitlesOff
-import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Badge
@@ -59,32 +60,37 @@ import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.SlateSurfaceVariant
 
 /**
- * Interactive Jetpack Compose Floating Icon & Subtitle Box Controller using
- * `Modifier.pointerInput` and `detectTapGestures`:
+ * Interactive Jetpack Compose Floating Icon, Green Scan Box & Translated Captions Controller
+ * using `Modifier.pointerInput` and `detectTapGestures`:
  *
- * - **Single Tap (`onTap`)**: Toggles ONLY [isVoiceMuted] (Mutes/Unmutes TTS Voice).
- *   Translation & the Subtitle Box stay visible and active.
- * - **Double Tap (`onDoubleTap`)**: Toggles ONLY [isSubtitleVisible] (Shows/Hides the Compose
- *   Subtitle/Translation Box and pauses/resumes new text scanning). Does NOT affect Voice ([isVoiceMuted]).
+ * - **Single Tap (`onTap`)**: Strictly toggles ONLY [isScanBoxVisible] (Hides/Shows the Green Scan Box).
+ *   Does NOT affect the Translated Captions Box!
+ * - **Double Tap (`onDoubleTap`)**: Strictly toggles ONLY [isSubtitleVisible] (Hides/Shows the dark
+ *   Translated Captions Box on top). Does NOT affect the Green Scan Box!
+ * - **Long Press (`onLongPress`)**: Toggles Voice ON/OFF ([isVoiceMuted], default ON).
  */
 @Composable
 fun FloatingIconGestureOverlayCard(
     state: TranslatorAppState,
-    onSingleTapVoiceMuteChanged: (isVoiceMuted: Boolean) -> Unit,
+    onSingleTapScanBoxVisibilityChanged: (isScanBoxVisible: Boolean) -> Unit,
     onDoubleTapSubtitleVisibilityChanged: (isSubtitleVisible: Boolean) -> Unit,
-    onLongPressOpenSettings: () -> Unit,
+    onLongPressVoiceMuteChanged: (isVoiceMuted: Boolean) -> Unit,
     onTestCasualHindiTranslation: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    // Separate boolean variables for Single Tap (Voice Mute) and Double Tap (Subtitle Box Visibility)
-    var isVoiceMuted by remember { mutableStateOf(state.isVoiceMuted) }
+    // Separate boolean states for Single Tap (Green Scan Box), Double Tap (Translated Captions), and Long Press (Voice Mute)
+    var isScanBoxVisible by remember { mutableStateOf(state.showTargetBoxOverlay) }
     var isSubtitleVisible by remember { mutableStateOf(state.isSubtitleVisible) }
+    var isVoiceMuted by remember { mutableStateOf(state.isVoiceMuted) }
 
-    LaunchedEffect(state.isVoiceMuted) {
-        isVoiceMuted = state.isVoiceMuted
+    LaunchedEffect(state.showTargetBoxOverlay) {
+        isScanBoxVisible = state.showTargetBoxOverlay
     }
     LaunchedEffect(state.isSubtitleVisible) {
         isSubtitleVisible = state.isSubtitleVisible
+    }
+    LaunchedEffect(state.isVoiceMuted) {
+        isVoiceMuted = state.isVoiceMuted
     }
 
     Surface(
@@ -94,7 +100,7 @@ fun FloatingIconGestureOverlayCard(
             .fillMaxWidth()
             .border(
                 width = 1.5.dp,
-                color = if (isSubtitleVisible) ElectricCyan else SaffronGold.copy(alpha = 0.6f),
+                color = if (isScanBoxVisible) NeonEmerald else SaffronGold.copy(alpha = 0.6f),
                 shape = RoundedCornerShape(18.dp)
             )
             .testTag("floating_icon_gesture_card")
@@ -111,14 +117,14 @@ fun FloatingIconGestureOverlayCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Floating Icon Tap Controls & Subtitle Box",
+                        text = "Floating Icon Tap Controls",
                         style = MaterialTheme.typography.titleMedium,
                         color = Color.White,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "• Single Tap: Voice Mute/Unmute Only\n• Double Tap: Show/Hide Subtitle Box & Scan",
+                        text = "• Single Tap: Green Scan Box Hide/Show\n• Double Tap: Translated Captions Hide/Show\n• Long Press: Voice ON/OFF (Default ON)",
                         style = MaterialTheme.typography.bodySmall,
                         color = ElectricCyan
                     )
@@ -132,13 +138,13 @@ fun FloatingIconGestureOverlayCard(
                         .size(58.dp)
                         .clip(CircleShape)
                         .background(
-                            if (isSubtitleVisible) SlateCardElevated else ObsidianBg
+                            if (isScanBoxVisible) SlateCardElevated else ObsidianBg
                         )
                         .border(
                             width = 2.dp,
                             color = when {
                                 isVoiceMuted -> CrimsonAlert
-                                isSubtitleVisible -> NeonEmerald
+                                isScanBoxVisible -> NeonEmerald
                                 else -> SaffronGold
                             },
                             shape = CircleShape
@@ -146,21 +152,24 @@ fun FloatingIconGestureOverlayCard(
                         .pointerInput(Unit) {
                             detectTapGestures(
                                 onTap = {
-                                    // Single Tap: ONLY toggle Voice (TTS Mute/Unmute).
-                                    // Do NOT hide Subtitle Box or stop translation!
-                                    val newMuted = !isVoiceMuted
-                                    isVoiceMuted = newMuted
-                                    onSingleTapVoiceMuteChanged(newMuted)
+                                    // Single Tap: Strictly toggle ONLY Green Scan Box (isScanBoxVisible).
+                                    // Does NOT affect Translated Captions (isSubtitleVisible)!
+                                    val newScanBoxVisible = !isScanBoxVisible
+                                    isScanBoxVisible = newScanBoxVisible
+                                    onSingleTapScanBoxVisibilityChanged(newScanBoxVisible)
                                 },
                                 onDoubleTap = {
-                                    // Double Tap: ONLY toggle Subtitle Box visibility & scanning.
-                                    // Do NOT change Voice Mute state!
-                                    val newVisible = !isSubtitleVisible
-                                    isSubtitleVisible = newVisible
-                                    onDoubleTapSubtitleVisibilityChanged(newVisible)
+                                    // Double Tap: Strictly toggle ONLY Translated Captions Box (isSubtitleVisible).
+                                    // Does NOT affect Green Scan Box (isScanBoxVisible)!
+                                    val newSubtitleVisible = !isSubtitleVisible
+                                    isSubtitleVisible = newSubtitleVisible
+                                    onDoubleTapSubtitleVisibilityChanged(newSubtitleVisible)
                                 },
                                 onLongPress = {
-                                    onLongPressOpenSettings()
+                                    // Long Press: Toggle Voice ON/OFF (isVoiceMuted)
+                                    val newMuted = !isVoiceMuted
+                                    isVoiceMuted = newMuted
+                                    onLongPressVoiceMuteChanged(newMuted)
                                 }
                             )
                         }
@@ -183,7 +192,7 @@ fun FloatingIconGestureOverlayCard(
                             .background(
                                 when {
                                     isVoiceMuted -> CrimsonAlert
-                                    isSubtitleVisible -> NeonEmerald
+                                    isScanBoxVisible -> NeonEmerald
                                     else -> SaffronGold
                                 }
                             )
@@ -192,34 +201,34 @@ fun FloatingIconGestureOverlayCard(
                 }
             }
 
-            // Live Independent State Badges (isVoiceMuted vs isSubtitleVisible)
+            // Live Independent State Badges (Single Tap: Green Scan Box | Double Tap: Translated Captions | Long Press: Voice)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Surface(
-                    color = if (isVoiceMuted) CrimsonAlert.copy(alpha = 0.18f) else NeonEmerald.copy(alpha = 0.18f),
+                    color = if (isScanBoxVisible) NeonEmerald.copy(alpha = 0.18f) else SaffronGold.copy(alpha = 0.18f),
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier
                         .weight(1f)
-                        .testTag("voice_mute_status_chip")
+                        .testTag("scan_box_visibility_status_chip")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = if (isVoiceMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                            imageVector = Icons.Default.CropFree,
                             contentDescription = null,
-                            tint = if (isVoiceMuted) CrimsonAlert else NeonEmerald,
-                            modifier = Modifier.size(18.dp)
+                            tint = if (isScanBoxVisible) NeonEmerald else SaffronGold,
+                            modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Column {
                             Text(
-                                text = if (isVoiceMuted) "Voice: MUTED (OFF)" else "Voice: ACTIVE (ON)",
+                                text = if (isScanBoxVisible) "Scan Box: SHOWN" else "Scan Box: HIDDEN",
                                 style = MaterialTheme.typography.labelMedium,
-                                color = if (isVoiceMuted) CrimsonAlert else NeonEmerald,
+                                color = if (isScanBoxVisible) NeonEmerald else SaffronGold,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
@@ -239,19 +248,19 @@ fun FloatingIconGestureOverlayCard(
                         .testTag("subtitle_visibility_status_chip")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
                             imageVector = if (isSubtitleVisible) Icons.Default.Subtitles else Icons.Default.SubtitlesOff,
                             contentDescription = null,
                             tint = if (isSubtitleVisible) ElectricCyan else SaffronGold,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Column {
                             Text(
-                                text = if (isSubtitleVisible) "Subtitle Box: SHOWN" else "Subtitle Box: HIDDEN",
+                                text = if (isSubtitleVisible) "Captions: SHOWN" else "Captions: HIDDEN",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = if (isSubtitleVisible) ElectricCyan else SaffronGold,
                                 fontWeight = FontWeight.Bold
@@ -266,7 +275,7 @@ fun FloatingIconGestureOverlayCard(
                 }
             }
 
-            // Compose Subtitle / Translation Box (Controlled strictly by isSubtitleVisible via Double Tap)
+            // 1. Translated Captions Dark Box (Controlled strictly by Double Tap -> isSubtitleVisible)
             AnimatedVisibility(
                 visible = isSubtitleVisible,
                 enter = fadeIn() + expandVertically(),
@@ -283,19 +292,9 @@ fun FloatingIconGestureOverlayCard(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Badge(
-                            containerColor = ElectricCyan.copy(alpha = 0.18f),
-                            contentColor = ElectricCyan
-                        ) {
-                            Text(
-                                text = "MODERN CASUAL HINDI SUBTITLE BOX",
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
                         Text(
                             text = state.lastTranslatedHindi,
                             style = MaterialTheme.typography.titleMedium,
@@ -308,49 +307,127 @@ fun FloatingIconGestureOverlayCard(
                 }
             }
 
-            // Quick Test Row for Modern/Casual Hindi (e.g. "My father's funeral" -> "मेरे पापा का फ्यूनरल")
-            Row(
+            // 2. Green Scan Box Preview (Controlled strictly by Single Tap -> isScanBoxVisible)
+            AnimatedVisibility(
+                visible = isScanBoxVisible,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                Surface(
+                    color = NeonEmerald.copy(alpha = 0.08f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(2.dp, NeonEmerald, RoundedCornerShape(12.dp))
+                        .testTag("compose_green_scan_box")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.CropFree,
+                                contentDescription = null,
+                                tint = NeonEmerald,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Green Scan Box Active",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = NeonEmerald,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Badge(
+                            containerColor = if (isVoiceMuted) CrimsonAlert.copy(alpha = 0.2f) else NeonEmerald.copy(alpha = 0.2f),
+                            contentColor = if (isVoiceMuted) CrimsonAlert else NeonEmerald
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isVoiceMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(text = if (isVoiceMuted) "Voice OFF" else "Voice ON")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Quick Character Name & Gender Voice Switch Test Row (Jenny = 18yo Girl Voice, Anon = 18yo Boy Voice)
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
                     .background(SlateSurfaceVariant)
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Casual Hinglish / Bolchal Mode Active",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = NeonEmerald,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "e.g. 'My father's funeral' → 'मेरे पापा का फ्यूनरल'",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White
-                    )
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                OutlinedButton(
-                    onClick = {
-                        onTestCasualHindiTranslation("Character A: I was at my father's funeral.")
-                    },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    modifier = Modifier.testTag("test_casual_hindi_button")
+                Text(
+                    text = "Smart Name Strip & 18yo Gender Voice Switch (Name Not Spoken)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = NeonEmerald,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Translate,
-                        contentDescription = null,
-                        tint = ElectricCyan,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Test Casual",
-                        color = ElectricCyan,
-                        style = MaterialTheme.typography.labelSmall
-                    )
+                    OutlinedButton(
+                        onClick = {
+                            onTestCasualHindiTranslation("Jenny\nWait for me! Where are you going so fast?")
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_jenny_female_voice_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RecordVoiceOver,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Test 'Jenny' (Girl 18y)",
+                            color = ElectricCyan,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            onTestCasualHindiTranslation("Anon\nI was at my father's funeral. Let's head back home.")
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_anon_male_voice_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RecordVoiceOver,
+                            contentDescription = null,
+                            tint = NeonEmerald,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Test 'Anon' (Boy 18y)",
+                            color = NeonEmerald,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
                 }
             }
         }

@@ -62,6 +62,16 @@ data class GameScenePreset(
 
 val GAME_SCENE_PRESETS = listOf(
     GameScenePreset(
+        title = "Jenny (Girl 18y)",
+        speaker = "Jenny",
+        subtitleEnglish = "Wait for me! Where are you going so fast?"
+    ),
+    GameScenePreset(
+        title = "Anon (Boy 18y)",
+        speaker = "Anon",
+        subtitleEnglish = "I was at my father's funeral. Let's head back home."
+    ),
+    GameScenePreset(
         title = "Cyberpunk Sector 7",
         speaker = "Cybernetic Guard",
         subtitleEnglish = "Alert! Target secured in Sector 7. Engage protocols."

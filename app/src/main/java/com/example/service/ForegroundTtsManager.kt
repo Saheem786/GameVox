@@ -13,6 +13,7 @@ import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
@@ -24,6 +25,7 @@ import java.nio.ByteOrder
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.abs
 import kotlin.math.cos
@@ -163,6 +165,18 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     // Maps utteranceId -> spoken text so network synthesis failures can auto-fallback to local voice
     private val activeNetworkUtterances = ConcurrentHashMap<String, String>()
+
+    /**
+     * Available Female TTS Voices fetched from `TextToSpeech.getVoices()` (`engine.voices`),
+     * used when a Female character (e.g. "Jenny", 18yo Girl) is detected in scanned text.
+     */
+    val femaleVoices = CopyOnWriteArrayList<Voice>()
+
+    /**
+     * Available Male TTS Voices fetched from `TextToSpeech.getVoices()` (`engine.voices`),
+     * used when a Male character (e.g. "Anon", 18yo Boy) is detected in scanned text.
+     */
+    val maleVoices = CopyOnWriteArrayList<Voice>()
 
     /**
      * BroadcastReceiver listening for [TextToSpeech.Engine.ACTION_TTS_DATA_INSTALLED]
@@ -326,10 +340,9 @@ class ForegroundTtsManager private constructor(context: Context) {
      * Attaches an [UtteranceProgressListener] that:
      * 1. Synchronizes real-time TTS playback events (`onStart`, `onRangeStart`, `onAudioAvailable`,
      *    `onDone`, `onStop`, `onError`) with [visualizerState] for the Jetpack Compose Canvas Audio Visualizer.
-     * 2. In [onDone], starts a 30-second coroutine (`delay(30000)`) only AFTER the complete sentence/paragraph
+     * 2. In [onDone], starts a 30-second coroutine (`delay(30000)`) ONLY after the complete sentence/paragraph
      *    has finished speaking, then invokes [onThirtySecondPostSpeechDelayCompleted] so if the same text
      *    remains on screen after 30 seconds, it will be spoken again.
-     * 3. Automatically retries using local synthesis if a network voice call fails.
      */
     private fun attachUtteranceProgressListener(engine: TextToSpeech) {
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -376,27 +389,22 @@ class ForegroundTtsManager private constructor(context: Context) {
             }
 
             override fun onDone(utteranceId: String?) {
-                if (utteranceId != null) {
-                    activeNetworkUtterances.remove(utteranceId)
-                    if (utteranceId == "warmup_async_voice_download") {
-                        managerScope.launch {
-                            refreshVoiceConfiguration()
-                        }
-                        return
-                    }
-                    if (activeUtteranceId == utteranceId) {
-                        isSpeakingUtterance = false
-                        activeUtteranceId = null
-                    }
-                    if (_visualizerState.value.utteranceId == utteranceId) {
-                        stopVisualizerSync()
-                    }
-                    // Start exact 30-second coroutine delay ONLY after full text speech finishes in onDone()
-                    thirtySecondRepeatDelayJob?.cancel()
-                    thirtySecondRepeatDelayJob = managerScope.launch {
-                        delay(30000L)
-                        onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
-                    }
+                if (utteranceId == null || utteranceId == "warmup_async_voice_download") {
+                    return
+                }
+                activeNetworkUtterances.remove(utteranceId)
+                isSpeakingUtterance = false
+                if (activeUtteranceId == utteranceId) {
+                    activeUtteranceId = null
+                }
+                if (_visualizerState.value.utteranceId == utteranceId) {
+                    stopVisualizerSync()
+                }
+                // 30-Second Wait Logic: Start Kotlin Coroutine delay(30000) ONLY after TTS finishes speaking full text
+                thirtySecondRepeatDelayJob?.cancel()
+                thirtySecondRepeatDelayJob = managerScope.launch {
+                    delay(30000L)
+                    onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
                 }
             }
 
@@ -426,23 +434,20 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private fun handleUtteranceFailure(utteranceId: String?, errorCode: Int) {
         if (utteranceId == null) return
-        val fallbackText = activeNetworkUtterances.remove(utteranceId)
-        if (fallbackText != null) {
-            Log.w(TAG, "Network synthesis error ($errorCode) for $utteranceId; retrying with local synthesis")
-            managerScope.launch {
-                speakInternal(
-                    text = fallbackText,
-                    allowNetworkSynthesis = false
-                )
-            }
-        } else {
-            if (activeUtteranceId == utteranceId) {
-                isSpeakingUtterance = false
-                activeUtteranceId = null
-            }
-            if (_visualizerState.value.utteranceId == utteranceId) {
-                stopVisualizerSync()
-            }
+        activeNetworkUtterances.remove(utteranceId)
+        Log.w(TAG, "TTS utterance error ($errorCode) for $utteranceId")
+        if (activeUtteranceId == utteranceId) {
+            isSpeakingUtterance = false
+            activeUtteranceId = null
+        }
+        if (_visualizerState.value.utteranceId == utteranceId) {
+            stopVisualizerSync()
+        }
+        // Still apply the 30-second cooldown on failure so the same line does not loop endlessly
+        thirtySecondRepeatDelayJob?.cancel()
+        thirtySecondRepeatDelayJob = managerScope.launch {
+            delay(30000L)
+            onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
         }
     }
 
@@ -457,6 +462,12 @@ class ForegroundTtsManager private constructor(context: Context) {
         speakSampleOnUpgrade: Boolean = false,
         notifyInstalledListeners: Boolean = false
     ) {
+        // Never reconfigure language or voice on the live TTS engine while an utterance is actively speaking,
+        // as calling setLanguage/setVoice mid-utterance cuts off ongoing speech on Android.
+        if (isSpeakingNow()) {
+            return
+        }
+
         val state = TranslatorStateRepository.state.value
         val targetLang = state.targetLanguage
         val primaryLocale = targetLang.locale
@@ -506,13 +517,18 @@ class ForegroundTtsManager private constructor(context: Context) {
             preferNetworkVoice = state.useHighQualityNetworkVoice
         )
 
-        val chosenVoice = voiceSelection.bestInstalledNetworkVoice
-            ?: voiceSelection.bestInstalledVoice
+        // Populate Female & Male TTS voice lists from engine.voices for automatic character gender switching
+        populateGenderVoiceCatalog(engine, targetLang)
+
+        val chosenVoice = voiceSelection.bestInstalledVoice
+            ?: voiceSelection.bestInstalledNetworkVoice
             ?: voiceSelection.bestDownloadableVoice
 
         if (chosenVoice != null) {
             try {
-                engine.voice = chosenVoice
+                if (engine.voice?.name != chosenVoice.name) {
+                    engine.setVoice(chosenVoice)
+                }
             } catch (_: Exception) {
             }
         }
@@ -774,8 +790,10 @@ class ForegroundTtsManager private constructor(context: Context) {
      * so Google Speech Services automatically fetches and caches the Hindi neural voice model in the background.
      */
     private fun triggerSilentAsyncVoicePackWarmup(engine: TextToSpeech, targetLang: TargetLanguage) {
+        if (isSpeakingNow()) return
         managerScope.launch(Dispatchers.IO) {
             try {
+                if (isSpeakingNow()) return@launch
                 val warmupFile = File(appContext.cacheDir, "tts_warmup_${targetLang.code}.wav")
                 val params = Bundle().apply {
                     putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
@@ -927,6 +945,41 @@ class ForegroundTtsManager private constructor(context: Context) {
         )
     }
 
+    /**
+     * Converts multi-sentence or multi-line game text into a single uninterrupted utterance string
+     * by replacing internal sentence-splitting punctuation (`।`, `.`, `!`, `?`, `:`, `;`, newlines)
+     * with soft comma pauses (`, `). This prevents Android's TTS synthesizer from stopping after
+     * the first clause or sentence and guarantees the entire paragraph is spoken in one pass.
+     */
+    private fun prepareSingleContinuousUtterance(rawText: String): String {
+        val collapsed = rawText
+            .replace(Regex("[\\r\\n]+"), ", ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (collapsed.isEmpty()) return ""
+
+        val trailingPunct = collapsed.lastOrNull()?.takeIf { it == '।' || it == '.' || it == '!' || it == '?' }
+        val body = if (trailingPunct != null) collapsed.dropLast(1).trim() else collapsed
+
+        // Replace internal sentence-ending punctuation with a natural comma pause so TTS speaks the whole text continuously
+        val smoothBody = body
+            .replace(Regex("[।.!?]+\\s+"), ", ")
+            .replace(Regex("[:;]+\\s*"), ", ")
+            .replace(Regex(",(\\s*,)+"), ",")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .trimEnd(',')
+            .trim()
+
+        return if (smoothBody.isEmpty()) {
+            collapsed
+        } else if (trailingPunct != null) {
+            "$smoothBody$trailingPunct"
+        } else {
+            smoothBody
+        }
+    }
+
     private fun speakInternal(
         text: String,
         allowNetworkSynthesis: Boolean,
@@ -934,45 +987,48 @@ class ForegroundTtsManager private constructor(context: Context) {
     ): Boolean {
         val engine = tts ?: return false
         val state = TranslatorStateRepository.state.value
-        // Normalize line breaks into single spaces so the entire sentence/paragraph is spoken in one uninterrupted utterance
-        val fullContinuousText = text
-            .replace(Regex("[\\r\\n]+"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+        val fullContinuousText = prepareSingleContinuousUtterance(text)
         if (fullContinuousText.isEmpty()) return false
 
         return try {
-            // Cancel any pending 30-second repeat timer because a new utterance is starting now
+            // Cancel any pending 30-second repeat timer because a genuinely new utterance is starting now
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
 
-            // If a specific character VoiceProfile is provided, select its distinct engine voice variant if available
             if (voiceProfile != null) {
-                selectIndexedVoiceForProfile(engine, state.targetLanguage, voiceProfile.engineVoiceIndex, allowNetworkSynthesis)
+                selectGenderBasedTtsVoice(
+                    engine = engine,
+                    targetLanguage = state.targetLanguage,
+                    gender = voiceProfile.gender,
+                    voiceIndex = voiceProfile.engineVoiceIndex,
+                    preferNetworkVoice = allowNetworkSynthesis
+                )
                 engine.setPitch(voiceProfile.pitch)
                 engine.setSpeechRate(voiceProfile.speechRate)
             } else {
-                engine.setPitch(state.ttsPitch)
-                engine.setSpeechRate(state.ttsSpeechRate)
+                val detectedGender = VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
+                    ?: SpeakerGender.MALE_18
+                selectGenderBasedTtsVoice(
+                    engine = engine,
+                    targetLanguage = state.targetLanguage,
+                    gender = detectedGender,
+                    voiceIndex = 0,
+                    preferNetworkVoice = allowNetworkSynthesis
+                )
+                engine.setPitch(detectedGender.defaultPitch18Yo)
+                engine.setSpeechRate(detectedGender.defaultSpeechRate18Yo)
             }
 
             val utteranceId = "gamevox_${UUID.randomUUID()}"
             val params = Bundle().apply {
                 putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
-                if (allowNetworkSynthesis) {
-                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
-                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_TIMEOUT_MS, "12000")
-                    activeNetworkUtterances[utteranceId] = fullContinuousText
-                } else {
-                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "false")
-                }
             }
 
             isSpeakingUtterance = true
             activeUtteranceId = utteranceId
 
-            // Flush any previous audio (QUEUE_FLUSH) and speak the full new text in one complete pass
+            // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak the complete new text
             val result = engine.speak(fullContinuousText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
                 activeNetworkUtterances.remove(utteranceId)
@@ -1030,14 +1086,14 @@ class ForegroundTtsManager private constructor(context: Context) {
         visualizerSyncJob?.cancel()
         visualizerSyncJob = managerScope.launch {
             val cleanText = text.trim()
-            val words = cleanText.split(Regex("\\s+")).filter { it.isNotEmpty() }
-            // Estimate natural speaking duration in ms (~68ms per char scaled by speechRate, min 1800ms, max 30000ms for full paragraphs)
-            val estimatedDurationMs = ((cleanText.length.coerceAtLeast(12) * 68f) / activeRate.coerceAtLeast(0.55f))
+            // Estimate natural speaking duration in ms (~85ms per char scaled by speechRate, min 2800ms, max 30000ms)
+            val estimatedDurationMs = ((cleanText.length.coerceAtLeast(16) * 85f) / activeRate.coerceAtLeast(0.55f))
                 .toLong()
-                .coerceIn(1800L, 30000L)
+                .coerceIn(2800L, 30000L)
 
             val startMs = System.currentTimeMillis()
             var frameIndex = 0
+            var consecutiveNotSpeakingFrames = 0
 
             while (isActive) {
                 delay(33L) // ~30 FPS real-time Canvas sync
@@ -1054,12 +1110,19 @@ class ForegroundTtsManager private constructor(context: Context) {
                     false
                 }
 
-                // Keep animating while engine.isSpeaking is true OR within the estimated utterance window
-                if (!engineSpeaking && elapsedMs > estimatedDurationMs) {
+                if (engineSpeaking) {
+                    consecutiveNotSpeakingFrames = 0
+                } else {
+                    consecutiveNotSpeakingFrames++
+                }
+
+                // Wait for UtteranceProgressListener.onDone() to stop the visualizer; only exit here if
+                // elapsed time exceeds estimatedDurationMs + 2500ms AND engine has stopped speaking for > 1.5s
+                if (!engineSpeaking && elapsedMs > estimatedDurationMs + 2500L && consecutiveNotSpeakingFrames > 45) {
                     break
                 }
 
-                val timeProgress = (elapsedMs.toFloat() / estimatedDurationMs.toFloat()).coerceIn(0f, 1f)
+                val timeProgress = (elapsedMs.toFloat() / estimatedDurationMs.toFloat()).coerceIn(0f, 0.98f)
                 val effectiveProgress = maxOf(currentVis.progressFraction, timeProgress)
 
                 // Compute current word highlight range if onRangeStart hasn't overridden it
@@ -1111,6 +1174,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                 }
             }
 
+            // Fallback cleanup ONLY if UtteranceProgressListener.onDone() did not fire on a stub/emulator engine
             if (activeUtteranceId == utteranceId) {
                 isSpeakingUtterance = false
                 activeUtteranceId = null
@@ -1162,32 +1226,138 @@ class ForegroundTtsManager private constructor(context: Context) {
         return rms to bands
     }
 
-    private fun selectIndexedVoiceForProfile(
+    /**
+     * Fetches all available voices from [TextToSpeech.getVoices] (`engine.voices`) and populates
+     * [femaleVoices] and [maleVoices] so character names (e.g., "Jenny" -> Female, "Anon" -> Male)
+     * can immediately switch the active TTS voice via `tts.setVoice()`.
+     */
+    private fun populateGenderVoiceCatalog(
         engine: TextToSpeech,
-        targetLanguage: TargetLanguage,
-        voiceIndex: Int,
-        preferNetworkVoice: Boolean
+        targetLanguage: TargetLanguage
     ) {
         try {
             val allVoices = engine.voices ?: return
             val installedForLang = allVoices.filter { voice ->
                 val features = voice.features.orEmpty()
                 voice.locale != null &&
-                    voice.locale.language.equals(targetLanguage.code, ignoreCase = true) &&
+                    (voice.locale.language.equals(targetLanguage.code, ignoreCase = true) ||
+                        voice.locale.language.equals("hi", ignoreCase = true) ||
+                        voice.locale.language.equals("en", ignoreCase = true)) &&
                     !features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) &&
                     !features.contains("notInstalled")
             }.sortedWith(
-                compareByDescending<Voice> { voice ->
+                compareByDescending<Voice> {
+                    it.locale.language.equals(targetLanguage.code, ignoreCase = true)
+                }.thenByDescending { voice ->
                     val isNet = voice.isNetworkConnectionRequired ||
-                        voice.name.contains("network", ignoreCase = true) ||
-                        voice.name.contains("wavenet", ignoreCase = true)
-                    if (preferNetworkVoice) (if (isNet) 2 else 1) else (if (!isNet) 2 else 1)
+                        voice.name.contains("network", ignoreCase = true)
+                    if (!isNet) 2 else 1
                 }.thenByDescending { it.quality }.thenBy { it.name }
             )
-            if (installedForLang.isNotEmpty()) {
-                val chosen = installedForLang[voiceIndex.coerceAtLeast(0) % installedForLang.size]
-                if (engine.voice?.name != chosen.name) {
-                    engine.voice = chosen
+
+            if (installedForLang.isEmpty()) return
+
+            val detectedFemales = mutableListOf<Voice>()
+            val detectedMales = mutableListOf<Voice>()
+            val unclassified = mutableListOf<Voice>()
+
+            for (voice in installedForLang) {
+                val lowerName = voice.name.lowercase(Locale.ROOT)
+                val lowerFeatures = voice.features.orEmpty().joinToString(" ").lowercase(Locale.ROOT)
+                val combined = "$lowerName $lowerFeatures"
+
+                val isExplicitFemale = combined.contains("female") ||
+                    lowerName.contains("-f-") ||
+                    lowerName.contains("_f_") ||
+                    lowerName.endsWith("-f") ||
+                    // Google TTS hi-IN / en-IN standard female voice codes (A, C, E, hia, hic, hie)
+                    lowerName.contains("hi-in-x-hia") ||
+                    lowerName.contains("hi-in-x-hic") ||
+                    lowerName.contains("hi-in-x-hie") ||
+                    lowerName.contains("wavenet-a") ||
+                    lowerName.contains("wavenet-c") ||
+                    lowerName.contains("standard-a") ||
+                    lowerName.contains("standard-c") ||
+                    lowerName.contains("en-in-x-ena") ||
+                    lowerName.contains("en-in-x-enc") ||
+                    lowerName.contains("en-in-x-ene")
+
+                val isExplicitMale = combined.contains("male") && !combined.contains("female") ||
+                    lowerName.contains("-m-") ||
+                    lowerName.contains("_m_") ||
+                    lowerName.endsWith("-m") ||
+                    // Google TTS hi-IN / en-IN standard male voice codes (B, D, hib, hid, hif)
+                    lowerName.contains("hi-in-x-hib") ||
+                    lowerName.contains("hi-in-x-hid") ||
+                    lowerName.contains("hi-in-x-hif") ||
+                    lowerName.contains("wavenet-b") ||
+                    lowerName.contains("wavenet-d") ||
+                    lowerName.contains("standard-b") ||
+                    lowerName.contains("standard-d") ||
+                    lowerName.contains("en-in-x-enb") ||
+                    lowerName.contains("en-in-x-end")
+
+                when {
+                    isExplicitFemale -> detectedFemales.add(voice)
+                    isExplicitMale -> detectedMales.add(voice)
+                    else -> unclassified.add(voice)
+                }
+            }
+
+            // Partition any remaining unclassified voices evenly so both femaleVoices and maleVoices are always non-empty
+            unclassified.forEachIndexed { idx, voice ->
+                if (idx % 2 == 0) {
+                    detectedFemales.add(voice)
+                } else {
+                    detectedMales.add(voice)
+                }
+            }
+
+            if (detectedFemales.isEmpty() && installedForLang.isNotEmpty()) {
+                detectedFemales.add(installedForLang.first())
+            }
+            if (detectedMales.isEmpty() && installedForLang.isNotEmpty()) {
+                detectedMales.add(installedForLang.last())
+            }
+
+            femaleVoices.clear()
+            femaleVoices.addAll(detectedFemales)
+            maleVoices.clear()
+            maleVoices.addAll(detectedMales)
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Automatically selects a Female TTS Voice (from [femaleVoices]) or Male TTS Voice (from [maleVoices])
+     * based on the detected character's [gender] (e.g. "Jenny" -> [SpeakerGender.FEMALE_18],
+     * "Anon" -> [SpeakerGender.MALE_18]) and calls `engine.setVoice(chosenVoice)` (`tts.setVoice()`).
+     */
+    private fun selectGenderBasedTtsVoice(
+        engine: TextToSpeech,
+        targetLanguage: TargetLanguage,
+        gender: SpeakerGender,
+        voiceIndex: Int,
+        preferNetworkVoice: Boolean
+    ) {
+        try {
+            if (femaleVoices.isEmpty() || maleVoices.isEmpty()) {
+                populateGenderVoiceCatalog(engine, targetLanguage)
+            }
+
+            val genderPool: List<Voice> = when (gender) {
+                SpeakerGender.FEMALE_18 -> femaleVoices
+                SpeakerGender.MALE_18 -> maleVoices
+            }
+
+            if (genderPool.isNotEmpty()) {
+                val langFiltered = genderPool.filter {
+                    it.locale?.language.equals(targetLanguage.code, ignoreCase = true)
+                }.ifEmpty { genderPool }
+
+                val chosenVoice = langFiltered[voiceIndex.coerceAtLeast(0) % langFiltered.size]
+                if (engine.voice?.name != chosenVoice.name) {
+                    engine.setVoice(chosenVoice)
                 }
             }
         } catch (_: Exception) {

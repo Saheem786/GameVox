@@ -94,6 +94,8 @@ class ScreenTranslatorService : Service() {
 
     private var simulatedPresetIndex = 0
     private val builtInGameDialogues = listOf(
+        "Jenny" to "Wait for me! Where are you going so fast?",
+        "Anon" to "I was at my father's funeral. Let's head back home.",
         "Cybernetic Guard" to "Alert! Target secured in Sector 7. Engage protocols.",
         "Ancient Dragon" to "You dare challenge the keeper of the eternal flame?",
         "Squad Leader" to "Hold your position! Reinforcements arriving in thirty seconds.",
@@ -213,13 +215,14 @@ class ScreenTranslatorService : Service() {
             }
 
             ACTION_TOGGLE_SCANNING -> {
-                overlayController?.toggleBoxesVisibilityOnDoubleTap()
+                val showCaptions = TranslatorStateRepository.state.value.isSubtitleVisible
+                overlayController?.setSubtitleCaptionsVisibility(showCaptions)
                 return START_STICKY
             }
 
             ACTION_TOGGLE_TARGET_BOX -> {
                 val showBox = TranslatorStateRepository.state.value.showTargetBoxOverlay
-                overlayController?.setBoxesVisibility(showBox, notifyCallback = true)
+                overlayController?.setScanBoxVisibility(showBox, notifyCallback = true)
                 return START_STICKY
             }
 
@@ -254,6 +257,8 @@ class ScreenTranslatorService : Service() {
                 val subtitle = intent?.getStringExtra(EXTRA_SIMULATED_SUBTITLE).orEmpty()
                 if (subtitle.isNotBlank()) {
                     serviceScope.launch {
+                        // If a genuinely new subtitle is requested manually, flush ongoing speech so the new text speaks
+                        ttsManager.stopSpeaking()
                         val sampleBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, subtitle)
                         pipeline.processCapturedFrame(
                             rawBitmap = sampleBitmap,

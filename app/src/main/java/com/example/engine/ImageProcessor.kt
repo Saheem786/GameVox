@@ -292,8 +292,7 @@ class ImageProcessor(
                 val cleanedBlockText = block.lines
                     .map { it.text.trim() }
                     .filter { it.length >= 2 }
-                    .joinToString(" ")
-                    .replace(Regex("\\s+"), " ")
+                    .joinToString("\n")
                     .trim()
 
                 if (cleanedBlockText.length < 2) {
@@ -323,8 +322,7 @@ class ImageProcessor(
             subtitleBlocks.ifEmpty { blocks }
         }
         return targetBlocks
-            .joinToString(" ") { it.text }
-            .replace(Regex("\\s+"), " ")
+            .joinToString("\n") { it.text }
             .trim()
     }
 

@@ -100,15 +100,14 @@ object BitmapInverter {
             typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
         }
 
-        val fullText = if (speakerName.isNotBlank()) {
-            "$speakerName: $subtitleEnglish"
-        } else {
-            subtitleEnglish
+        val maxLineWidth = boxRect.width() - 80f
+        val lines = mutableListOf<String>()
+
+        if (speakerName.isNotBlank()) {
+            lines.add(speakerName.trim())
         }
 
-        val maxLineWidth = boxRect.width() - 80f
-        val words = fullText.split(" ")
-        val lines = mutableListOf<String>()
+        val words = subtitleEnglish.split(" ")
         var currentLine = StringBuilder()
 
         for (word in words) {

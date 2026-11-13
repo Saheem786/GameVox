@@ -28,29 +28,31 @@ object HindiTranslationEngine {
 
     private val MULTI_LANG_DIALOGUE_MAP: Map<TargetLanguage, Map<String, String>> = mapOf(
         TargetLanguage.HINDI to mapOf(
+            "wait for me! where are you going so fast?" to "अरे मेरा वेट करो! इतनी जल्दी कहाँ जा रहे हो?",
+            "i was at my father's funeral. let's head back home." to "मैं अपने पापा के फ्यूनरल पे था। चलो वापस घर चलते हैं।",
             "my father's funeral" to "मेरे पापा का फ्यूनरल",
             "at my father's funeral" to "मेरे पापा के फ्यूनरल पे",
             "i was at my father's funeral." to "मैं अपने पापा के फ्यूनरल पे था।",
             "cybernetic guard: alert! target secured in sector 7. engage protocols." to
-                "साइबरनेटिक गार्ड: अलर्ट! सेक्टर 7 में टारगेट सेफ है। प्रोटोकॉल चालू करो।",
+                "अलर्ट! सेक्टर 7 में टारगेट सेफ है। प्रोटोकॉल चालू करो।",
             "alert! target secured in sector 7. engage protocols." to
                 "अलर्ट! सेक्टर 7 में टारगेट सेफ है। प्रोटोकॉल चालू करो।",
             "ancient dragon: you dare challenge the keeper of the eternal flame?" to
-                "एन्शिएंट ड्रैगन: तुम्हारी हिम्मत कैसे हुई एटर्नल फ्लेम के गार्जियन को चैलेंज करने की?",
+                "तुम्हारी हिम्मत कैसे हुई एटर्नल फ्लेम के गार्जियन को चैलेंज करने की?",
             "you dare challenge the keeper of the eternal flame?" to
                 "तुम्हारी हिम्मत कैसे हुई एटर्नल फ्लेम के गार्जियन को चैलेंज करने की?",
             "squad leader: hold your position! reinforcements arriving in thirty seconds." to
-                "स्क्वाड लीडर: अपनी पोज़िशन होल्ड करो! 30 सेकंड में बैकअप आ रहा है।",
+                "अपनी पोज़िशन होल्ड करो! 30 सेकंड में बैकअप आ रहा है।",
             "hold your position! reinforcements arriving in thirty seconds." to
                 "अपनी पोज़िशन होल्ड करो! 30 सेकंड में बैकअप आ रहा है।",
             "mystic oracle: seek the hidden temple beyond the crimson mountains before dawn." to
-                "मिस्टिक ओरेकल: सुबह होने से पहले लाल पहाड़ों के उस पार छुपा हुआ मंदिर ढूंढो।",
+                "सुबह होने से पहले लाल पहाड़ों के उस पार छुपा हुआ मंदिर ढूंढो।",
             "mystic oracle: seek the hidden temple beyond thecrimson mountains before dawn." to
-                "मिस्टिक ओरेकल: सुबह होने से पहले लाल पहाड़ों के उस पार छुपा हुआ मंदिर ढूंढो।",
+                "सुबह होने से पहले लाल पहाड़ों के उस पार छुपा हुआ मंदिर ढूंढो।",
             "seek the hidden temple beyond the crimson mountains before dawn." to
                 "सुबह होने से पहले लाल पहाड़ों के उस पार छुपा हुआ मंदिर ढूंढो।",
             "system terminal: security override complete. main vault door unlocked." to
-                "सिस्टम टर्मिनल: सिक्योरिटी ओवरराइड पूरा हो गया। मेन वॉल्ट का गेट खुल गया है।",
+                "सिक्योरिटी ओवरराइड पूरा हो गया। मेन वॉल्ट का गेट खुल गया है।",
             "security override complete. main vault door unlocked." to
                 "सिक्योरिटी ओवरराइड पूरा हो गया। मेन वॉल्ट का गेट खुल गया है।",
             "hold the northern gate!" to
@@ -343,11 +345,11 @@ object HindiTranslationEngine {
         englishText: String,
         targetLanguage: TargetLanguage = TargetLanguage.HINDI
     ): String {
-        val clean = englishText.trim()
+        val clean = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
         if (clean.isEmpty()) return ""
 
         val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
-        val cacheKey = "${targetLanguage.code}_casual_v2:$normalized"
+        val cacheKey = "${targetLanguage.code}_casual_v3:$normalized"
 
         translationCache.get(cacheKey)?.let { return it }
 
@@ -480,9 +482,8 @@ object HindiTranslationEngine {
             val speaker = parts[0].trim()
             val body = parts[1].trim()
             if (speaker.isNotEmpty() && body.isNotEmpty() && speaker.split(" ").size <= 4) {
-                val translatedSpeaker = translateHindiClause(speaker)
-                val translatedBody = translateHindiClause(body)
-                return "$translatedSpeaker: $translatedBody"
+                // Never include the character name in the translated dialogue
+                return translateHindiClause(body)
             }
         }
         return translateHindiClause(clean)

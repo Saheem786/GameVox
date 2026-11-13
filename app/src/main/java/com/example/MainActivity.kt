@@ -473,30 +473,14 @@ fun GameVoxHindiDashboard(
                 }
 
                 // 1.05. Jetpack Compose Floating Icon Tap Controls (`Modifier.pointerInput` + `detectTapGestures`)
-                // - Single Tap (`onTap`): Toggles ONLY `isVoiceMuted` (TTS Mute/Unmute)
-                // - Double Tap (`onDoubleTap`): Toggles ONLY `isSubtitleVisible` (Show/Hide Subtitle Box & Scan)
+                // - Single Tap (`onTap`): Toggles ONLY the Green Scan Box (`showTargetBoxOverlay`)
+                // - Double Tap (`onDoubleTap`): Toggles ONLY the Translated Captions Box (`isSubtitleVisible`)
+                // - Long Press (`onLongPress`): Toggles Voice ON/OFF (`isVoiceMuted`)
                 item {
                     FloatingIconGestureOverlayCard(
                         state = state,
-                        onSingleTapVoiceMuteChanged = { muted ->
-                            TranslatorStateRepository.setVoiceMuted(context, muted)
-                            if (muted) {
-                                localPipeline.ttsManager.stopSpeaking()
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Voice Muted (Single Tap) — Subtitles still active")
-                                }
-                            } else {
-                                val currentHindi = state.lastTranslatedHindi
-                                if (currentHindi.isNotBlank() && currentHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
-                                    localPipeline.speakHindiNonBlocking(currentHindi, forceSpeakEvenIfRepeat = true)
-                                }
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Voice Unmuted (Single Tap)")
-                                }
-                            }
-                        },
-                        onDoubleTapSubtitleVisibilityChanged = { visible ->
-                            TranslatorStateRepository.setSubtitleVisible(context, visible)
+                        onSingleTapScanBoxVisibilityChanged = { scanBoxVisible ->
+                            TranslatorStateRepository.updateShowTargetBoxOverlay(context, scanBoxVisible)
                             if (state.isServiceRunning) {
                                 val intent = Intent(context, ScreenTranslatorService::class.java).apply {
                                     action = ScreenTranslatorService.ACTION_TOGGLE_TARGET_BOX
@@ -505,13 +489,42 @@ fun GameVoxHindiDashboard(
                             }
                             coroutineScope.launch {
                                 snackbarHostState.showSnackbar(
-                                    if (visible) "Subtitle Box Shown & Scanning Resumed (Double Tap)"
-                                    else "Subtitle Box Hidden & Scanning Paused (Double Tap)"
+                                    if (scanBoxVisible) "Green Scan Box Shown (Single Tap)"
+                                    else "Green Scan Box Hidden (Single Tap)"
                                 )
                             }
                         },
-                        onLongPressOpenSettings = {
-                            TranslatorStateRepository.setShowSettingsBottomSheet(true)
+                        onDoubleTapSubtitleVisibilityChanged = { captionsVisible ->
+                            TranslatorStateRepository.setSubtitleVisible(context, captionsVisible)
+                            if (state.isServiceRunning) {
+                                val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                                    action = ScreenTranslatorService.ACTION_TOGGLE_SCANNING
+                                }
+                                context.startService(intent)
+                            }
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar(
+                                    if (captionsVisible) "Translated Captions Box Shown (Double Tap)"
+                                    else "Translated Captions Box Hidden (Double Tap) — Green Scan Box untouched"
+                                )
+                            }
+                        },
+                        onLongPressVoiceMuteChanged = { muted ->
+                            TranslatorStateRepository.setVoiceMuted(context, muted)
+                            if (muted) {
+                                localPipeline.ttsManager.stopSpeaking()
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("Voice Muted (Long Press)")
+                                }
+                            } else {
+                                val currentHindi = state.lastTranslatedHindi
+                                if (currentHindi.isNotBlank() && currentHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
+                                    localPipeline.speakHindiNonBlocking(currentHindi, forceSpeakEvenIfRepeat = true)
+                                }
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("Voice Unmuted (Long Press)")
+                                }
+                            }
                         },
                         onTestCasualHindiTranslation = { sampleEng ->
                             localPipeline.resetAntiRepeatMemory()
@@ -875,7 +888,7 @@ private fun HeroControlBanner(
                         color = Color.White
                     )
                     Text(
-                        text = "1-Tap Icon: Voice Mute/Unmute • 2-Tap: Show/Hide Subtitle Box",
+                        text = "1-Tap: Green Scan Box • 2-Tap: Translated Captions • Hold: Voice Mute",
                         style = MaterialTheme.typography.bodyMedium,
                         color = ElectricCyan
                     )
