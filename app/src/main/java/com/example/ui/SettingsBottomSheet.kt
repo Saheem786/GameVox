@@ -1,23 +1,21 @@
 package com.example.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.InvertColors
@@ -34,6 +32,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -44,9 +43,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -59,6 +58,7 @@ import com.example.ui.theme.SaffronGold
 import com.example.ui.theme.SlateCardElevated
 import com.example.ui.theme.SlateSurface
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,6 +75,18 @@ fun SettingsBottomSheet(
     onResetAntiRepeat: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+
+    val dismissCleanly: () -> Unit = {
+        scope.launch {
+            try {
+                sheetState.hide()
+            } catch (_: Exception) {
+            } finally {
+                onDismiss()
+            }
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -91,13 +103,16 @@ fun SettingsBottomSheet(
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Header
+            // Header with immediate Close / Dismiss button
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Icon(
                         imageVector = Icons.Default.Tune,
                         contentDescription = "Voice and OCR Settings",
@@ -112,17 +127,31 @@ fun SettingsBottomSheet(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Opened via Long-Press on Floating Icon or HUD Controls",
+                            text = "Tune Hindi Voice Pitch, Speed & Screen Reader",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+
+                IconButton(
+                    onClick = dismissCleanly,
+                    modifier = Modifier.testTag("close_settings_sheet_icon_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Close Settings Dialog",
+                        tint = MaterialTheme.colorScheme.onSurface
+                    )
                 }
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
             // 1. Hindi TTS Installation & Voice Check Card
+            val isTtsWorking = state.ttsStatus == TtsEngineStatus.READY ||
+                state.ttsStatus == TtsEngineStatus.FALLBACK_VOICE_READY
+
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -130,11 +159,7 @@ fun SettingsBottomSheet(
                     .fillMaxWidth()
                     .border(
                         width = 1.dp,
-                        color = when (state.ttsStatus) {
-                            TtsEngineStatus.READY -> NeonEmerald.copy(alpha = 0.5f)
-                            TtsEngineStatus.MISSING_HINDI_DATA -> SaffronGold.copy(alpha = 0.7f)
-                            else -> CrimsonAlert.copy(alpha = 0.5f)
-                        },
+                        color = if (isTtsWorking) NeonEmerald.copy(alpha = 0.5f) else SaffronGold.copy(alpha = 0.7f),
                         shape = RoundedCornerShape(16.dp)
                     )
             ) {
@@ -147,24 +172,19 @@ fun SettingsBottomSheet(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
                             Icon(
-                                imageVector = if (state.ttsStatus == TtsEngineStatus.READY) {
-                                    Icons.Default.CheckCircle
-                                } else {
-                                    Icons.Default.Warning
-                                },
+                                imageVector = if (isTtsWorking) Icons.Default.CheckCircle else Icons.Default.Warning,
                                 contentDescription = "Hindi TTS Status",
-                                tint = when (state.ttsStatus) {
-                                    TtsEngineStatus.READY -> NeonEmerald
-                                    TtsEngineStatus.MISSING_HINDI_DATA -> SaffronGold
-                                    else -> CrimsonAlert
-                                },
+                                tint = if (isTtsWorking) NeonEmerald else SaffronGold,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Hindi TTS (hi-IN): ${state.ttsStatus.label}",
+                                text = "Hindi TTS: ${state.ttsStatus.label}",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
@@ -183,12 +203,6 @@ fun SettingsBottomSheet(
                             modifier = Modifier.testTag("recheck_tts_chip")
                         )
                     }
-
-                    Text(
-                        text = "Non-blocking async TTS is active: OCR and Hindi translation never freeze even if voice data is still initializing.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -229,7 +243,7 @@ fun SettingsBottomSheet(
                 }
             }
 
-            // 2. TTS Pitch Slider (Default 0.8f for less robotic voice)
+            // 2. TTS Pitch Slider (Default 0.8f)
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -260,11 +274,6 @@ fun SettingsBottomSheet(
                             modifier = Modifier.testTag("reset_pitch_chip")
                         )
                     }
-                    Text(
-                        text = "0.80f lowers pitch slightly for a deeper, natural cinematic Hindi narration.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                     Slider(
                         value = state.ttsPitch,
                         onValueChange = onPitchChange,
@@ -309,11 +318,6 @@ fun SettingsBottomSheet(
                             modifier = Modifier.testTag("reset_rate_chip")
                         )
                     }
-                    Text(
-                        text = "0.90f paces Hindi syllables clearly without sounding rushed or robotic.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                     Slider(
                         value = state.ttsSpeechRate,
                         onValueChange = onSpeechRateChange,
@@ -359,7 +363,7 @@ fun SettingsBottomSheet(
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text = "Inverts white game subtitles on dark scenes into black text on light background before ML Kit OCR.",
+                                    text = "Inverts white game subtitles on dark scenes into black text before ML Kit OCR.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -431,6 +435,23 @@ fun SettingsBottomSheet(
                         }
                     }
                 }
+            }
+
+            // Explicit Close / Dismiss Button at bottom so the dialog always closes in 1 tap
+            Button(
+                onClick = dismissCleanly,
+                colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("close_settings_sheet_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Close / Dismiss Settings", fontWeight = FontWeight.Bold)
             }
         }
     }

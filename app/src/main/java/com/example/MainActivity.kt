@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -10,12 +11,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -39,6 +40,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.BubbleChart
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteSweep
@@ -73,7 +75,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -97,13 +98,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.ModelDownloadStatus
 import com.example.data.SubtitleTranslationEntry
 import com.example.data.TranslatorAppState
 import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
 import com.example.engine.BitmapInverter
 import com.example.engine.OcrTranslationPipeline
+import com.example.service.GameVoxAccessibilityService
 import com.example.service.ScreenTranslatorService
 import com.example.ui.GAME_SCENE_PRESETS
 import com.example.ui.GameSimulatorSection
@@ -127,20 +128,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         TranslatorStateRepository.loadPreferences(applicationContext)
-        localPipeline = OcrTranslationPipeline(applicationContext)
+        localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
 
-        // Generate an initial sample preview on first launch so the user immediately sees
-        // how ColorMatrix inversion turns white game subtitles into black text for ML Kit OCR.
-        val initialPreset = GAME_SCENE_PRESETS.first()
-        val rawSample = BitmapInverter.createSampleGameSubtitleBitmap(
-            initialPreset.speaker,
-            initialPreset.subtitleEnglish
-        )
-        val invSample = BitmapInverter.invertBitmap(rawSample)
-        TranslatorStateRepository.updateFramePreviews(
-            BitmapInverter.createPreviewThumbnail(rawSample),
-            BitmapInverter.createPreviewThumbnail(invSample)
-        )
+        if (TranslatorStateRepository.state.value.originalFramePreview == null) {
+            val initialPreset = GAME_SCENE_PRESETS.first()
+            val rawSample = BitmapInverter.createSampleGameSubtitleBitmap(
+                initialPreset.speaker,
+                initialPreset.subtitleEnglish
+            )
+            val invSample = BitmapInverter.invertBitmap(rawSample)
+            TranslatorStateRepository.updateFramePreviews(
+                BitmapInverter.createPreviewThumbnail(rawSample),
+                BitmapInverter.createPreviewThumbnail(invSample)
+            )
+        }
 
         setContent {
             MyApplicationTheme {
@@ -156,13 +157,6 @@ class MainActivity : ComponentActivity() {
         if (::localPipeline.isInitialized) {
             localPipeline.refreshTtsConfiguration()
         }
-    }
-
-    override fun onDestroy() {
-        if (::localPipeline.isInitialized) {
-            localPipeline.release()
-        }
-        super.onDestroy()
     }
 }
 
@@ -184,13 +178,18 @@ fun GameVoxHindiDashboard(
     var hasNotificationPermission by remember {
         mutableStateOf(checkNotificationPermission(context))
     }
+    var isAccessibilityEnabled by remember {
+        mutableStateOf(checkAccessibilityServiceEnabled(context))
+    }
 
-    // Re-check permissions whenever returning from Android System Settings
+    // Re-check permissions cleanly whenever returning from Android System Settings
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasOverlayPermission = Settings.canDrawOverlays(context)
                 hasNotificationPermission = checkNotificationPermission(context)
+                isAccessibilityEnabled = checkAccessibilityServiceEnabled(context)
+                TranslatorStateRepository.setAccessibilityConnected(isAccessibilityEnabled)
                 localPipeline.refreshTtsConfiguration()
             }
         }
@@ -210,7 +209,13 @@ fun GameVoxHindiDashboard(
         hasOverlayPermission = Settings.canDrawOverlays(context)
     }
 
-    // MediaProjection Screen Capture consent launcher
+    val accessibilitySettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        isAccessibilityEnabled = checkAccessibilityServiceEnabled(context)
+        TranslatorStateRepository.setAccessibilityConnected(isAccessibilityEnabled)
+    }
+
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -222,11 +227,7 @@ fun GameVoxHindiDashboard(
             }
             ContextCompat.startForegroundService(context, serviceIntent)
             coroutineScope.launch {
-                snackbarHostState.showSnackbar("Floating Translator & 2s MediaProjection OCR Started!")
-            }
-        } else {
-            coroutineScope.launch {
-                snackbarHostState.showSnackbar("Screen capture cancelled. You can still test the Floating Overlay or Simulator below.")
+                snackbarHostState.showSnackbar("Floating Translator & 2s Screen Capture Started!")
             }
         }
     }
@@ -264,7 +265,7 @@ fun GameVoxHindiDashboard(
                                 style = MaterialTheme.typography.titleLarge
                             )
                             Text(
-                                text = "OCR • ColorMatrix • ML Kit HI • TTS",
+                                text = "Accessibility • OCR • Hindi TTS",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan
                             )
@@ -312,27 +313,13 @@ fun GameVoxHindiDashboard(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // 1. Hero Banner & Floating Overlay Controls
+                // 1. Hero Banner & Floating Overlay Controls (Never chains multiple dialogs!)
                 item {
                     HeroControlBanner(
                         state = state,
                         hasOverlayPermission = hasOverlayPermission,
-                        onLaunchFullScreenCapture = {
-                            if (!hasOverlayPermission) {
-                                val intent = Intent(
-                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                    Uri.parse("package:${context.packageName}")
-                                )
-                                overlaySettingsLauncher.launch(intent)
-                                return@HeroControlBanner
-                            }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
-                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                            }
-                            val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                            mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
-                        },
-                        onLaunchFloatingOverlayDemo = {
+                        isAccessibilityEnabled = isAccessibilityEnabled,
+                        onStartFloatingIcon = {
                             if (!hasOverlayPermission) {
                                 val intent = Intent(
                                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -345,6 +332,22 @@ fun GameVoxHindiDashboard(
                                 action = ScreenTranslatorService.ACTION_START_DEMO_OVERLAY
                             }
                             ContextCompat.startForegroundService(context, serviceIntent)
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar("Floating Icon Active! Single-tap icon to read & speak game text.")
+                            }
+                        },
+                        onLaunchFullScreenCapture = {
+                            if (!hasOverlayPermission) {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                overlaySettingsLauncher.launch(intent)
+                                return@HeroControlBanner
+                            }
+                            // Only launch MediaProjection (1 single system dialog, no chained dialog loop!)
+                            val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                            mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
                         },
                         onToggleScanning = {
                             if (state.isServiceRunning) {
@@ -365,11 +368,12 @@ fun GameVoxHindiDashboard(
                     )
                 }
 
-                // 2. Permissions & Engine Readiness Checklist
+                // 2. Permissions & AccessibilityService Readiness Checklist
                 item {
                     PermissionsAndEngineStatusCard(
                         state = state,
                         hasOverlayPermission = hasOverlayPermission,
+                        isAccessibilityEnabled = isAccessibilityEnabled,
                         hasNotificationPermission = hasNotificationPermission,
                         onGrantOverlay = {
                             val intent = Intent(
@@ -377,6 +381,10 @@ fun GameVoxHindiDashboard(
                                 Uri.parse("package:${context.packageName}")
                             )
                             overlaySettingsLauncher.launch(intent)
+                        },
+                        onEnableAccessibility = {
+                            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                            accessibilitySettingsLauncher.launch(intent)
                         },
                         onGrantNotification = {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -392,7 +400,7 @@ fun GameVoxHindiDashboard(
                     )
                 }
 
-                // 3. Live OCR Debug Readout & Hindi Translation Card (Mirrors Floating Debug TextView)
+                // 3. Live OCR Debug Readout & Hindi Translation Card
                 item {
                     LiveOcrDebugMonitorCard(
                         state = state,
@@ -413,6 +421,8 @@ fun GameVoxHindiDashboard(
                     GameSimulatorSection(
                         state = state,
                         onSimulateFrameScan = { speaker, subtitle ->
+                            // Reset anti-repeat when user clicks Scan & Speak in simulator so it always speaks
+                            localPipeline.resetAntiRepeatMemory()
                             if (state.isServiceRunning) {
                                 val intent = Intent(context, ScreenTranslatorService::class.java).apply {
                                     action = ScreenTranslatorService.ACTION_PROCESS_SIMULATED_FRAME
@@ -482,7 +492,7 @@ fun GameVoxHindiDashboard(
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text = "Tap 'Scan & Speak Hindi' above or launch the Floating Translator over any game.",
+                                    text = "Tap 'Scan & Speak Hindi' above or launch the Floating Icon over any game.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -508,6 +518,7 @@ fun GameVoxHindiDashboard(
         }
     }
 
+    // Controlled single-dialog Jetpack Compose state — only 1 dialog can ever open, and Dismiss closes it immediately
     if (state.showSettingsBottomSheet) {
         SettingsBottomSheet(
             state = state,
@@ -515,24 +526,10 @@ fun GameVoxHindiDashboard(
             onPitchChange = { newPitch ->
                 TranslatorStateRepository.updateTtsPitch(context, newPitch)
                 localPipeline.refreshTtsConfiguration()
-                if (state.isServiceRunning) {
-                    context.startService(
-                        Intent(context, ScreenTranslatorService::class.java).apply {
-                            action = ScreenTranslatorService.ACTION_REFRESH_TTS
-                        }
-                    )
-                }
             },
             onSpeechRateChange = { newRate ->
                 TranslatorStateRepository.updateTtsSpeechRate(context, newRate)
                 localPipeline.refreshTtsConfiguration()
-                if (state.isServiceRunning) {
-                    context.startService(
-                        Intent(context, ScreenTranslatorService::class.java).apply {
-                            action = ScreenTranslatorService.ACTION_REFRESH_TTS
-                        }
-                    )
-                }
             },
             onInvertColorsChange = { enabled ->
                 TranslatorStateRepository.updateInvertColors(context, enabled)
@@ -541,24 +538,17 @@ fun GameVoxHindiDashboard(
                 TranslatorStateRepository.updateCaptureInterval(context, intervalMs)
             },
             onTestHindiTts = {
-                if (state.isServiceRunning) {
-                    context.startService(
-                        Intent(context, ScreenTranslatorService::class.java).apply {
-                            action = ScreenTranslatorService.ACTION_TEST_TTS
-                        }
-                    )
-                } else {
-                    localPipeline.refreshTtsConfiguration()
-                    localPipeline.speakHindiNonBlocking(
-                        "नमस्ते गेमर! आपकी हिंदी आवाज की पिच और गति सेट हो गई है।",
-                        forceSpeakEvenIfRepeat = true
-                    )
-                }
+                localPipeline.refreshTtsConfiguration()
+                localPipeline.speakHindiNonBlocking(
+                    "नमस्ते गेमर! आपकी हिंदी आवाज की पिच और गति सेट हो गई है।",
+                    forceSpeakEvenIfRepeat = true
+                )
             },
             onRefreshTtsStatus = {
                 localPipeline.refreshTtsConfiguration()
             },
             onInstallHindiVoiceData = {
+                TranslatorStateRepository.setShowSettingsBottomSheet(false)
                 localPipeline.promptInstallHindiTtsData(context)
             },
             onResetAntiRepeat = {
@@ -572,8 +562,9 @@ fun GameVoxHindiDashboard(
 private fun HeroControlBanner(
     state: TranslatorAppState,
     hasOverlayPermission: Boolean,
+    isAccessibilityEnabled: Boolean,
+    onStartFloatingIcon: () -> Unit,
     onLaunchFullScreenCapture: () -> Unit,
-    onLaunchFloatingOverlayDemo: () -> Unit,
     onToggleScanning: () -> Unit,
     onStopService: () -> Unit
 ) {
@@ -614,7 +605,6 @@ private fun HeroControlBanner(
                         )
                 )
 
-                // Status badge in top-right
                 Surface(
                     color = if (state.isCapturingOcr) NeonEmerald else SlateCardElevated,
                     shape = RoundedCornerShape(50),
@@ -657,7 +647,7 @@ private fun HeroControlBanner(
                         color = Color.White
                     )
                     Text(
-                        text = "Single-Tap Floating Icon: Start/Stop OCR • Long-Press: Hindi TTS Settings",
+                        text = "Single-Tap Floating Icon: Start/Stop Speech • Hold: TTS Settings",
                         style = MaterialTheme.typography.bodyMedium,
                         color = ElectricCyan
                     )
@@ -670,24 +660,26 @@ private fun HeroControlBanner(
             ) {
                 if (!state.isServiceRunning) {
                     Button(
-                        onClick = onLaunchFullScreenCapture,
+                        onClick = onStartFloatingIcon,
                         colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan),
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(52.dp)
-                            .testTag("launch_projection_button")
+                            .testTag("toggle_overlay_demo_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.ScreenShare,
+                            imageVector = Icons.Default.BubbleChart,
                             contentDescription = null,
                             tint = ObsidianBg
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (hasOverlayPermission) {
-                                "Start Floating Screen Capture (MediaProjection)"
+                            text = if (!hasOverlayPermission) {
+                                "1. Grant Overlay Permission"
+                            } else if (isAccessibilityEnabled) {
+                                "Launch Floating Icon (Accessibility + OCR Ready)"
                             } else {
-                                "1. Grant Overlay Permission & Start Capture"
+                                "Launch Draggable Floating Icon"
                             },
                             color = ObsidianBg,
                             style = MaterialTheme.typography.labelLarge
@@ -695,20 +687,20 @@ private fun HeroControlBanner(
                     }
 
                     OutlinedButton(
-                        onClick = onLaunchFloatingOverlayDemo,
+                        onClick = onLaunchFullScreenCapture,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(48.dp)
-                            .testTag("toggle_overlay_demo_button")
+                            .testTag("launch_projection_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.BubbleChart,
+                            imageVector = Icons.Default.ScreenShare,
                             contentDescription = null,
                             tint = SaffronGold
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Spawn Draggable Floating Icon Only",
+                            text = "Start with MediaProjection Screen Capture",
                             color = SaffronGold
                         )
                     }
@@ -738,7 +730,7 @@ private fun HeroControlBanner(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (state.isCapturingOcr) "Pause 2s OCR" else "Resume 2s OCR",
+                                text = if (state.isCapturingOcr) "Pause Reading" else "Start Reading",
                                 color = ObsidianBg,
                                 fontWeight = FontWeight.Bold
                             )
@@ -770,8 +762,10 @@ private fun HeroControlBanner(
 private fun PermissionsAndEngineStatusCard(
     state: TranslatorAppState,
     hasOverlayPermission: Boolean,
+    isAccessibilityEnabled: Boolean,
     hasNotificationPermission: Boolean,
     onGrantOverlay: () -> Unit,
+    onEnableAccessibility: () -> Unit,
     onGrantNotification: () -> Unit,
     onInstallHindiVoice: () -> Unit,
     onOpenSettingsSheet: () -> Unit
@@ -786,12 +780,27 @@ private fun PermissionsAndEngineStatusCard(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "System Permissions & Hindi Engine Readiness",
+                text = "Permissions, Accessibility Reader & Hindi TTS",
                 style = MaterialTheme.typography.titleMedium,
                 color = ElectricCyan
             )
 
-            // Row 1: SYSTEM_ALERT_WINDOW (Floating Overlay)
+            // Row 1: AccessibilityService for reading text across other games
+            PermissionStatusRow(
+                icon = Icons.Default.AccessibilityNew,
+                title = "Game Screen Reader (AccessibilityService)",
+                subtitle = if (isAccessibilityEnabled) {
+                    "Active — Reads game text & takes OCR screenshots without popups"
+                } else {
+                    "Enable 'GameVox Hindi' in Accessibility Settings to read other games"
+                },
+                isReady = isAccessibilityEnabled,
+                actionLabel = if (isAccessibilityEnabled) "Enabled" else "Enable",
+                onActionClick = onEnableAccessibility,
+                testTag = "enable_accessibility_button"
+            )
+
+            // Row 2: SYSTEM_ALERT_WINDOW (Floating Overlay)
             PermissionStatusRow(
                 icon = Icons.Default.Layers,
                 title = "Floating Overlay (SYSTEM_ALERT_WINDOW)",
@@ -806,14 +815,14 @@ private fun PermissionsAndEngineStatusCard(
                 testTag = "grant_overlay_permission_button"
             )
 
-            // Row 2: POST_NOTIFICATIONS (Android 13+ Foreground Service)
+            // Row 3: POST_NOTIFICATIONS (Android 13+)
             PermissionStatusRow(
                 icon = Icons.Default.NotificationsActive,
                 title = "Foreground Service Notification (Android 13+)",
                 subtitle = if (hasNotificationPermission) {
-                    "Granted — Persistent MediaProjection service notification active"
+                    "Granted — Persistent service notification active"
                 } else {
-                    "Recommended to control Pause/Stop from notification shade"
+                    "Optional — Control Pause/Stop from notification shade"
                 },
                 isReady = hasNotificationPermission,
                 actionLabel = if (hasNotificationPermission) "Ready" else "Allow",
@@ -821,12 +830,15 @@ private fun PermissionsAndEngineStatusCard(
                 testTag = "grant_notification_permission_button"
             )
 
-            // Row 3: Hindi TTS (hi-IN) with Pitch 0.8f & Speed 0.9f
+            // Row 4: Hindi TTS (hi-IN)
+            val isTtsWorking = state.ttsStatus == TtsEngineStatus.READY ||
+                state.ttsStatus == TtsEngineStatus.FALLBACK_VOICE_READY
+
             PermissionStatusRow(
                 icon = Icons.Default.RecordVoiceOver,
-                title = "Native Hindi TTS (hi-IN • Pitch ${state.ttsPitch}x • Rate ${state.ttsSpeechRate}x)",
+                title = "Native Hindi TTS (Pitch ${state.ttsPitch}x • Rate ${state.ttsSpeechRate}x)",
                 subtitle = state.ttsStatus.label,
-                isReady = state.ttsStatus == TtsEngineStatus.READY,
+                isReady = isTtsWorking,
                 actionLabel = if (state.ttsStatus == TtsEngineStatus.MISSING_HINDI_DATA) {
                     "Install Data"
                 } else {
@@ -923,13 +935,11 @@ private fun LiveOcrDebugMonitorCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "Floating Debug TextView Readout",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = ElectricCyan
-                    )
-                }
+                Text(
+                    text = "Floating Debug TextView Readout",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = ElectricCyan
+                )
                 Badge(
                     containerColor = SaffronGold.copy(alpha = 0.2f),
                     contentColor = SaffronGold
@@ -941,7 +951,6 @@ private fun LiveOcrDebugMonitorCard(
                 }
             }
 
-            // Simulated Floating Debug TextView Box
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -952,7 +961,7 @@ private fun LiveOcrDebugMonitorCard(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text(
-                    text = "OCR EXTRACTED (INVERTED BITMAP):",
+                    text = "EXTRACTED GAME TEXT (ACCESSIBILITY / OCR):",
                     style = MaterialTheme.typography.labelSmall,
                     color = ElectricCyan
                 )
@@ -967,7 +976,7 @@ private fun LiveOcrDebugMonitorCard(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    text = "HINDI TRANSLATION (ML KIT + HI-IN TTS):",
+                    text = "HINDI TRANSLATION (SPOKEN VIA HI-IN TTS):",
                     style = MaterialTheme.typography.labelSmall,
                     color = SaffronGold
                 )
@@ -998,7 +1007,7 @@ private fun LiveOcrDebugMonitorCard(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Speak Hindi Again",
+                        text = "Speak Hindi Now",
                         color = ObsidianBg,
                         fontWeight = FontWeight.Bold
                     )
@@ -1097,5 +1106,16 @@ private fun checkNotificationPermission(context: Context): Boolean {
         ) == PackageManager.PERMISSION_GRANTED
     } else {
         true
+    }
+}
+
+private fun checkAccessibilityServiceEnabled(context: Context): Boolean {
+    if (GameVoxAccessibilityService.instance != null) return true
+    val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
+    val enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+    return enabledServices.any { info ->
+        val resolveInfo = info.resolveInfo?.serviceInfo
+        resolveInfo?.packageName == context.packageName &&
+            resolveInfo?.name == GameVoxAccessibilityService::class.java.name
     }
 }

@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.media.AudioAttributes
+import android.media.AudioManager
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.util.Log
@@ -27,18 +29,31 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 /**
- * Coordinates the complete 4-stage pipeline:
+ * Process-wide Singleton coordinating:
  * 1. Bitmap ColorMatrix Inversion (white game subtitles on dark background -> black text on white)
- * 2. Google ML Kit Text Recognition (English OCR extraction)
+ * 2. Google ML Kit Text Recognition (English OCR extraction) + AccessibilityService node text
  * 3. English -> Hindi Translation + Anti-Repeat check (lastSpokenText)
- * 4. Asynchronous Android TextToSpeech (hi-IN, pitch = 0.8f, speechRate = 0.9f)
- *    with non-blocking initialization and missing Hindi voice data check.
+ * 4. Properly initialized Android TextToSpeech (hi-IN with fallback locales, USAGE_MEDIA audio stream,
+ *    queued pending utterances while warming up, pitch = 0.8f, speechRate = 0.9f).
  */
-class OcrTranslationPipeline(private val appContext: Context) {
+class OcrTranslationPipeline private constructor(context: Context) {
+
+    private val appContext: Context = context.applicationContext
 
     companion object {
         private const val TAG = "OcrTranslationPipeline"
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
+        private val HINDI_GENERIC_LOCALE: Locale = Locale.forLanguageTag("hi")
+        private val INDIAN_ENGLISH_LOCALE: Locale = Locale.forLanguageTag("en-IN")
+
+        @Volatile
+        private var INSTANCE: OcrTranslationPipeline? = null
+
+        fun getInstance(context: Context): OcrTranslationPipeline {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: OcrTranslationPipeline(context.applicationContext).also { INSTANCE = it }
+            }
+        }
     }
 
     private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -50,10 +65,13 @@ class OcrTranslationPipeline(private val appContext: Context) {
     @Volatile
     private var isTtsReady: Boolean = false
 
+    @Volatile
+    private var pendingSpeechText: String? = null
+
     private var tts: TextToSpeech? = null
 
     /**
-     * Anti-Repeat state variable required by specification:
+     * Anti-Repeat state variable:
      * If the newly translated Hindi text is identical to [lastSpokenText], skip speaking it again.
      */
     @Volatile
@@ -71,35 +89,28 @@ class OcrTranslationPipeline(private val appContext: Context) {
     }
 
     /**
-     * Initializes Android's native [TextToSpeech] asynchronously with Hindi Locale (hi-IN).
-     * Does NOT block OCR or translation if TTS is still warming up or if Hindi voice data is missing.
+     * Initializes Android's native [TextToSpeech] asynchronously with USAGE_MEDIA audio stream
+     * and Hindi Locale (hi-IN), falling back gracefully so speech ALWAYS works on any device.
      */
+    @Synchronized
     fun initializeTtsAsync() {
+        if (tts != null && isTtsReady) {
+            refreshTtsConfiguration()
+            return
+        }
         TranslatorStateRepository.setTtsStatus(TtsEngineStatus.INITIALIZING)
         try {
             tts?.shutdown()
             tts = TextToSpeech(appContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
                     val engine = tts ?: return@TextToSpeech
-                    val currentState = TranslatorStateRepository.state.value
-                    // Requirement 4: Set pitch to 0.8f and speech rate to 0.9f so it sounds natural
-                    engine.setPitch(currentState.ttsPitch)
-                    engine.setSpeechRate(currentState.ttsSpeechRate)
+                    configureTtsEngine(engine)
 
-                    val availability = engine.isLanguageAvailable(HINDI_LOCALE)
-                    when (availability) {
-                        TextToSpeech.LANG_MISSING_DATA,
-                        TextToSpeech.LANG_NOT_SUPPORTED -> {
-                            isTtsReady = false
-                            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.MISSING_HINDI_DATA)
-                            Log.w(TAG, "Hindi TTS (hi-IN) voice data is missing or unsupported: $availability")
-                        }
-                        else -> {
-                            engine.language = HINDI_LOCALE
-                            isTtsReady = true
-                            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
-                            Log.i(TAG, "Hindi TTS (hi-IN) initialized with pitch=${currentState.ttsPitch}, rate=${currentState.ttsSpeechRate}")
-                        }
+                    // If speech was requested while TTS was still initializing, speak it now!
+                    val queued = pendingSpeechText
+                    if (!queued.isNullOrBlank()) {
+                        pendingSpeechText = null
+                        speakHindiNonBlocking(queued, forceSpeakEvenIfRepeat = true)
                     }
                 } else {
                     isTtsReady = false
@@ -114,9 +125,52 @@ class OcrTranslationPipeline(private val appContext: Context) {
         }
     }
 
+    private fun configureTtsEngine(engine: TextToSpeech) {
+        val currentState = TranslatorStateRepository.state.value
+
+        // Route TTS audio through USAGE_MEDIA (Music/Game stream) so it's always audible during gameplay
+        try {
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            engine.setAudioAttributes(audioAttrs)
+        } catch (_: Exception) {
+        }
+
+        engine.setPitch(currentState.ttsPitch)
+        engine.setSpeechRate(currentState.ttsSpeechRate)
+
+        val hiInResult = engine.setLanguage(HINDI_LOCALE)
+        if (hiInResult != TextToSpeech.LANG_MISSING_DATA && hiInResult != TextToSpeech.LANG_NOT_SUPPORTED) {
+            isTtsReady = true
+            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
+            Log.i(TAG, "Hindi TTS (hi-IN) ready with pitch=${currentState.ttsPitch}, rate=${currentState.ttsSpeechRate}")
+            return
+        }
+
+        val hiResult = engine.setLanguage(HINDI_GENERIC_LOCALE)
+        if (hiResult != TextToSpeech.LANG_MISSING_DATA && hiResult != TextToSpeech.LANG_NOT_SUPPORTED) {
+            isTtsReady = true
+            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
+            return
+        }
+
+        // Fallback: even if offline Hindi voice pack isn't downloaded yet, try en-IN or default
+        // and STILL mark isTtsReady = true so engine.speak() is never silently blocked!
+        val enInResult = engine.setLanguage(INDIAN_ENGLISH_LOCALE)
+        if (enInResult == TextToSpeech.LANG_MISSING_DATA || enInResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+            engine.setLanguage(Locale.getDefault())
+        }
+        // Attempt setting hi-IN one more time for network synthesis if Google TTS is active
+        engine.setLanguage(HINDI_LOCALE)
+        isTtsReady = true
+        TranslatorStateRepository.setTtsStatus(TtsEngineStatus.FALLBACK_VOICE_READY)
+        Log.w(TAG, "Hindi offline pack missing; TTS enabled in fallback/network mode so audio still plays.")
+    }
+
     /**
-     * Re-checks Hindi voice data availability (e.g., after user returns from TTS settings)
-     * and applies latest pitch & speechRate.
+     * Re-checks Hindi voice data availability and applies latest pitch & speechRate.
      */
     fun refreshTtsConfiguration() {
         val engine = tts
@@ -124,27 +178,27 @@ class OcrTranslationPipeline(private val appContext: Context) {
             initializeTtsAsync()
             return
         }
-        val state = TranslatorStateRepository.state.value
-        engine.setPitch(state.ttsPitch)
-        engine.setSpeechRate(state.ttsSpeechRate)
+        configureTtsEngine(engine)
+    }
 
-        val availability = engine.isLanguageAvailable(HINDI_LOCALE)
-        if (availability == TextToSpeech.LANG_MISSING_DATA || availability == TextToSpeech.LANG_NOT_SUPPORTED) {
-            isTtsReady = false
-            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.MISSING_HINDI_DATA)
-        } else {
-            engine.language = HINDI_LOCALE
-            isTtsReady = true
-            TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
-        }
+    fun ensureTranslationModelDownloaded() {
+        TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
     }
 
     /**
-     * Marks the English-to-Hindi translation engine ready without invoking native C++ mlock()
-     * on restricted container memory limits.
+     * Processes text extracted directly by [com.example.service.GameVoxAccessibilityService]
+     * from an active game window without requiring bitmap OCR.
      */
-    fun ensureTranslationModelDownloaded() {
-        TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+    suspend fun processExtractedRawText(
+        rawEnglishText: String,
+        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
+    ): Pair<String, String> = withContext(Dispatchers.Default) {
+        val startTime = System.currentTimeMillis()
+        val extractedEnglish = cleanExtractedSubtitle(rawEnglishText)
+        if (extractedEnglish.isBlank()) {
+            return@withContext "" to ""
+        }
+        handleExtractedSubtitle(extractedEnglish, startTime, onDebugTextUpdate)
     }
 
     /**
@@ -153,8 +207,6 @@ class OcrTranslationPipeline(private val appContext: Context) {
      * 2. Runs ML Kit OCR
      * 3. Translates English -> Hindi
      * 4. Checks Anti-Repeat [lastSpokenText] and speaks Hindi out loud via non-blocking TTS.
-     *
-     * Returns a pair of (extractedEnglish, translatedHindi) for the Floating Debug TextView.
      */
     suspend fun processCapturedFrame(
         rawBitmap: Bitmap,
@@ -197,12 +249,18 @@ class OcrTranslationPipeline(private val appContext: Context) {
             return@withContext "" to ""
         }
 
-        // Step 3: Translate extracted English text to Hindi
+        handleExtractedSubtitle(extractedEnglish, startTime, onDebugTextUpdate)
+    }
+
+    private suspend fun handleExtractedSubtitle(
+        extractedEnglish: String,
+        startTime: Long,
+        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?
+    ): Pair<String, String> {
         val translatedHindi = translateEnglishToHindi(extractedEnglish)
         val elapsedMs = System.currentTimeMillis() - startTime
         val timestamp = timeFormatter.format(Date())
 
-        // Step 4: Anti-Repeat check against lastSpokenText
         val normalizedHindi = translatedHindi.trim()
         val normalizedEnglish = extractedEnglish.trim().lowercase(Locale.ROOT)
 
@@ -225,21 +283,14 @@ class OcrTranslationPipeline(private val appContext: Context) {
                     "Skipped (Anti-Repeat)"
                 )
             }
-            return@withContext extractedEnglish to translatedHindi
+            return extractedEnglish to translatedHindi
         }
 
-        // Update Anti-Repeat memory and speak asynchronously without blocking translation
         lastSpokenText = normalizedHindi
         lastExtractedNormalized = normalizedEnglish
 
         val spokenSuccess = speakHindiNonBlocking(translatedHindi)
-        val skipNote = when {
-            spokenSuccess -> null
-            TranslatorStateRepository.state.value.ttsStatus == TtsEngineStatus.MISSING_HINDI_DATA ->
-                "TTS Skipped: Hindi Voice Missing"
-            !isTtsReady -> "TTS Warming Up (Non-blocking)"
-            else -> null
-        }
+        val skipNote = if (spokenSuccess) null else "TTS Queued / Warming Up"
 
         TranslatorStateRepository.recordTranslationResult(
             english = extractedEnglish,
@@ -258,19 +309,16 @@ class OcrTranslationPipeline(private val appContext: Context) {
             )
         }
 
-        extractedEnglish to translatedHindi
+        return extractedEnglish to translatedHindi
     }
 
-    /**
-     * Translates [englishText] to Hindi cleanly and deterministically.
-     */
     suspend fun translateEnglishToHindi(englishText: String): String = withContext(Dispatchers.Default) {
         HindiTranslationEngine.translate(englishText)
     }
 
     /**
-     * Speaks [hindiText] using Android's native [TextToSpeech] without blocking the caller.
-     * Applies user-configured pitch (default 0.8f) and speechRate (default 0.9f).
+     * Speaks [hindiText] using Android's native [TextToSpeech] on the Media stream.
+     * If TTS is still warming up, queues [hindiText] so it speaks immediately once ready.
      */
     fun speakHindiNonBlocking(hindiText: String, forceSpeakEvenIfRepeat: Boolean = false): Boolean {
         if (hindiText.isBlank()) return false
@@ -280,7 +328,10 @@ class OcrTranslationPipeline(private val appContext: Context) {
 
         val engine = tts
         if (engine == null || !isTtsReady) {
-            Log.w(TAG, "TTS not ready yet — skipping audio playback without blocking OCR pipeline.")
+            pendingSpeechText = hindiText
+            if (engine == null) {
+                initializeTtsAsync()
+            }
             return false
         }
 
@@ -288,7 +339,10 @@ class OcrTranslationPipeline(private val appContext: Context) {
         return try {
             engine.setPitch(state.ttsPitch)
             engine.setSpeechRate(state.ttsSpeechRate)
-            val params = Bundle()
+            val params = Bundle().apply {
+                putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
+                putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            }
             val utteranceId = "gamevox_${UUID.randomUUID()}"
             val result = engine.speak(hindiText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             result == TextToSpeech.SUCCESS
@@ -304,10 +358,6 @@ class OcrTranslationPipeline(private val appContext: Context) {
         TranslatorStateRepository.clearLastSpokenMemory()
     }
 
-    /**
-     * Launches the Android system intent to install missing Hindi TTS voice data,
-     * falling back to general Text-to-Speech settings if the direct installer is unavailable.
-     */
     fun promptInstallHindiTtsData(context: Context) {
         try {
             val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).apply {
@@ -334,21 +384,5 @@ class OcrTranslationPipeline(private val appContext: Context) {
             .joinToString(" ")
             .replace(Regex("\\s+"), " ")
             .trim()
-    }
-
-    fun release() {
-        pipelineScope.launch {
-            try {
-                textRecognizer.close()
-            } catch (_: Exception) {
-            }
-        }
-        try {
-            tts?.stop()
-            tts?.shutdown()
-            tts = null
-            isTtsReady = false
-        } catch (_: Exception) {
-        }
     }
 }

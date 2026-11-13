@@ -1,11 +1,12 @@
 <resources>
     <string name="app_name">GameVox Hindi</string>
-    <string name="hero_subtitle">Real-Time Game Screen OCR &amp; Hindi Voice Dubber</string>
+    <string name="hero_subtitle">Real-Time Game Screen OCR, Accessibility Reader &amp; Hindi Voice Dubber</string>
+    <string name="accessibility_service_description">Reads English subtitles and on-screen text from running games using Accessibility &amp; OCR, translates them to Hindi, and speaks them out loud via TextToSpeech.</string>
     <string name="overlay_permission_title">Floating Overlay Permission</string>
     <string name="overlay_permission_desc">Required to display the draggable circular control icon and live OCR debug readout over games.</string>
     <string name="notification_permission_title">Foreground Service Notification</string>
-    <string name="notification_permission_desc">Required on Android 13+ to keep the MediaProjection capture engine running smoothly.</string>
-    <string name="hindi_model_title">ML Kit English → Hindi Model</string>
+    <string name="notification_permission_desc">Required on Android 13+ to keep the floating translator service running smoothly.</string>
+    <string name="hindi_model_title">English → Hindi Translator</string>
     <string name="hindi_tts_title">Hindi Text-to-Speech (hi-IN)</string>
     <string name="start_floating_translator">Launch Floating Translator</string>
     <string name="stop_floating_translator">Stop Floating Service</string>
@@ -14,6 +15,6 @@
     <string name="test_hindi_voice">Test Hindi Speech</string>
     <string name="notification_channel_name">Game Screen Subtitle Translator</string>
     <string name="notification_title">GameVox Hindi Active</string>
-    <string name="notification_content_scanning">Capturing game subtitles every 2s (OCR + Hindi TTS)</string>
-    <string name="notification_content_paused">Floating icon ready — Single tap to start OCR scan</string>
+    <string name="notification_content_scanning">Reading game subtitles (Accessibility + OCR + Hindi TTS)</string>
+    <string name="notification_content_paused">Floating icon ready — Single tap to scan &amp; speak</string>
 </resources>

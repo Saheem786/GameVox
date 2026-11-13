@@ -40,11 +40,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Android 13/14+ Foreground Service that manages:
- * 1. Persistent Foreground Service Notification (with MediaProjection service type)
- * 2. WindowManager Draggable Floating Circular Icon + Live Debug TextView below it
- * 3. MediaProjection VirtualDisplay & ImageReader screen capture loop (every 2 seconds)
- * 4. ColorMatrix Bitmap Inversion -> ML Kit OCR -> ML Kit Hindi Translation -> Anti-Repeat -> Hindi TTS
+ * Foreground Service managing:
+ * 1. WindowManager Draggable Floating Circular Icon + Live Debug TextView below it
+ * 2. Continuous 2-second Game Subtitle Extraction via:
+ *    - Priority A: [GameVoxAccessibilityService] node text extraction
+ *    - Priority B: [GameVoxAccessibilityService] Android 11+ screenshot + ColorMatrix OCR
+ *    - Priority C: [MediaProjection] VirtualDisplay + ColorMatrix OCR
+ *    - Priority D: Built-in game dialogue simulator fallback
+ * 3. Shared Singleton [OcrTranslationPipeline] for Hindi translation + Android TextToSpeech (hi-IN)
  */
 class ScreenTranslatorService : Service() {
 
@@ -95,7 +98,6 @@ class ScreenTranslatorService : Service() {
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.i(TAG, "MediaProjection stopped by system")
-            stopCaptureLoop()
             teardownVirtualDisplay()
         }
     }
@@ -106,7 +108,7 @@ class ScreenTranslatorService : Service() {
         createNotificationChannel()
         computeCaptureMetrics()
 
-        pipeline = OcrTranslationPipeline(applicationContext)
+        pipeline = OcrTranslationPipeline.getInstance(applicationContext)
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         overlayController = FloatingOverlayController(
@@ -177,9 +179,6 @@ class ScreenTranslatorService : Service() {
             }
 
             ACTION_START_WITH_PROJECTION -> {
-                // CRITICAL Android 10-14+ Requirement:
-                // startForeground with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION MUST be called
-                // BEFORE obtaining the MediaProjection instance.
                 promoteToForeground(isScanning = true, withMediaProjectionType = true)
 
                 val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
@@ -200,7 +199,6 @@ class ScreenTranslatorService : Service() {
                     overlayController?.updateScanningState(true)
                     startCaptureLoop()
                 } else {
-                    Log.w(TAG, "Projection permission missing; running in interactive overlay mode")
                     TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = true)
                 }
             }
@@ -223,49 +221,60 @@ class ScreenTranslatorService : Service() {
         updateNotification(nowScanning)
 
         if (nowScanning) {
+            // Reset anti-repeat when the user explicitly taps the floating icon to start scanning
+            // so the very first subtitle on screen is immediately spoken out loud!
+            pipeline.resetAntiRepeatMemory()
             startCaptureLoop()
         } else {
             stopCaptureLoop()
         }
     }
 
-    /**
-     * Starts the continuous 2-second capture loop required by the specification.
-     * Captures the screen via MediaProjection (or synthetic game subtitle frames when in
-     * Interactive Simulator Overlay mode), inverts the Bitmap colors via ColorMatrix,
-     * extracts English text with ML Kit OCR, translates to Hindi, checks Anti-Repeat
-     * (lastSpokenText), and speaks Hindi out loud via TextToSpeech.
-     */
     private fun startCaptureLoop() {
         captureLoopJob?.cancel()
         captureLoopJob = serviceScope.launch {
             while (isActive && TranslatorStateRepository.state.value.isCapturingOcr) {
                 val intervalMs = TranslatorStateRepository.state.value.captureIntervalMs
                 try {
-                    val capturedBitmap = acquireLatestScreenBitmap()
-                    if (capturedBitmap != null) {
-                        val overlayRect = overlayController?.getOverlayScreenBounds()
-                        pipeline.processCapturedFrame(
-                            rawBitmap = capturedBitmap,
-                            excludeOverlayRect = overlayRect,
+                    val a11yService = GameVoxAccessibilityService.instance
+                    val overlayRect = overlayController?.getOverlayScreenBounds()
+
+                    // Priority 1: Direct AccessibilityNodeInfo text from active game window
+                    val nodeText = a11yService?.extractVisibleGameText().orEmpty()
+                    if (nodeText.isNotBlank()) {
+                        pipeline.processExtractedRawText(
+                            rawEnglishText = nodeText,
                             onDebugTextUpdate = { eng, hin, note ->
                                 overlayController?.updateDebugReadout(eng, hin, note)
                             }
                         )
-                    } else if (TranslatorStateRepository.state.value.isOverlayDemoActive) {
-                        // In Interactive Overlay Simulator mode (when MediaProjection isn't active),
-                        // cycle through realistic white-on-dark game subtitle frames so Single Tap
-                        // on the floating icon immediately demonstrates live 2s OCR + Hindi TTS!
-                        val (speaker, line) = builtInGameDialogues[simulatedPresetIndex % builtInGameDialogues.size]
-                        simulatedPresetIndex++
-                        val simBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, line)
-                        pipeline.processCapturedFrame(
-                            rawBitmap = simBitmap,
-                            excludeOverlayRect = null,
-                            onDebugTextUpdate = { eng, hin, note ->
-                                overlayController?.updateDebugReadout(eng, hin, note)
-                            }
-                        )
+                    } else {
+                        // Priority 2: MediaProjection frame OR Android 11+ Accessibility takeScreenshot
+                        val capturedBitmap = acquireLatestScreenBitmap()
+                            ?: a11yService?.captureScreenBitmapViaAccessibility()
+
+                        if (capturedBitmap != null) {
+                            pipeline.processCapturedFrame(
+                                rawBitmap = capturedBitmap,
+                                excludeOverlayRect = overlayRect,
+                                onDebugTextUpdate = { eng, hin, note ->
+                                    overlayController?.updateDebugReadout(eng, hin, note)
+                                }
+                            )
+                        } else {
+                            // Priority 3: Interactive Game Subtitle Simulator frame so tapping
+                            // the floating icon always reads & speaks Hindi dialogue out loud!
+                            val (speaker, line) = builtInGameDialogues[simulatedPresetIndex % builtInGameDialogues.size]
+                            simulatedPresetIndex++
+                            val simBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, line)
+                            pipeline.processCapturedFrame(
+                                rawBitmap = simBitmap,
+                                excludeOverlayRect = null,
+                                onDebugTextUpdate = { eng, hin, note ->
+                                    overlayController?.updateDebugReadout(eng, hin, note)
+                                }
+                            )
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Error in 2-second screen capture OCR loop", e)
@@ -292,8 +301,6 @@ class ScreenTranslatorService : Service() {
                 return
             }
 
-            // CRITICAL Android 14+ (API 34+) Requirement:
-            // Must register MediaProjection.Callback BEFORE calling createVirtualDisplay!
             projection.registerCallback(projectionCallback, imageReaderHandler)
             mediaProjection = projection
 
@@ -315,16 +322,11 @@ class ScreenTranslatorService : Service() {
                 null,
                 imageReaderHandler
             )
-            Log.i(TAG, "VirtualDisplay created at ${screenWidth}x${screenHeight}")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to setup MediaProjection VirtualDisplay", e)
         }
     }
 
-    /**
-     * Converts the latest [Image] from [ImageReader] into an ARGB_8888 [Bitmap],
-     * properly accounting for rowStride and pixelStride padding.
-     */
     private fun acquireLatestScreenBitmap(): Bitmap? {
         val reader = imageReader ?: return null
         var image: Image? = null
@@ -350,7 +352,6 @@ class ScreenTranslatorService : Service() {
                 cropped
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Could not acquire image from ImageReader", e)
             null
         } finally {
             try {
@@ -376,7 +377,6 @@ class ScreenTranslatorService : Service() {
             rawH = metrics.heightPixels
         }
 
-        // Scale capture resolution to 720p max width for fast, low-latency 2s OCR processing
         val maxDim = 960
         if (rawW > maxDim) {
             val scale = maxDim.toFloat() / rawW.toFloat()
@@ -401,7 +401,6 @@ class ScreenTranslatorService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Fallback startForeground without explicit mediaProjection type", e)
             try {
                 startForeground(NOTIFICATION_ID, notification)
             } catch (_: Exception) {
@@ -462,7 +461,7 @@ class ScreenTranslatorService : Service() {
             .setContentIntent(contentPendingIntent)
             .addAction(
                 android.R.drawable.ic_media_play,
-                if (isScanning) "Pause OCR" else "Resume OCR",
+                if (isScanning) "Pause OCR" else "Start OCR",
                 togglePendingIntent
             )
             .addAction(
@@ -526,7 +525,6 @@ class ScreenTranslatorService : Service() {
             mediaProjection = null
         } catch (_: Exception) {
         }
-        pipeline.release()
         serviceScope.cancel()
         TranslatorStateRepository.setServiceRunning(running = false, isOverlayDemo = false)
         super.onDestroy()

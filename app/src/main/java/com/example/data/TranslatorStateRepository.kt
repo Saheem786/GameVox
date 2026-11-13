@@ -10,15 +10,16 @@ import kotlinx.coroutines.flow.update
 enum class TtsEngineStatus(val label: String) {
     INITIALIZING("Initializing Hindi TTS..."),
     READY("Hindi Voice (hi-IN) Ready"),
+    FALLBACK_VOICE_READY("TTS Ready (Fallback Locale Active)"),
     MISSING_HINDI_DATA("Hindi Voice Data Missing"),
     ERROR("TTS Engine Unavailable")
 }
 
 enum class ModelDownloadStatus(val label: String) {
-    CHECKING("Checking Hindi Model..."),
-    DOWNLOADING("Downloading EN → HI Model..."),
-    READY("ML Kit EN → HI Model Ready"),
-    OFFLINE_FALLBACK("Ready (Fast Local + ML Kit)")
+    CHECKING("Checking Hindi Engine..."),
+    DOWNLOADING("Loading EN → HI Engine..."),
+    READY("EN → HI Translator Ready"),
+    OFFLINE_FALLBACK("Ready (Offline Engine)")
 }
 
 data class SubtitleTranslationEntry(
@@ -33,6 +34,7 @@ data class SubtitleTranslationEntry(
 
 data class TranslatorAppState(
     val isServiceRunning: Boolean = false,
+    val isAccessibilityConnected: Boolean = false,
     val isOverlayDemoActive: Boolean = false,
     val isCapturingOcr: Boolean = false,
     val ttsPitch: Float = 0.8f,
@@ -45,7 +47,7 @@ data class TranslatorAppState(
     val scanFrameCount: Int = 0,
     val duplicateSkippedCount: Int = 0,
     val ttsStatus: TtsEngineStatus = TtsEngineStatus.INITIALIZING,
-    val modelStatus: ModelDownloadStatus = ModelDownloadStatus.CHECKING,
+    val modelStatus: ModelDownloadStatus = ModelDownloadStatus.READY,
     val showSettingsBottomSheet: Boolean = false,
     val originalFramePreview: Bitmap? = null,
     val invertedFramePreview: Bitmap? = null,
@@ -61,6 +63,9 @@ object TranslatorStateRepository {
 
     private val _state = MutableStateFlow(TranslatorAppState())
     val state: StateFlow<TranslatorAppState> = _state.asStateFlow()
+
+    @Volatile
+    private var lastDialogChangeTimestamp: Long = 0L
 
     fun loadPreferences(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -123,6 +128,10 @@ object TranslatorStateRepository {
         }
     }
 
+    fun setAccessibilityConnected(connected: Boolean) {
+        _state.update { it.copy(isAccessibilityConnected = connected) }
+    }
+
     fun setCapturingOcr(capturing: Boolean) {
         _state.update { it.copy(isCapturingOcr = capturing) }
     }
@@ -144,7 +153,18 @@ object TranslatorStateRepository {
         _state.update { it.copy(modelStatus = status) }
     }
 
+    /**
+     * Strictly guards dialog state so opening or closing never triggers duplicate dialogs in a loop.
+     */
     fun setShowSettingsBottomSheet(show: Boolean) {
+        val now = System.currentTimeMillis()
+        if (show && _state.value.showSettingsBottomSheet) {
+            return
+        }
+        if (show && (now - lastDialogChangeTimestamp) < 400L) {
+            return
+        }
+        lastDialogChangeTimestamp = now
         _state.update { it.copy(showSettingsBottomSheet = show) }
     }
 
@@ -168,7 +188,7 @@ object TranslatorStateRepository {
     ) {
         _state.update { current ->
             val newEntry = SubtitleTranslationEntry(
-                id = System.currentTimeMillis(),
+                id = System.nanoTime(),
                 timestamp = timestamp,
                 extractedEnglish = english,
                 translatedHindi = hindi,

@@ -10,6 +10,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.TypedValue
@@ -32,8 +33,7 @@ import kotlin.math.abs
 
 /**
  * Manages the WindowManager floating circular icon, the live OCR Debug TextView positioned
- * directly below the floating icon, and the Long-Press Settings BottomSheet overlay that
- * works over any running game.
+ * directly below the floating icon, and a single guarded Settings dialog that never loops.
  */
 class FloatingOverlayController(
     private val context: Context,
@@ -53,14 +53,21 @@ class FloatingOverlayController(
     private var debugTextView: TextView? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
+    @Volatile
     private var bottomSheetOverlayView: FrameLayout? = null
+
+    @Volatile
+    private var isDialogOpeningOrShown: Boolean = false
+
+    @Volatile
+    private var lastTapElapsedMs: Long = 0L
 
     val isAttached: Boolean
         get() = rootOverlayView != null
 
     /**
      * Returns the current screen bounding box of the floating widget + debug TextView
-     * so MediaProjection can mask it out and avoid OCR-reading its own debug text.
+     * so screen capture can mask it out and avoid OCR-reading its own debug text.
      */
     fun getOverlayScreenBounds(): Rect? {
         val view = rootOverlayView ?: return null
@@ -101,7 +108,6 @@ class FloatingOverlayController(
         }
         overlayParams = params
 
-        // Root vertical container holding the Circular Floating Icon and the Debug TextView below it
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -129,7 +135,6 @@ class FloatingOverlayController(
         }
         bubbleFrame.addView(glyphText)
 
-        // Small status dot in bottom-right of circular icon
         val dotSize = dpToPx(14)
         val statusDot = View(context).apply {
             layoutParams = FrameLayout.LayoutParams(dotSize, dotSize).apply {
@@ -173,12 +178,8 @@ class FloatingOverlayController(
         container.addView(bubbleFrame)
         container.addView(debugTv)
 
-        // Gesture & Drag handling on the circular icon:
-        // - Drag: Moves floating icon + debug TextView across screen
-        // - Single Tap: Toggle OCR/Screen capture Start/Stop
-        // - Long Press (Hold): Open BottomSheet dialog with settings
         val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
-        val longPressTimeout = 500L
+        val longPressTimeout = 550L
 
         var initialX = 0
         var initialY = 0
@@ -188,11 +189,10 @@ class FloatingOverlayController(
         var longPressTriggered = false
 
         val longPressRunnable = Runnable {
-            if (!isDragging) {
+            if (!isDragging && !longPressTriggered && !isDialogOpeningOrShown) {
                 longPressTriggered = true
                 bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 showOverlaySettingsBottomSheet()
-                TranslatorStateRepository.setShowSettingsBottomSheet(true)
             }
         }
 
@@ -205,6 +205,7 @@ class FloatingOverlayController(
                     initialTouchY = event.rawY
                     isDragging = false
                     longPressTriggered = false
+                    mainHandler.removeCallbacks(longPressRunnable)
                     mainHandler.postDelayed(longPressRunnable, longPressTimeout)
                     true
                 }
@@ -228,8 +229,13 @@ class FloatingOverlayController(
                 MotionEvent.ACTION_UP -> {
                     mainHandler.removeCallbacks(longPressRunnable)
                     if (!isDragging && !longPressTriggered) {
-                        bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        onSingleTapToggleCapture()
+                        val now = SystemClock.elapsedRealtime()
+                        // 400ms debounce so rapid taps never trigger multiple loops
+                        if (now - lastTapElapsedMs > 400L) {
+                            lastTapElapsedMs = now
+                            bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            onSingleTapToggleCapture()
+                        }
                     }
                     true
                 }
@@ -269,7 +275,7 @@ class FloatingOverlayController(
                 val state = TranslatorStateRepository.state.value
                 debugTextView?.text = "PAUSED • Tap to Start\nOCR: ${state.lastExtractedEnglish.take(36)}"
             } else {
-                debugTextView?.text = "SCANNING (2s) • Inverted OCR\nWaiting for subtitles..."
+                debugTextView?.text = "SCANNING (2s) • Active\nReading game subtitles..."
             }
         }
     }
@@ -283,13 +289,22 @@ class FloatingOverlayController(
     }
 
     /**
-     * Displays a BottomSheet-style settings dialog directly over the screen using WindowManager
-     * when the user long-presses (holds) the floating icon while playing a game.
+     * Displays a single guarded Settings BottomSheet over the active game screen.
+     * Strictly prevents opening duplicate dialogs in a loop, and closes immediately on Dismiss.
      */
     fun showOverlaySettingsBottomSheet() {
+        if (isDialogOpeningOrShown || bottomSheetOverlayView != null) return
+        isDialogOpeningOrShown = true
+
         mainHandler.post {
-            if (bottomSheetOverlayView != null) return@post
-            if (!Settings.canDrawOverlays(context)) return@post
+            if (bottomSheetOverlayView != null) {
+                isDialogOpeningOrShown = true
+                return@post
+            }
+            if (!Settings.canDrawOverlays(context)) {
+                isDialogOpeningOrShown = false
+                return@post
+            }
 
             val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -335,7 +350,6 @@ class FloatingOverlayController(
                 }
             }
 
-            // Drag handle pill
             val handleView = View(context).apply {
                 layoutParams = LinearLayout.LayoutParams(dpToPx(44), dpToPx(5)).apply {
                     gravity = Gravity.CENTER_HORIZONTAL
@@ -349,7 +363,7 @@ class FloatingOverlayController(
             sheetCard.addView(handleView)
 
             val titleTv = TextView(context).apply {
-                text = "GameVox Hindi • Quick Settings"
+                text = "GameVox Hindi • Voice & OCR Settings"
                 setTextColor(Color.parseColor("#00E5FF"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -366,7 +380,6 @@ class FloatingOverlayController(
 
             val currentState = TranslatorStateRepository.state.value
 
-            // TTS Pitch Slider (0.4f .. 1.8f, default 0.8f)
             val pitchLabel = TextView(context).apply {
                 text = String.format(Locale.US, "TTS Pitch: %.2fx (Default 0.80x)", currentState.ttsPitch)
                 setTextColor(Color.WHITE)
@@ -375,7 +388,7 @@ class FloatingOverlayController(
             sheetCard.addView(pitchLabel)
 
             val pitchSeek = SeekBar(context).apply {
-                max = 140 // maps 0..140 -> 0.40f..1.80f
+                max = 140
                 progress = ((currentState.ttsPitch - 0.4f) * 100f).toInt().coerceIn(0, 140)
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -392,7 +405,6 @@ class FloatingOverlayController(
             }
             sheetCard.addView(pitchSeek)
 
-            // TTS Speed / Speech Rate Slider (0.4f .. 1.8f, default 0.9f)
             val rateLabel = TextView(context).apply {
                 text = String.format(Locale.US, "TTS Speech Rate: %.2fx (Default 0.90x)", currentState.ttsSpeechRate)
                 setTextColor(Color.WHITE)
@@ -419,7 +431,6 @@ class FloatingOverlayController(
             }
             sheetCard.addView(rateSeek)
 
-            // ColorMatrix Inversion Toggle
             val invertSwitch = Switch(context).apply {
                 text = "Invert Bitmap Colors (White → Black Text OCR)"
                 setTextColor(Color.WHITE)
@@ -431,20 +442,21 @@ class FloatingOverlayController(
             }
             sheetCard.addView(invertSwitch)
 
-            // Hindi TTS Status Readout
             val ttsStatusTv = TextView(context).apply {
                 val status = TranslatorStateRepository.state.value.ttsStatus
                 text = "Hindi TTS Status: ${status.label}"
                 setTextColor(
-                    if (status == TtsEngineStatus.READY) Color.parseColor("#00E676")
-                    else Color.parseColor("#FFB300")
+                    if (status == TtsEngineStatus.READY || status == TtsEngineStatus.FALLBACK_VOICE_READY) {
+                        Color.parseColor("#00E676")
+                    } else {
+                        Color.parseColor("#FFB300")
+                    }
                 )
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                 setPadding(0, dpToPx(4), 0, dpToPx(12))
             }
             sheetCard.addView(ttsStatusTv)
 
-            // Action Buttons Row 1: Test Voice & Check/Install Hindi Data
             val actionsRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 weightSum = 2f
@@ -489,7 +501,6 @@ class FloatingOverlayController(
             actionsRow.addView(installVoiceBtn)
             sheetCard.addView(actionsRow)
 
-            // Action Buttons Row 2: Close Sheet & Stop Service
             val bottomRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 weightSum = 2f
@@ -497,7 +508,7 @@ class FloatingOverlayController(
             }
 
             val closeBtn = Button(context).apply {
-                text = "Close Settings"
+                text = "Close / Dismiss"
                 isAllCaps = false
                 setTextColor(Color.WHITE)
                 background = GradientDrawable().apply {
@@ -537,19 +548,28 @@ class FloatingOverlayController(
                 windowManager.addView(scrimRoot, sheetParams)
                 bottomSheetOverlayView = scrimRoot
             } catch (_: Exception) {
+                isDialogOpeningOrShown = false
             }
         }
     }
 
     fun dismissOverlaySettingsBottomSheet() {
         mainHandler.post {
-            val sheet = bottomSheetOverlayView ?: return@post
-            try {
-                windowManager.removeView(sheet)
-            } catch (_: Exception) {
-            } finally {
-                bottomSheetOverlayView = null
+            TranslatorStateRepository.setShowSettingsBottomSheet(false)
+            val sheet = bottomSheetOverlayView
+            if (sheet != null) {
+                try {
+                    windowManager.removeViewImmediate(sheet)
+                } catch (_: Exception) {
+                    try {
+                        windowManager.removeView(sheet)
+                    } catch (_: Exception) {
+                    }
+                } finally {
+                    bottomSheetOverlayView = null
+                }
             }
+            isDialogOpeningOrShown = false
         }
     }
 
