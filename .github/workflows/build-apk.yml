@@ -1,35 +1,109 @@
-name: Build and Release APK
+name: Build & Release Android APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release Tag Name (e.g., v1.0.0)"
+        required: false
+        default: "v1.0.0"
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  build-apk:
+    name: Build Debug APK & Publish Release
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-    - name: Build with Gradle
-      run: ./gradlew assembleDebug
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: app/build/outputs/apk/debug/app-debug.apk
-        tag_name: v1.0.${{ github.run_number }}
-        name: Release v1.0.${{ github.run_number }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ensure Gradle Wrapper Exists & Is Executable
+        run: |
+          if [ ! -f "./gradlew" ] || [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Generating Gradle Wrapper..."
+            gradle wrapper --gradle-version 9.3.1
+          fi
+          chmod +x ./gradlew
+
+      - name: Ensure debug.keystore Exists for SigningConfig
+        run: |
+          if [ ! -f "debug.keystore" ]; then
+            if [ -f "debug.keystore.base64" ]; then
+              echo "Decoding debug.keystore from debug.keystore.base64..."
+              base64 -d debug.keystore.base64 > debug.keystore || base64 --decode debug.keystore.base64 > debug.keystore
+            else
+              echo "Generating debug.keystore for debugConfig signing..."
+              keytool -genkeypair \
+                -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Ensure .env.example Exists
+        run: |
+          if [ ! -f ".env.example" ]; then
+            touch .env.example
+          fi
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare Renamed APK for Release
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk GameVox-Hindi-v1.0-debug.apk
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameVox-Hindi-APK
+          path: |
+            GameVox-Hindi-v1.0-debug.apk
+            app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Create or Update GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.release_tag || format('v1.0.{0}', github.run_number) }}
+          name: "GameVox Hindi APK Release (${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.release_tag || format('v1.0.{0}', github.run_number) }})"
+          body: |
+            ### GameVox Hindi — Automated Android APK Build
+            - **Commit**: `${{ github.sha }}`
+            - **Features**: Floating Overlay (`WindowManager`), MediaProjection 2s Screen Capture, `ColorMatrix` Bitmap Inversion, Google ML Kit OCR, English-to-Hindi Translation, Anti-Repeat (`lastSpokenText`), and Hindi (`hi-IN`) TTS.
+          files: |
+            GameVox-Hindi-v1.0-debug.apk
+            app/build/outputs/apk/debug/app-debug.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
