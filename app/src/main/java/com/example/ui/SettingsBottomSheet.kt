@@ -23,17 +23,24 @@ import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.InvertColors
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -42,6 +49,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -49,12 +58,19 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorAppState
@@ -80,6 +96,7 @@ fun SettingsBottomSheet(
     onHighQualityVoiceChange: (Boolean) -> Unit,
     onSsmlEnabledChange: (Boolean) -> Unit,
     onCloudTtsProviderChange: (CloudTtsProvider) -> Unit,
+    onSaveCloudTtsApiConfig: (CloudTtsProvider, String) -> Unit,
     onShowTargetBoxChange: (Boolean) -> Unit,
     onPitchChange: (Float) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
@@ -163,6 +180,230 @@ fun SettingsBottomSheet(
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+            // 0. Cloud TTS Provider Dropdown & API Key Settings (Saved in Jetpack DataStore Preferences)
+            var selectedProviderDraft by remember { mutableStateOf(state.cloudTtsProvider) }
+            var apiKeyInput by remember { mutableStateOf(state.savedKeyFor(state.cloudTtsProvider)) }
+            var isApiKeyVisible by remember { mutableStateOf(false) }
+            var isProviderMenuExpanded by remember { mutableStateOf(false) }
+            var localValidationError by remember { mutableStateOf<String?>(null) }
+            var localSaveConfirmation by remember { mutableStateOf<String?>(null) }
+
+            LaunchedEffect(
+                state.cloudTtsProvider,
+                state.userGoogleCloudApiKey,
+                state.userElevenLabsApiKey,
+                state.userOpenAiApiKey
+            ) {
+                selectedProviderDraft = state.cloudTtsProvider
+                apiKeyInput = state.savedKeyFor(state.cloudTtsProvider)
+            }
+
+            Surface(
+                color = SlateCardElevated,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.5.dp,
+                        color = ElectricCyan.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .testTag("cloud_tts_api_settings_card")
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Key,
+                            contentDescription = "Cloud TTS API Key Settings",
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Cloud TTS Provider & API Key",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Saved securely in Jetpack DataStore • Auto-loads on app launch",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    // 4. Provider Selection Dropdown (Google Cloud TTS, ElevenLabs, OpenAI, Default Phone TTS)
+                    ExposedDropdownMenuBox(
+                        expanded = isProviderMenuExpanded,
+                        onExpandedChange = { isProviderMenuExpanded = !isProviderMenuExpanded },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedTextField(
+                            value = selectedProviderDraft.displayLabel,
+                            onValueChange = {},
+                            readOnly = true,
+                            label = { Text("Select TTS Provider") },
+                            supportingText = { Text(selectedProviderDraft.subtitle) },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(expanded = isProviderMenuExpanded)
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                            ),
+                            modifier = Modifier
+                                .menuAnchor()
+                                .fillMaxWidth()
+                                .testTag("tts_provider_dropdown_field")
+                        )
+
+                        ExposedDropdownMenu(
+                            expanded = isProviderMenuExpanded,
+                            onDismissRequest = { isProviderMenuExpanded = false }
+                        ) {
+                            CloudTtsProvider.entries.forEach { provider ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text(
+                                                text = provider.displayLabel,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = provider.subtitle,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    },
+                                    onClick = {
+                                        selectedProviderDraft = provider
+                                        apiKeyInput = state.savedKeyFor(provider)
+                                        localValidationError = null
+                                        localSaveConfirmation = null
+                                        isProviderMenuExpanded = false
+                                        onCloudTtsProviderChange(provider)
+                                    },
+                                    modifier = Modifier.testTag("dropdown_provider_${provider.code}")
+                                )
+                            }
+                        }
+                    }
+
+                    // 1. Masked API Key TextField with Show/Hide Eye Icon
+                    OutlinedTextField(
+                        value = apiKeyInput,
+                        onValueChange = {
+                            apiKeyInput = it
+                            localValidationError = null
+                            localSaveConfirmation = null
+                        },
+                        label = { Text("Enter API Key") },
+                        placeholder = {
+                            Text(
+                                when (selectedProviderDraft) {
+                                    CloudTtsProvider.GOOGLE_CLOUD_TTS -> "AIza... (Google Cloud TTS Key)"
+                                    CloudTtsProvider.ELEVENLABS -> "sk_... (ElevenLabs API Key)"
+                                    CloudTtsProvider.OPENAI_TTS -> "sk-... (OpenAI API Key)"
+                                    CloudTtsProvider.ANDROID_SSML_NETWORK -> "Optional (Not needed for Default Phone TTS)"
+                                }
+                            )
+                        },
+                        singleLine = true,
+                        visualTransformation = if (isApiKeyVisible) {
+                            VisualTransformation.None
+                        } else {
+                            PasswordVisualTransformation()
+                        },
+                        trailingIcon = {
+                            IconButton(
+                                onClick = { isApiKeyVisible = !isApiKeyVisible },
+                                modifier = Modifier.testTag("toggle_api_key_visibility_button")
+                            ) {
+                                Icon(
+                                    imageVector = if (isApiKeyVisible) {
+                                        Icons.Default.VisibilityOff
+                                    } else {
+                                        Icons.Default.Visibility
+                                    },
+                                    contentDescription = if (isApiKeyVisible) "Hide API Key" else "Show API Key",
+                                    tint = ElectricCyan
+                                )
+                            }
+                        },
+                        isError = localValidationError != null,
+                        supportingText = {
+                            when {
+                                localValidationError != null -> Text(
+                                    text = localValidationError.orEmpty(),
+                                    color = CrimsonAlert
+                                )
+                                localSaveConfirmation != null -> Text(
+                                    text = localSaveConfirmation.orEmpty(),
+                                    color = NeonEmerald
+                                )
+                                state.activeApiKeyStatusNote.isNotBlank() -> Text(
+                                    text = state.activeApiKeyStatusNote,
+                                    color = SaffronGold
+                                )
+                                selectedProviderDraft.requiresApiKey && apiKeyInput.isBlank() -> Text(
+                                    text = "No key entered yet — app automatically falls back to Default Phone TTS.",
+                                    color = SaffronGold
+                                )
+                            }
+                        },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ElectricCyan,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("enter_api_key_textfield")
+                    )
+
+                    // Save Button
+                    Button(
+                        onClick = {
+                            val trimmed = apiKeyInput.trim()
+                            if (selectedProviderDraft.requiresApiKey && trimmed.isEmpty()) {
+                                // Still save provider choice cleanly & notify fallback to Phone TTS
+                                localValidationError = "API key is empty — falling back to Default Phone TTS until a key is saved."
+                            } else {
+                                localValidationError = null
+                                localSaveConfirmation = if (selectedProviderDraft.requiresApiKey) {
+                                    "${selectedProviderDraft.displayLabel} key saved to DataStore!"
+                                } else {
+                                    "Default Phone TTS saved!"
+                                }
+                            }
+                            onSaveCloudTtsApiConfig(selectedProviderDraft, trimmed)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("save_api_key_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Save,
+                            contentDescription = "Save API Key",
+                            tint = ObsidianBg,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Save",
+                            color = ObsidianBg,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
 
             // 1. Target Translation & TTS Language Selector Card
             Surface(
@@ -471,33 +712,38 @@ fun SettingsBottomSheet(
                         }
                     }
 
-                    val googleKeyReady = CloudTtsService.hasGoogleCloudKey()
-                    val openAiKeyReady = CloudTtsService.hasOpenAiKey()
+                    val googleKeyReady = CloudTtsService.hasGoogleCloudKey(state.userGoogleCloudApiKey)
+                    val elevenLabsKeyReady = CloudTtsService.hasElevenLabsKey(state.userElevenLabsApiKey)
+                    val openAiKeyReady = CloudTtsService.hasOpenAiKey(state.userOpenAiApiKey)
+                    val isCurrentCloudMissingKey = when (state.cloudTtsProvider) {
+                        CloudTtsProvider.GOOGLE_CLOUD_TTS -> !googleKeyReady
+                        CloudTtsProvider.ELEVENLABS -> !elevenLabsKeyReady
+                        CloudTtsProvider.OPENAI_TTS -> !openAiKeyReady
+                        CloudTtsProvider.ANDROID_SSML_NETWORK -> false
+                    }
                     val statusNote = when (state.cloudTtsProvider) {
                         CloudTtsProvider.ANDROID_SSML_NETWORK ->
-                            "Active: Built-in Android SSML + High-Quality Network voices (hi-in-x-hif-network / hi-in-x-him-network)."
+                            "Active: Default Phone TTS with SSML + HD Network voices (hi-in-x-hif-network / hi-in-x-him-network)."
                         CloudTtsProvider.GOOGLE_CLOUD_TTS -> if (googleKeyReady) {
-                            "Google Cloud TTS API Key Ready! Using Neural2 / WaveNet SSML voices with instant on-device fallback."
+                            "Google Cloud TTS API Key Ready (DataStore / BuildConfig)! Using Neural2 / WaveNet SSML voices."
                         } else {
-                            "GOOGLE_CLOUD_TTS_API_KEY not set in AI Studio Secrets panel — falling back seamlessly to Android SSML + Network."
+                            "No Google Cloud API key saved — automatically using Default Phone TTS engine."
+                        }
+                        CloudTtsProvider.ELEVENLABS -> if (elevenLabsKeyReady) {
+                            "ElevenLabs API Key Ready (DataStore)! Using eleven_multilingual_v2 expressive AI voices."
+                        } else {
+                            "No ElevenLabs API key saved — automatically using Default Phone TTS engine."
                         }
                         CloudTtsProvider.OPENAI_TTS -> if (openAiKeyReady) {
-                            "OpenAI TTS API Key Ready! Using gpt-4o-mini-tts expressive voices with instant on-device fallback."
+                            "OpenAI TTS API Key Ready! Using gpt-4o-mini-tts expressive voices."
                         } else {
-                            "OPENAI_TTS_API_KEY not set in AI Studio Secrets panel — falling back seamlessly to Android SSML + Network."
+                            "No OpenAI API key saved — automatically using Default Phone TTS engine."
                         }
                     }
                     Text(
                         text = statusNote,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (
-                            (state.cloudTtsProvider == CloudTtsProvider.GOOGLE_CLOUD_TTS && !googleKeyReady) ||
-                            (state.cloudTtsProvider == CloudTtsProvider.OPENAI_TTS && !openAiKeyReady)
-                        ) {
-                            SaffronGold
-                        } else {
-                            NeonEmerald
-                        }
+                        color = if (isCurrentCloudMissingKey) SaffronGold else NeonEmerald
                     )
                 }
             }

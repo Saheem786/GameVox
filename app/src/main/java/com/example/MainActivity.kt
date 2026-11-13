@@ -101,6 +101,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import com.example.data.SubtitleTranslationEntry
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorAppState
@@ -138,6 +139,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         TranslatorStateRepository.loadPreferences(applicationContext)
+        lifecycleScope.launch {
+            TranslatorStateRepository.loadCloudTtsFromDataStore(applicationContext)
+        }
         VoiceProfileRepository.initialize(applicationContext)
         localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
 
@@ -746,6 +750,21 @@ fun GameVoxHindiDashboard(
             onCloudTtsProviderChange = { provider ->
                 TranslatorStateRepository.updateCloudTtsProvider(context, provider)
                 localPipeline.ttsManager.stopSpeaking()
+            },
+            onSaveCloudTtsApiConfig = { provider, apiKey ->
+                TranslatorStateRepository.saveCloudTtsConfig(context, provider, apiKey)
+                localPipeline.ttsManager.stopSpeaking()
+                coroutineScope.launch {
+                    snackbarHostState.showSnackbar(
+                        if (!provider.requiresApiKey) {
+                            "TTS Provider set to Default Phone TTS"
+                        } else if (apiKey.isNotBlank()) {
+                            "${provider.displayLabel} API Key saved to DataStore!"
+                        } else {
+                            "No API Key entered — using Default Phone TTS fallback"
+                        }
+                    )
+                }
             },
             onShowTargetBoxChange = { showBox ->
                 TranslatorStateRepository.updateShowTargetBoxOverlay(context, showBox)

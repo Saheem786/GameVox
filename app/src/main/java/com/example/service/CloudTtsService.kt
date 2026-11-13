@@ -20,29 +20,40 @@ import org.json.JSONObject
 
 /**
  * Selectable Speech Synthesis Engine in GameVox Hindi:
- * 1. [ANDROID_SSML_NETWORK]: Built-in Android [android.speech.tts.TextToSpeech] with SSML + High-Quality Network Voice
- * 2. [GOOGLE_CLOUD_TTS]: Google Cloud Text-to-Speech API (Neural2 / WaveNet voices with full SSML emotion support)
- * 3. [OPENAI_TTS]: OpenAI Audio Speech API (`gpt-4o-mini-tts` with expressive emotional style instructions)
+ * 1. [ANDROID_SSML_NETWORK]: Default Phone TTS engine with SSML + High-Quality Network Voice
+ * 2. [GOOGLE_CLOUD_TTS]: Google Cloud Text-to-Speech API (Neural2 / WaveNet voices with full SSML)
+ * 3. [ELEVENLABS]: ElevenLabs Multilingual v2 AI voices with emotion-tuned voice settings
+ * 4. [OPENAI_TTS]: OpenAI Audio Speech API (`gpt-4o-mini-tts` with expressive emotional instructions)
  */
 enum class CloudTtsProvider(
     val code: String,
     val displayLabel: String,
-    val subtitle: String
+    val subtitle: String,
+    val requiresApiKey: Boolean
 ) {
     ANDROID_SSML_NETWORK(
         code = "android_ssml",
-        displayLabel = "Android SSML + HD Network",
-        subtitle = "Built-in hi-IN network voices + SSML prosody (No key needed)"
+        displayLabel = "Default Phone TTS",
+        subtitle = "Built-in hi-IN network voices + SSML prosody (No API key needed)",
+        requiresApiKey = false
     ),
     GOOGLE_CLOUD_TTS(
         code = "google_cloud_tts",
-        displayLabel = "Google Cloud TTS (Neural2)",
-        subtitle = "AI Neural2 & WaveNet human voices with full SSML emotions"
+        displayLabel = "Google Cloud TTS",
+        subtitle = "AI Neural2 & WaveNet human voices with full SSML emotions",
+        requiresApiKey = true
+    ),
+    ELEVENLABS(
+        code = "elevenlabs",
+        displayLabel = "ElevenLabs",
+        subtitle = "Ultra-realistic Multilingual v2 AI voices with emotion settings",
+        requiresApiKey = true
     ),
     OPENAI_TTS(
         code = "openai_tts",
-        displayLabel = "OpenAI TTS (gpt-4o-mini-tts)",
-        subtitle = "Expressive AI voices with natural tone & emotion instructions"
+        displayLabel = "OpenAI TTS",
+        subtitle = "Expressive gpt-4o-mini-tts AI voices with emotion instructions",
+        requiresApiKey = true
     );
 
     companion object {
@@ -55,11 +66,12 @@ enum class CloudTtsProvider(
 
 /**
  * AI Cloud Text-to-Speech integration client supporting:
- * - **Google Cloud Text-to-Speech REST API (`v1/text:synthesize`)** using Neural2 & WaveNet voices with SSML
- * - **OpenAI Audio Speech REST API (`v1/audio/speech`)** using `gpt-4o-mini-tts` expressive emotion instructions
+ * - **Google Cloud Text-to-Speech REST API (`v1/text:synthesize`)** via [GoogleCloudTtsService]
+ * - **ElevenLabs REST API (`v1/text-to-speech`)** via [ElevenLabsTtsService]
+ * - **OpenAI Audio Speech REST API (`v1/audio/speech`)** using `gpt-4o-mini-tts`
  *
- * API keys are injected at build time via the Secrets Gradle Plugin (`BuildConfig.GOOGLE_CLOUD_TTS_API_KEY`
- * and `BuildConfig.OPENAI_TTS_API_KEY`) configured in the AI Studio Secrets panel.
+ * Prioritizes dynamically saved user API keys from Jetpack DataStore Preferences and falls back
+ * to `BuildConfig` secrets when configured via the AI Studio Secrets panel.
  */
 object CloudTtsService {
 
@@ -70,15 +82,17 @@ object CloudTtsService {
     @Volatile
     private var activeMediaPlayer: MediaPlayer? = null
 
-    private val googleCloudTtsService: GoogleCloudTtsService by lazy {
-        GoogleCloudTtsService()
+    fun hasGoogleCloudKey(userKey: String = ""): Boolean {
+        return GoogleCloudTtsService.hasValidApiKey(userKey) ||
+            GoogleCloudTtsService.hasValidApiKey(BuildConfig.GOOGLE_CLOUD_TTS_API_KEY)
     }
 
-    fun hasGoogleCloudKey(): Boolean {
-        return GoogleCloudTtsService.hasValidApiKey(BuildConfig.GOOGLE_CLOUD_TTS_API_KEY)
+    fun hasElevenLabsKey(userKey: String = ""): Boolean {
+        return ElevenLabsTtsService.hasValidApiKey(userKey)
     }
 
-    fun hasOpenAiKey(): Boolean {
+    fun hasOpenAiKey(userKey: String = ""): Boolean {
+        if (userKey.trim().isNotEmpty() && !userKey.trim().startsWith("MY_")) return true
         val key = BuildConfig.OPENAI_TTS_API_KEY.trim()
         return key.isNotEmpty() && !key.startsWith("MY_")
     }
@@ -104,11 +118,11 @@ object CloudTtsService {
     }
 
     /**
-     * Synthesizes [emotionResult] using [GoogleCloudTtsService] (Neural2/WaveNet) or OpenAI TTS
-     * (`gpt-4o-mini-tts`) and plays the resulting MP3 audio via [MediaPlayer].
+     * Synthesizes [emotionResult] using [provider] and the dynamically resolved [apiKeyOverride]
+     * (from Jetpack DataStore Preferences) and plays the resulting MP3 audio via [MediaPlayer].
      *
-     * Returns `true` if cloud audio synthesis & playback started, or `false` if no valid key is configured
-     * or the network request failed (so the caller can seamlessly fallback to Android's SSML TTS engine).
+     * Returns `true` if cloud audio synthesis & playback started, or `false` if no valid key is
+     * configured or the network request failed (so the caller falls back to Default Phone TTS).
      */
     suspend fun synthesizeAndPlay(
         context: Context,
@@ -116,15 +130,19 @@ object CloudTtsService {
         targetLanguage: TargetLanguage,
         gender: SpeakerGender,
         emotionResult: EmotionAnalysisResult,
+        apiKeyOverride: String = "",
         onStarted: (voiceModelLabel: String) -> Unit,
         onCompleted: () -> Unit,
         onError: (String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        val dynamicKey = apiKeyOverride.trim()
         val mp3Result: Pair<ByteArray, String>? = when (provider) {
             CloudTtsProvider.GOOGLE_CLOUD_TTS -> {
-                if (!hasGoogleCloudKey()) return@withContext false
+                val resolvedKey = dynamicKey.ifEmpty { BuildConfig.GOOGLE_CLOUD_TTS_API_KEY.trim() }
+                if (!GoogleCloudTtsService.hasValidApiKey(resolvedKey)) return@withContext false
+                val googleClient = GoogleCloudTtsService(apiKey = resolvedKey)
                 when (
-                    val result = googleCloudTtsService.synthesizeWithEmotionResult(
+                    val result = googleClient.synthesizeWithEmotionResult(
                         targetLanguage = targetLanguage,
                         gender = gender,
                         emotionResult = emotionResult,
@@ -138,10 +156,27 @@ object CloudTtsService {
                     }
                 }
             }
+            CloudTtsProvider.ELEVENLABS -> {
+                if (!ElevenLabsTtsService.hasValidApiKey(dynamicKey)) return@withContext false
+                val elevenLabsClient = ElevenLabsTtsService(apiKey = dynamicKey)
+                when (
+                    val result = elevenLabsClient.synthesizeEmotionAwareSpeech(
+                        gender = gender,
+                        emotionResult = emotionResult
+                    )
+                ) {
+                    is CloudTtsSynthesisResult.Success -> result.audioBytes to result.voiceName
+                    is CloudTtsSynthesisResult.Failure -> {
+                        Log.w(TAG, "ElevenLabs TTS fallback triggered: ${result.message}")
+                        null
+                    }
+                }
+            }
             CloudTtsProvider.OPENAI_TTS -> {
-                if (!hasOpenAiKey()) return@withContext false
+                val resolvedKey = dynamicKey.ifEmpty { BuildConfig.OPENAI_TTS_API_KEY.trim() }
+                if (resolvedKey.isEmpty() || resolvedKey.startsWith("MY_")) return@withContext false
                 synthesizeViaOpenAiTts(
-                    apiKey = BuildConfig.OPENAI_TTS_API_KEY.trim(),
+                    apiKey = resolvedKey,
                     gender = gender,
                     emotionResult = emotionResult
                 )

@@ -6,10 +6,14 @@ import android.graphics.Rect
 import com.example.engine.SpeechEmotion
 import com.example.service.CloudTtsProvider
 import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 /**
  * Target languages supported by ML Kit / Google Translator (BCP-47 language codes)
@@ -154,6 +158,10 @@ data class TranslatorAppState(
     val useHighQualityNetworkVoice: Boolean = true,
     val ssmlEnabledOnDevice: Boolean = true,
     val cloudTtsProvider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+    val userGoogleCloudApiKey: String = "",
+    val userElevenLabsApiKey: String = "",
+    val userOpenAiApiKey: String = "",
+    val activeApiKeyStatusNote: String = "",
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
     val availableVoicesCount: Int = 0,
     val voiceDownloadMessage: String = "HD Network Synthesis Active",
@@ -175,9 +183,19 @@ data class TranslatorAppState(
     val originalFramePreview: Bitmap? = null,
     val invertedFramePreview: Bitmap? = null,
     val history: List<SubtitleTranslationEntry> = emptyList()
-)
+) {
+    fun savedKeyFor(provider: CloudTtsProvider): String {
+        return when (provider) {
+            CloudTtsProvider.GOOGLE_CLOUD_TTS -> userGoogleCloudApiKey
+            CloudTtsProvider.ELEVENLABS -> userElevenLabsApiKey
+            CloudTtsProvider.OPENAI_TTS -> userOpenAiApiKey
+            CloudTtsProvider.ANDROID_SSML_NETWORK -> ""
+        }
+    }
+}
 
 object TranslatorStateRepository {
+    private val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private const val PREFS_NAME = "gamevox_hindi_prefs"
     private const val KEY_TARGET_LANG = "target_lang_code"
     private const val KEY_NETWORK_VOICE = "use_hq_network_voice"
@@ -265,7 +283,65 @@ object TranslatorStateRepository {
             .edit()
             .putString(KEY_CLOUD_TTS_PROVIDER, provider.code)
             .apply()
-        _state.update { it.copy(cloudTtsProvider = provider) }
+        _state.update { it.copy(cloudTtsProvider = provider, activeApiKeyStatusNote = "") }
+        dataStoreScope.launch {
+            TtsSettingsDataStore.saveProvider(context, provider)
+        }
+    }
+
+    suspend fun loadCloudTtsFromDataStore(context: Context) {
+        val stored = TtsSettingsDataStore.readPreferences(context)
+        _state.update {
+            it.copy(
+                cloudTtsProvider = stored.provider,
+                userGoogleCloudApiKey = stored.googleCloudApiKey,
+                userElevenLabsApiKey = stored.elevenLabsApiKey,
+                userOpenAiApiKey = stored.openAiApiKey
+            )
+        }
+    }
+
+    fun saveCloudTtsConfig(
+        context: Context,
+        provider: CloudTtsProvider,
+        apiKey: String
+    ) {
+        val trimmedKey = apiKey.trim()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CLOUD_TTS_PROVIDER, provider.code)
+            .apply()
+
+        _state.update { current ->
+            current.copy(
+                cloudTtsProvider = provider,
+                userGoogleCloudApiKey = if (provider == CloudTtsProvider.GOOGLE_CLOUD_TTS) trimmedKey else current.userGoogleCloudApiKey,
+                userElevenLabsApiKey = if (provider == CloudTtsProvider.ELEVENLABS) trimmedKey else current.userElevenLabsApiKey,
+                userOpenAiApiKey = if (provider == CloudTtsProvider.OPENAI_TTS) trimmedKey else current.userOpenAiApiKey,
+                activeApiKeyStatusNote = when {
+                    !provider.requiresApiKey -> "Default Phone TTS active (No API key needed)."
+                    trimmedKey.isNotEmpty() -> "${provider.displayLabel} API Key saved to DataStore."
+                    else -> "API key cleared — will fallback to Default Phone TTS."
+                }
+            )
+        }
+
+        dataStoreScope.launch {
+            TtsSettingsDataStore.saveProviderAndApiKey(
+                context = context,
+                provider = provider,
+                apiKey = trimmedKey
+            )
+        }
+    }
+
+    fun setCloudTtsStatusMessage(message: String) {
+        _state.update {
+            it.copy(
+                activeApiKeyStatusNote = message,
+                voiceDownloadMessage = message
+            )
+        }
     }
 
     fun updateEmotionTelemetry(

@@ -17,6 +17,7 @@ import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
+import com.example.data.TtsSettingsDataStore
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
 import com.example.engine.EmotionAnalysisResult
@@ -224,6 +225,9 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     init {
         registerTtsDataBroadcastReceiver()
+        managerScope.launch {
+            TranslatorStateRepository.loadCloudTtsFromDataStore(appContext)
+        }
         initializeAsync()
     }
 
@@ -995,12 +999,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
-        // Try Cloud AI TTS (Google Cloud Neural2/WaveNet or OpenAI gpt-4o-mini-tts) when selected and key is configured
-        val useCloudProvider = state.cloudTtsProvider != CloudTtsProvider.ANDROID_SSML_NETWORK &&
-            ((state.cloudTtsProvider == CloudTtsProvider.GOOGLE_CLOUD_TTS && CloudTtsService.hasGoogleCloudKey()) ||
-                (state.cloudTtsProvider == CloudTtsProvider.OPENAI_TTS && CloudTtsService.hasOpenAiKey()))
-
-        if (useCloudProvider) {
+        // Dynamically fetch the Cloud TTS API key from Jetpack DataStore when a Cloud provider is selected
+        if (state.cloudTtsProvider != CloudTtsProvider.ANDROID_SSML_NETWORK) {
             val cloudUtteranceId = "cloud_${UUID.randomUUID()}"
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
@@ -1014,14 +1014,39 @@ class ForegroundTtsManager private constructor(context: Context) {
             activeUtteranceId = cloudUtteranceId
 
             managerScope.launch {
+                val resolvedApiKey = TtsSettingsDataStore.getEffectiveApiKey(
+                    context = appContext,
+                    provider = state.cloudTtsProvider
+                )
+                if (resolvedApiKey.isBlank()) {
+                    // No API key saved by user -> switch to Default Phone TTS engine with clear status note
+                    TranslatorStateRepository.setCloudTtsStatusMessage(
+                        "No API key saved for ${state.cloudTtsProvider.displayLabel} — switched to Default Phone TTS"
+                    )
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == cloudUtteranceId) {
+                        activeUtteranceId = null
+                    }
+                    speakOnAndroidTts(
+                        text = text,
+                        sourceEnglishText = sourceEnglishText,
+                        voiceProfile = voiceProfile
+                    )
+                    return@launch
+                }
+
                 val started = CloudTtsService.synthesizeAndPlay(
                     context = appContext,
                     provider = state.cloudTtsProvider,
                     targetLanguage = state.targetLanguage,
                     gender = targetGender,
                     emotionResult = emotionResult,
+                    apiKeyOverride = resolvedApiKey,
                     onStarted = { cloudModelName ->
                         TranslatorStateRepository.setActiveVoiceName(cloudModelName)
+                        TranslatorStateRepository.setCloudTtsStatusMessage(
+                            "Speaking via ${state.cloudTtsProvider.displayLabel}"
+                        )
                         startRealtimeVisualizerSync(
                             utteranceId = cloudUtteranceId,
                             text = emotionResult.cleanSpokenText,
@@ -1044,8 +1069,11 @@ class ForegroundTtsManager private constructor(context: Context) {
                             onThirtySecondPostSpeechDelayCompleted?.invoke(cloudUtteranceId)
                         }
                     },
-                    onError = {
-                        // Cloud playback failed -> fallback smoothly to Android SSML + HD Network TTS
+                    onError = { errorMsg ->
+                        // Cloud playback failed -> fallback smoothly to Default Phone TTS engine
+                        TranslatorStateRepository.setCloudTtsStatusMessage(
+                            "${state.cloudTtsProvider.displayLabel} error ($errorMsg) — switched to Default Phone TTS"
+                        )
                         isSpeakingUtterance = false
                         if (activeUtteranceId == cloudUtteranceId) {
                             activeUtteranceId = null
@@ -1058,6 +1086,9 @@ class ForegroundTtsManager private constructor(context: Context) {
                     }
                 )
                 if (!started) {
+                    TranslatorStateRepository.setCloudTtsStatusMessage(
+                        "${state.cloudTtsProvider.displayLabel} request failed — switched to Default Phone TTS"
+                    )
                     isSpeakingUtterance = false
                     if (activeUtteranceId == cloudUtteranceId) {
                         activeUtteranceId = null
