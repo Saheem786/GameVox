@@ -48,10 +48,18 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".service.MediaProjectionConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name=".service.ScreenTranslatorService"
             android:enabled="true"
             android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
             android:foregroundServiceType="mediaProjection" />
 
         <service

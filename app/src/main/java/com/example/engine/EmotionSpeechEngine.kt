@@ -164,7 +164,8 @@ object EmotionSpeechEngine {
         sourceEnglishText: String = "",
         gender: SpeakerGender = SpeakerGender.MALE_18,
         profilePitchOverride: Float? = null,
-        profileRateOverride: Float? = null
+        profileRateOverride: Float? = null,
+        masterVolume: Float = 1.0f
     ): EmotionAnalysisResult {
         val cleanSpoken = stripStageDirections(spokenText)
         val combinedText = "$sourceEnglishText $spokenText".trim()
@@ -172,12 +173,13 @@ object EmotionSpeechEngine {
 
         val (emotion, reason) = detectEmotion(combinedText, lowerCombined)
 
-        val (effectivePitch, effectiveRate, effectiveVolume) = computeGenderEmotionProsody(
+        val (effectivePitch, effectiveRate, emotionVolume) = computeGenderEmotionProsody(
             emotion = emotion,
             gender = gender,
             profilePitchOverride = profilePitchOverride,
             profileRateOverride = profileRateOverride
         )
+        val effectiveVolume = (emotionVolume * masterVolume.coerceIn(0.1f, 1.0f)).coerceIn(0.08f, 1.0f)
 
         val ssml = buildSsmlString(
             cleanText = cleanSpoken,

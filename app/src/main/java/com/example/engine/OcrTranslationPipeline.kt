@@ -3,7 +3,6 @@ package com.example.engine
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
-import com.example.data.ModelDownloadStatus
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
@@ -11,23 +10,29 @@ import com.example.service.ForegroundTtsManager
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
  * Process-wide Singleton coordinating:
- * 1. [ImageProcessor] Target Bounding Box Cropping + Grayscale + ColorMatrix Inversion + ML Kit OCR
- * 2. AccessibilityService bounding-box node & screenshot overlay extraction
+ * 1. [ImageProcessor] Target Subtitle Region Cropping + Frame-Diff Optimization + Grayscale/Inversion + ML Kit OCR
+ * 2. [SubtitleTextFilter] to ignore HUD clutter, health bars, timers, and unrelated game UI text
  * 3. Multi-Speaker Character Detection ([VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle])
- * 4. Google Translate Neural API + Offline English -> Hindi Translation + Anti-Repeat check (lastSpokenText)
- * 5. [ForegroundTtsManager] for Multi-Voice & High-Quality Network Voice TextToSpeech.
+ * 4. Dual-Mode Translation via [HindiTranslationEngine.translateSuspend] (Free On-Device ML Kit OR Context-Aware AI)
+ * 5. [SubtitleDubbingQueue] (short bounded queue with intelligent skipping when subtitles change rapidly)
+ * 6. [PronunciationGlossary] applied right before Hindi TTS playback via [ForegroundTtsManager].
  */
 class OcrTranslationPipeline private constructor(context: Context) {
 
     private val appContext: Context = context.applicationContext
     private val scanMutex = Mutex()
+    private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val dubbingQueue = SubtitleDubbingQueue(maxCapacity = 2)
 
     companion object {
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
@@ -48,21 +53,19 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
     val ttsManager: ForegroundTtsManager by lazy {
         ForegroundTtsManager.getInstance(appContext).also { manager ->
+            manager.onUtteranceCompletedImmediately = {
+                drainNextQueuedSubtitleIfAny()
+            }
             manager.onThirtySecondPostSpeechDelayCompleted = {
-                // 30 seconds after UtteranceProgressListener.onDone() finished speaking the full sentence,
-                // clear lastSpokenText so if the same text is still on the screen, the next scan speaks it again.
-                lastSpokenText = ""
-                lastExtractedNormalized = ""
+                // Only clear anti-repeat memory if the queue is empty and same line stayed idle for 30s
+                if (dubbingQueue.size() == 0) {
+                    lastSpokenText = ""
+                    lastExtractedNormalized = ""
+                }
             }
         }
     }
 
-    /**
-     * Anti-Repeat state variable:
-     * Holds the last spoken text while TTS is speaking and during the 30-second post-speech wait window
-     * after `UtteranceProgressListener.onDone()`. If scanned text matches [lastSpokenText], it is not
-     * spoken again until the 30-second post-speech delay expires.
-     */
     @Volatile
     var lastSpokenText: String = ""
         private set
@@ -78,17 +81,8 @@ class OcrTranslationPipeline private constructor(context: Context) {
         ensureTranslationModelDownloaded()
     }
 
-    /**
-     * Returns true if the TTS engine is currently speaking an utterance.
-     * Used by the background scan loops so no new scan is triggered until the current text finishes speaking.
-     */
-    fun isTtsSpeakingNow(): Boolean {
-        return ttsManager.isSpeakingNow()
-    }
+    fun isTtsSpeakingNow(): Boolean = ttsManager.isSpeakingNow()
 
-    /**
-     * Initializes [ForegroundTtsManager] asynchronously without blocking OCR or translation.
-     */
     fun initializeTtsAsync() {
         ttsManager.registerTtsDataBroadcastReceiver()
         ttsManager.initializeAsync()
@@ -98,58 +92,41 @@ class OcrTranslationPipeline private constructor(context: Context) {
         ttsManager.refreshVoiceConfiguration()
     }
 
-    fun ensureTranslationModelDownloaded() {
-        TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+    fun ensureTranslationModelDownloaded(downloadIfMissing: Boolean = true) {
+        pipelineScope.launch(Dispatchers.IO) {
+            val targetLang = TranslatorStateRepository.state.value.targetLanguage
+            HindiTranslationEngine.ensureOfflineModelDownloaded(
+                targetLanguage = targetLang,
+                downloadIfMissing = downloadIfMissing
+            )
+        }
     }
 
-    /**
-     * Processes text extracted directly by [com.example.service.GameVoxAccessibilityService]
-     * from inside the user's Draggable & Resizable Target Bounding Box.
-     */
     suspend fun processExtractedRawText(
         rawEnglishText: String,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
-        if (isTtsSpeakingNow()) {
-            return@withContext "" to ""
-        }
         scanMutex.withLock {
-            if (isTtsSpeakingNow()) {
-                return@withLock "" to ""
-            }
             val startTime = System.currentTimeMillis()
-            val extractedEnglish = cleanExtractedSubtitle(rawEnglishText)
+            val filtered = SubtitleTextFilter.filterDialogueText(rawEnglishText)
+            val extractedEnglish = cleanExtractedSubtitle(filtered)
             if (extractedEnglish.isBlank()) {
                 return@withLock "" to ""
             }
-            handleExtractedSubtitle(rawEnglishText, extractedEnglish, startTime, onDebugTextUpdate)
+            handleExtractedSubtitle(filtered, extractedEnglish, startTime, onDebugTextUpdate)
         }
     }
 
-    /**
-     * Processes a captured screen [rawBitmap] using [ImageProcessor]:
-     * 1. Crops [rawBitmap] strictly to [targetRegionScreenRect] (the user's Draggable Overlay Box)
-     * 2. Applies Grayscale + Color-Inversion
-     * 3. Extracts text from the cropped box via Google ML Kit Text Recognition
-     * 4. Runs [SpeakerHeuristicEngine] to detect character name tags (`"Character A:"`, etc.) and map to [VoiceProfile]
-     * 5. Translates clean dialogue -> selected TargetLanguage via Google Translate API + Offline fallback
-     * 6. Checks Anti-Repeat [lastSpokenText] and speaks via the assigned character's [VoiceProfile].
-     */
     suspend fun processCapturedFrame(
         rawBitmap: Bitmap,
         excludeOverlayRect: Rect? = null,
         targetRegionScreenRect: Rect? = null,
         rawScreenWidth: Int = 0,
         rawScreenHeight: Int = 0,
+        skipIfRegionUnchanged: Boolean = true,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
-        if (isTtsSpeakingNow()) {
-            return@withContext "" to ""
-        }
         scanMutex.withLock {
-            if (isTtsSpeakingNow()) {
-                return@withLock "" to ""
-            }
             val startTime = System.currentTimeMillis()
             val appState = TranslatorStateRepository.state.value
 
@@ -159,8 +136,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 excludeOverlayRect = excludeOverlayRect,
                 targetRegionScreenRect = targetRegionScreenRect,
                 rawScreenWidth = rawScreenWidth,
-                rawScreenHeight = rawScreenHeight
+                rawScreenHeight = rawScreenHeight,
+                skipIfRegionUnchanged = skipIfRegionUnchanged
             )
+
+            if (extractionResult.skippedUnchangedFrame) {
+                return@withLock "" to ""
+            }
 
             val origThumb = BitmapInverter.createPreviewThumbnail(extractionResult.croppedOriginalBitmap)
             val invThumb = BitmapInverter.createPreviewThumbnail(extractionResult.processedBitmap)
@@ -181,124 +163,197 @@ class OcrTranslationPipeline private constructor(context: Context) {
         startTime: Long,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?
     ): Pair<String, String> {
-        val targetLang = TranslatorStateRepository.state.value.targetLanguage
+        val state = TranslatorStateRepository.state.value
+        val targetLang = state.targetLanguage
 
-        // 1. Sentence Parsing Logic: Separate Line 1 (Character Name like "Jenny" or "Anon") from the dialogue,
-        // detect Gender & Age (18yo Girl vs 18yo Boy), and map to the corresponding VoiceProfile.
         val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(rawScanText)
         val assignedVoice = parsedDialogue.assignedVoice
-
-        // 2. Do NOT read the character name: Only translate and speak the dialogue after the name!
         val dialogueToTranslate = parsedDialogue.spokenDialogue.trim()
         if (dialogueToTranslate.isBlank()) {
             return "" to ""
         }
 
-        val translatedText = translateEnglishToHindi(dialogueToTranslate)
+        // Skip re-translating if extracted dialogue matches the active or most recently queued line
+        val candidateNorm = SubtitleDubbingQueue.normalize(dialogueToTranslate)
+        if (SubtitleDubbingQueue.areSimilar(candidateNorm, lastExtractedNormalized) && !isTtsSpeakingNow()) {
+            TranslatorStateRepository.recordTranslationResult(
+                english = dialogueToTranslate,
+                hindi = lastSpokenText.ifBlank { state.lastTranslatedHindi },
+                wasSpoken = false,
+                skippedReason = "Anti-Repeat: Identical to lastSpokenText",
+                processingTimeMs = System.currentTimeMillis() - startTime,
+                timestamp = timeFormatter.format(Date())
+            )
+            return dialogueToTranslate to lastSpokenText
+        }
+
+        val translatedText = translateEnglishToHindi(
+            englishText = dialogueToTranslate,
+            speakerName = parsedDialogue.speakerName
+        )
         if (translatedText.isBlank()) {
             return "" to ""
         }
         val elapsedMs = System.currentTimeMillis() - startTime
         val timestamp = timeFormatter.format(Date())
 
-        val isRepeat = isSameOrSimilarSubtitle(translatedText, lastSpokenText) ||
-            isSameOrSimilarSubtitle(dialogueToTranslate, lastExtractedNormalized)
-
-        if (isRepeat) {
-            TranslatorStateRepository.recordTranslationResult(
-                english = dialogueToTranslate,
-                hindi = translatedText,
-                wasSpoken = false,
-                skippedReason = "Anti-Repeat: Waiting 30s after onDone() before repeating same text",
-                processingTimeMs = elapsedMs,
-                timestamp = timestamp
-            )
-            withContext(Dispatchers.Main) {
-                onDebugTextUpdate?.invoke(
-                    dialogueToTranslate,
-                    translatedText,
-                    "Skipped (30s Anti-Repeat Window)"
-                )
-            }
-            return dialogueToTranslate to translatedText
-        }
-
-        // Genuinely new text detected: update lastSpokenText and speak full text with QUEUE_FLUSH
-        lastSpokenText = translatedText.trim()
-        lastExtractedNormalized = normalizeForComparison(dialogueToTranslate)
-
-        val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
-        val spokenSuccess = if (isVoiceMuted) {
-            false
-        } else {
-            withContext(Dispatchers.Main) {
-                speakHindiNonBlocking(
-                    hindiText = translatedText,
-                    forceSpeakEvenIfRepeat = false,
-                    voiceProfile = assignedVoice,
-                    sourceEnglishText = dialogueToTranslate
-                )
-            }
-        }
         val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
-        val genderBadge = parsedDialogue.detectedGender.displayLabel
-        val skipNote = when {
-            isVoiceMuted -> "Voice Muted (Long-Press Icon to Unmute) • $speakerTag ($genderBadge)"
-            spokenSuccess -> "$speakerTag ($genderBadge) → ${assignedVoice.name}"
-            else -> "TTS Queued / Downloading Voice Async"
-        }
-
-        TranslatorStateRepository.recordTranslationResult(
-            english = dialogueToTranslate,
-            hindi = translatedText,
-            wasSpoken = spokenSuccess,
-            skippedReason = skipNote,
-            processingTimeMs = elapsedMs,
-            timestamp = timestamp
+        val queueItem = PendingDubbingItem(
+            sourceEnglish = dialogueToTranslate,
+            spokenDialogue = dialogueToTranslate,
+            translatedText = translatedText,
+            voiceProfile = assignedVoice,
+            speakerLabel = speakerTag
         )
 
-        withContext(Dispatchers.Main) {
-            onDebugTextUpdate?.invoke(
-                dialogueToTranslate,
-                translatedText,
-                if (spokenSuccess) "Speaking ${targetLang.displayName} ($speakerTag [$genderBadge] → ${assignedVoice.name})" else skipNote
-            )
+        val outcome = dubbingQueue.enqueue(
+            item = queueItem,
+            isCurrentlySpeaking = isTtsSpeakingNow(),
+            activeSpokenEnglishNormalized = lastExtractedNormalized,
+            activeSpokenTranslated = lastSpokenText
+        )
+
+        val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
+        when (outcome) {
+            is DubbingEnqueueOutcome.SkippedDuplicate -> {
+                TranslatorStateRepository.recordTranslationResult(
+                    english = dialogueToTranslate,
+                    hindi = translatedText,
+                    wasSpoken = false,
+                    skippedReason = "Anti-Repeat: Identical to lastSpokenText",
+                    processingTimeMs = elapsedMs,
+                    timestamp = timestamp
+                )
+                withContext(Dispatchers.Main) {
+                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, "Duplicate skipped")
+                }
+            }
+
+            is DubbingEnqueueOutcome.Queued -> {
+                TranslatorStateRepository.updateQueueTelemetry(queuedCount = outcome.queueSize)
+                TranslatorStateRepository.recordTranslationResult(
+                    english = dialogueToTranslate,
+                    hindi = translatedText,
+                    wasSpoken = false,
+                    skippedReason = "Queued next (${outcome.queueSize})",
+                    processingTimeMs = elapsedMs,
+                    timestamp = timestamp
+                )
+                withContext(Dispatchers.Main) {
+                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, "Queued (${outcome.queueSize})")
+                }
+            }
+
+            is DubbingEnqueueOutcome.QueuedAndSkippedStale -> {
+                TranslatorStateRepository.updateQueueTelemetry(
+                    queuedCount = outcome.queueSize,
+                    skippedRapidIncrement = 1
+                )
+                TranslatorStateRepository.recordTranslationResult(
+                    english = dialogueToTranslate,
+                    hindi = translatedText,
+                    wasSpoken = false,
+                    skippedReason = "Skipped stale line; queued latest (${outcome.queueSize})",
+                    processingTimeMs = elapsedMs,
+                    timestamp = timestamp
+                )
+                withContext(Dispatchers.Main) {
+                    onDebugTextUpdate?.invoke(
+                        dialogueToTranslate,
+                        translatedText,
+                        "Skipped old rapid line • Queued (${outcome.queueSize})"
+                    )
+                }
+            }
+
+            is DubbingEnqueueOutcome.SpeakImmediately -> {
+                TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
+                lastSpokenText = translatedText.trim()
+                lastExtractedNormalized = SubtitleDubbingQueue.normalize(dialogueToTranslate)
+
+                val spokenSuccess = if (isVoiceMuted) {
+                    false
+                } else {
+                    withContext(Dispatchers.Main) {
+                        speakHindiNonBlocking(
+                            hindiText = translatedText,
+                            forceSpeakEvenIfRepeat = false,
+                            voiceProfile = assignedVoice,
+                            sourceEnglishText = dialogueToTranslate
+                        )
+                    }
+                }
+                val genderBadge = parsedDialogue.detectedGender.displayLabel
+                val note = when {
+                    isVoiceMuted -> "Voice Muted • $speakerTag ($genderBadge)"
+                    spokenSuccess -> "Speaking ${targetLang.displayName} ($speakerTag)"
+                    else -> "TTS Initializing"
+                }
+
+                TranslatorStateRepository.recordTranslationResult(
+                    english = dialogueToTranslate,
+                    hindi = translatedText,
+                    wasSpoken = spokenSuccess,
+                    skippedReason = note,
+                    processingTimeMs = elapsedMs,
+                    timestamp = timestamp
+                )
+
+                withContext(Dispatchers.Main) {
+                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, note)
+                }
+            }
         }
 
         return dialogueToTranslate to translatedText
     }
 
-    /**
-     * Toggles ONLY the Voice (TTS Mute/Unmute) state when the user Single-Taps the Floating Icon:
-     * - When muted (`true`): immediately pauses/stops TTS output while keeping Subtitle translation & scanning active.
-     * - When unmuted (`false`): resumes TTS voice and speaks the current subtitle if one is on screen.
-     */
-    fun toggleVoiceMuteOnSingleTap(): Boolean {
-        val nowMuted = TranslatorStateRepository.toggleVoiceMuted(appContext)
-        if (nowMuted) {
-            ttsManager.stopSpeaking()
-        } else {
-            val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
-            val latestEnglish = TranslatorStateRepository.state.value.lastExtractedEnglish
-            if (latestHindi.isNotBlank() && latestHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
-                speakHindiNonBlocking(
-                    hindiText = latestHindi,
-                    forceSpeakEvenIfRepeat = true,
-                    sourceEnglishText = latestEnglish
-                )
+    private fun drainNextQueuedSubtitleIfAny() {
+        pipelineScope.launch(Dispatchers.Main) {
+            val next = dubbingQueue.pollNext() ?: run {
+                TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
+                return@launch
             }
+            TranslatorStateRepository.updateQueueTelemetry(queuedCount = dubbingQueue.size())
+            if (TranslatorStateRepository.state.value.isVoiceMuted) return@launch
+
+            lastSpokenText = next.translatedText.trim()
+            lastExtractedNormalized = SubtitleDubbingQueue.normalize(next.spokenDialogue)
+
+            val spokenSuccess = speakHindiNonBlocking(
+                hindiText = next.translatedText,
+                forceSpeakEvenIfRepeat = true,
+                voiceProfile = next.voiceProfile,
+                sourceEnglishText = next.sourceEnglish
+            )
+
+            TranslatorStateRepository.recordTranslationResult(
+                english = next.spokenDialogue,
+                hindi = next.translatedText,
+                wasSpoken = spokenSuccess,
+                skippedReason = if (spokenSuccess) "Spoken from queue (${next.speakerLabel})" else "Queue TTS failed",
+                processingTimeMs = 0L,
+                timestamp = timeFormatter.format(Date())
+            )
         }
-        return nowMuted
     }
 
-    suspend fun translateEnglishToHindi(englishText: String): String = withContext(Dispatchers.IO) {
-        val targetLang = TranslatorStateRepository.state.value.targetLanguage
-        HindiTranslationEngine.translate(englishText, targetLang)
+    suspend fun translateEnglishToHindi(
+        englishText: String,
+        speakerName: String? = null
+    ): String = withContext(Dispatchers.IO) {
+        val state = TranslatorStateRepository.state.value
+        HindiTranslationEngine.translateSuspend(
+            englishText = englishText,
+            targetLanguage = state.targetLanguage,
+            mode = state.translationMode,
+            speakerName = speakerName
+        )
     }
 
     /**
-     * Speaks [hindiText] using [ForegroundTtsManager] with the specified character's [voiceProfile]
-     * (or the default selected voice if null) and [sourceEnglishText] for emotion analysis.
+     * Applies configured [PronunciationGlossary] rules right before speaking via [ForegroundTtsManager]
+     * so English names and Hinglish terms sound natural without altering displayed Hindi captions.
      */
     fun speakHindiNonBlocking(
         hindiText: String,
@@ -307,24 +362,26 @@ class OcrTranslationPipeline private constructor(context: Context) {
         sourceEnglishText: String = ""
     ): Boolean {
         if (hindiText.isBlank()) return false
-        if (!forceSpeakEvenIfRepeat && TranslatorStateRepository.state.value.isVoiceMuted) {
+        val state = TranslatorStateRepository.state.value
+        if (!forceSpeakEvenIfRepeat && state.isVoiceMuted) {
             return false
         }
         lastSpokenText = hindiText.trim()
+        val speechReadyText = if (state.targetLanguage.code == "hi") {
+            PronunciationGlossary.applyForSpeech(hindiText, state.pronunciationGlossary)
+        } else {
+            hindiText
+        }
         val activeProfile = voiceProfile ?: VoiceProfileRepository.voices.value.find {
             it.id == VoiceProfileRepository.selectedVoiceId.value
         }
         return ttsManager.speakNonBlocking(
-            text = hindiText,
+            text = speechReadyText,
             voiceProfile = activeProfile,
             sourceEnglishText = sourceEnglishText
         )
     }
 
-    /**
-     * Plays a preview of [voiceProfile] in the active target language so the user can hear
-     * its cloned pitch, speech rate, and timbre from the Voice List UI.
-     */
     fun previewVoiceProfile(voiceProfile: VoiceProfile) {
         val lang = TranslatorStateRepository.state.value.targetLanguage
         val previewLine = when (lang.code) {
@@ -335,55 +392,17 @@ class OcrTranslationPipeline private constructor(context: Context) {
     }
 
     fun resetAntiRepeatMemory() {
+        dubbingQueue.clear()
+        imageProcessor.resetFrameDiffCache()
+        HindiTranslationEngine.clearSceneContext()
         ttsManager.stopSpeaking()
         ttsManager.cancelThirtySecondRepeatTimer()
         lastSpokenText = ""
         lastExtractedNormalized = ""
+        TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
         TranslatorStateRepository.clearLastSpokenMemory()
     }
 
-    /**
-     * Returns true if [candidate] is identical or near-identical (accounting for minor 1-2 character
-     * ML Kit OCR jitter across frames) to [reference]. Prevents the same on-screen subtitle from
-     * re-triggering TTS before the 30-second post-speech timer expires.
-     */
-    private fun isSameOrSimilarSubtitle(candidate: String, reference: String): Boolean {
-        val normA = normalizeForComparison(candidate)
-        val normB = normalizeForComparison(reference)
-        if (normA.isEmpty() || normB.isEmpty()) return false
-        if (normA == normB) return true
-
-        val shorterLen = minOf(normA.length, normB.length)
-        val longerLen = maxOf(normA.length, normB.length)
-        if (shorterLen >= 8 && (normA.contains(normB) || normB.contains(normA)) &&
-            shorterLen.toFloat() / longerLen.toFloat() >= 0.65f
-        ) {
-            return true
-        }
-
-        val wordsA = normA.split(" ").filter { it.isNotEmpty() }.toSet()
-        val wordsB = normB.split(" ").filter { it.isNotEmpty() }.toSet()
-        if (wordsA.isNotEmpty() && wordsB.isNotEmpty()) {
-            val intersection = wordsA.intersect(wordsB).size
-            val union = wordsA.union(wordsB).size.coerceAtLeast(1)
-            if (intersection.toFloat() / union.toFloat() >= 0.72f) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun normalizeForComparison(text: String): String {
-        return text
-            .lowercase(Locale.ROOT)
-            .replace(Regex("[^\\p{L}\\p{N}\\s]"), "")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    /**
-     * Triggers an asynchronous language data download and warm-up via [ForegroundTtsManager].
-     */
     fun promptInstallHindiTtsData(context: Context, openSystemInstaller: Boolean = true) {
         ttsManager.requestAsyncLanguageDataDownload(
             context = context,

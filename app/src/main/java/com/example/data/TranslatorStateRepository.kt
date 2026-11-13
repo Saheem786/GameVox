@@ -3,6 +3,7 @@ package com.example.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
+import com.example.engine.PronunciationGlossary
 import com.example.engine.SpeechEmotion
 import com.example.service.CloudTtsProvider
 import java.util.Locale
@@ -128,10 +129,36 @@ enum class TtsEngineStatus(val label: String) {
 }
 
 enum class ModelDownloadStatus(val label: String) {
-    CHECKING("Checking Translator..."),
-    DOWNLOADING("Connecting Translator..."),
-    READY("Google Neural + Offline Translator Ready"),
-    OFFLINE_FALLBACK("Ready (Offline Dictionary Mode)")
+    CHECKING("Checking Offline Pack..."),
+    DOWNLOADING("Downloading Offline Hindi Model (~30 MB)..."),
+    READY("On-Device + Neural Translator Ready"),
+    OFFLINE_FALLBACK("Offline Mode (Downloading Pack Required)")
+}
+
+enum class TranslationMode(
+    val code: String,
+    val displayName: String,
+    val shortBadge: String,
+    val costAndLimitNote: String
+) {
+    ON_DEVICE_MLKIT(
+        code = "on_device_mlkit",
+        displayName = "Free On-Device (ML Kit)",
+        shortBadge = "Offline • Free",
+        costAndLimitNote = "Downloads ~30 MB Hindi pack once. Zero cloud cost, private, works offline. Translates line-by-line without scene memory."
+    ),
+    CONTEXT_AWARE_AI(
+        code = "context_aware_ai",
+        displayName = "Context-Aware AI (Gemini)",
+        shortBadge = "Online • Context AI",
+        costAndLimitNote = "Requires internet & uses cloud quota. Uses last 4 dialogue lines to preserve tone, sarcasm & character names. Sends cropped OCR text only."
+    );
+
+    companion object {
+        fun fromCode(code: String?): TranslationMode {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: ON_DEVICE_MLKIT
+        }
+    }
 }
 
 data class SubtitleTranslationEntry(
@@ -149,12 +176,17 @@ data class TranslatorAppState(
     val isServiceRunning: Boolean = false,
     val isAccessibilityConnected: Boolean = false,
     val isOverlayDemoActive: Boolean = false,
+    val hasActiveMediaProjection: Boolean = false,
+    val isProtectedScreenDetected: Boolean = false,
+    val captureStatusMessage: String = "Ready — tap Start to capture subtitles",
     val isCapturingOcr: Boolean = false,
     val showTargetBoxOverlay: Boolean = true,
     val isSubtitleVisible: Boolean = true,
     val isVoiceMuted: Boolean = false,
     val targetBoxScreenRect: Rect? = null,
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
+    val translationMode: TranslationMode = TranslationMode.ON_DEVICE_MLKIT,
+    val aiPrivacyConsentAccepted: Boolean = false,
     val useHighQualityNetworkVoice: Boolean = true,
     val ssmlEnabledOnDevice: Boolean = true,
     val cloudTtsProvider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
@@ -165,20 +197,25 @@ data class TranslatorAppState(
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
     val availableVoicesCount: Int = 0,
     val voiceDownloadMessage: String = "HD Network Synthesis Active",
+    val mlKitModelStatusText: String = "Offline Hindi pack: checking...",
     val lastDetectedEmotion: SpeechEmotion = SpeechEmotion.NEUTRAL,
     val lastEmotionReason: String = "Normal sentence → Neutral (18yo natural baseline)",
     val lastSsmlPreview: String = "",
     val ttsPitch: Float = 1.0f,
     val ttsSpeechRate: Float = 1.0f,
+    val ttsVolume: Float = 1.0f,
     val invertColorsEnabled: Boolean = true,
-    val captureIntervalMs: Long = 2000L,
-    val lastExtractedEnglish: String = "Drag the cyan Scan Box over game text...",
-    val lastTranslatedHindi: String = "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...",
+    val captureIntervalMs: Long = 1200L,
+    val lastExtractedEnglish: String = "Drag the green subtitle box to the bottom of the screen...",
+    val lastTranslatedHindi: String = "सबटायटल बॉक्स को गेम टेक्स्ट पर रखें...",
     val lastSpokenText: String = "",
     val scanFrameCount: Int = 0,
     val duplicateSkippedCount: Int = 0,
+    val queuedSubtitlesCount: Int = 0,
+    val skippedRapidCount: Int = 0,
+    val pronunciationGlossary: Map<String, String> = PronunciationGlossary.DEFAULT_ENTRIES,
     val ttsStatus: TtsEngineStatus = TtsEngineStatus.INITIALIZING,
-    val modelStatus: ModelDownloadStatus = ModelDownloadStatus.READY,
+    val modelStatus: ModelDownloadStatus = ModelDownloadStatus.CHECKING,
     val showSettingsBottomSheet: Boolean = false,
     val originalFramePreview: Bitmap? = null,
     val invertedFramePreview: Bitmap? = null,
@@ -204,10 +241,14 @@ object TranslatorStateRepository {
     private const val KEY_VOICE_MUTED = "is_voice_muted_v1"
     private const val KEY_PITCH = "tts_pitch_v3"
     private const val KEY_RATE = "tts_speech_rate_v3"
+    private const val KEY_VOLUME = "tts_volume_v1"
     private const val KEY_INVERT = "invert_colors_enabled"
     private const val KEY_INTERVAL = "capture_interval_ms"
     private const val KEY_SSML_ENABLED = "ssml_enabled_on_device_v1"
     private const val KEY_CLOUD_TTS_PROVIDER = "cloud_tts_provider_v1"
+    private const val KEY_TRANSLATION_MODE = "translation_mode_v1"
+    private const val KEY_AI_PRIVACY_CONSENT = "ai_privacy_consent_v1"
+    private const val KEY_GLOSSARY_JSON = "pronunciation_glossary_v1"
 
     private val _state = MutableStateFlow(TranslatorAppState())
     val state: StateFlow<TranslatorAppState> = _state.asStateFlow()
@@ -219,6 +260,10 @@ object TranslatorStateRepository {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val langCode = prefs.getString(KEY_TARGET_LANG, TargetLanguage.HINDI.code)
         val targetLang = TargetLanguage.fromCode(langCode)
+        val translationMode = TranslationMode.fromCode(
+            prefs.getString(KEY_TRANSLATION_MODE, TranslationMode.ON_DEVICE_MLKIT.code)
+        )
+        val aiConsent = prefs.getBoolean(KEY_AI_PRIVACY_CONSENT, false)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
         val ssmlEnabled = prefs.getBoolean(KEY_SSML_ENABLED, true)
         val cloudProvider = CloudTtsProvider.fromCode(
@@ -226,15 +271,18 @@ object TranslatorStateRepository {
         )
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
         val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
-        // Voice is ON (unmuted = false) by default
         val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
         val pitch = prefs.getFloat(KEY_PITCH, 1.0f).coerceIn(0.4f, 1.8f)
         val rate = prefs.getFloat(KEY_RATE, 1.0f).coerceIn(0.4f, 1.8f)
+        val volume = prefs.getFloat(KEY_VOLUME, 1.0f).coerceIn(0.1f, 1.0f)
         val invert = prefs.getBoolean(KEY_INVERT, true)
-        val interval = prefs.getLong(KEY_INTERVAL, 2000L).coerceIn(1000L, 5000L)
+        val interval = prefs.getLong(KEY_INTERVAL, 1200L).coerceIn(700L, 5000L)
+        val glossary = PronunciationGlossary.fromJsonString(prefs.getString(KEY_GLOSSARY_JSON, null))
         _state.update {
             it.copy(
                 targetLanguage = targetLang,
+                translationMode = translationMode,
+                aiPrivacyConsentAccepted = aiConsent,
                 useHighQualityNetworkVoice = useHqVoice,
                 ssmlEnabledOnDevice = ssmlEnabled,
                 cloudTtsProvider = cloudProvider,
@@ -243,8 +291,10 @@ object TranslatorStateRepository {
                 isVoiceMuted = voiceMuted,
                 ttsPitch = pitch,
                 ttsSpeechRate = rate,
+                ttsVolume = volume,
                 invertColorsEnabled = invert,
-                captureIntervalMs = interval
+                captureIntervalMs = interval,
+                pronunciationGlossary = glossary
             )
         }
     }
@@ -461,6 +511,63 @@ object TranslatorStateRepository {
         _state.update { it.copy(ttsSpeechRate = clamped) }
     }
 
+    fun updateTtsVolume(context: Context, volume: Float) {
+        val clamped = volume.coerceIn(0.1f, 1.0f)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putFloat(KEY_VOLUME, clamped)
+            .apply()
+        _state.update { it.copy(ttsVolume = clamped) }
+    }
+
+    fun updateTranslationMode(
+        context: Context,
+        mode: TranslationMode,
+        aiPrivacyConsentAccepted: Boolean = _state.value.aiPrivacyConsentAccepted
+    ) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_TRANSLATION_MODE, mode.code)
+            .putBoolean(KEY_AI_PRIVACY_CONSENT, aiPrivacyConsentAccepted)
+            .apply()
+        _state.update {
+            it.copy(
+                translationMode = mode,
+                aiPrivacyConsentAccepted = aiPrivacyConsentAccepted
+            )
+        }
+    }
+
+    fun upsertGlossaryEntry(context: Context, term: String, pronunciation: String): Boolean {
+        val sanitized = PronunciationGlossary.sanitizeEntry(term, pronunciation) ?: return false
+        val current = _state.value.pronunciationGlossary.toMutableMap()
+        val existingKey = PronunciationGlossary.normalizedKeyMatch(current, sanitized.first)
+        if (existingKey != null && existingKey != sanitized.first) {
+            current.remove(existingKey)
+        }
+        current[sanitized.first] = sanitized.second
+        saveGlossary(context, current)
+        return true
+    }
+
+    fun removeGlossaryEntry(context: Context, term: String) {
+        val updated = _state.value.pronunciationGlossary.toMutableMap()
+        updated.remove(term)
+        saveGlossary(context, updated)
+    }
+
+    fun resetGlossaryToDefaults(context: Context) {
+        saveGlossary(context, PronunciationGlossary.DEFAULT_ENTRIES.toMap())
+    }
+
+    private fun saveGlossary(context: Context, glossary: Map<String, String>) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_GLOSSARY_JSON, PronunciationGlossary.toJsonString(glossary))
+            .apply()
+        _state.update { it.copy(pronunciationGlossary = glossary) }
+    }
+
     fun updateInvertColors(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -470,7 +577,7 @@ object TranslatorStateRepository {
     }
 
     fun updateCaptureInterval(context: Context, intervalMs: Long) {
-        val clamped = intervalMs.coerceIn(1000L, 5000L)
+        val clamped = intervalMs.coerceIn(700L, 5000L)
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putLong(KEY_INTERVAL, clamped)
@@ -478,14 +585,47 @@ object TranslatorStateRepository {
         _state.update { it.copy(captureIntervalMs = clamped) }
     }
 
-    fun setServiceRunning(running: Boolean, isOverlayDemo: Boolean = false) {
+    fun setServiceRunning(
+        running: Boolean,
+        isOverlayDemo: Boolean = false,
+        hasActiveProjection: Boolean = if (!running) false else _state.value.hasActiveMediaProjection
+    ) {
         _state.update {
             it.copy(
                 isServiceRunning = running,
                 isOverlayDemoActive = isOverlayDemo,
-                isCapturingOcr = if (!running) false else it.isCapturingOcr
+                hasActiveMediaProjection = hasActiveProjection,
+                isCapturingOcr = if (!running) false else it.isCapturingOcr,
+                isProtectedScreenDetected = if (!running) false else it.isProtectedScreenDetected
             )
         }
+    }
+
+    fun updateCaptureTelemetry(
+        hasActiveProjection: Boolean = _state.value.hasActiveMediaProjection,
+        isProtectedScreen: Boolean = _state.value.isProtectedScreenDetected,
+        statusMessage: String = _state.value.captureStatusMessage
+    ) {
+        _state.update {
+            it.copy(
+                hasActiveMediaProjection = hasActiveProjection,
+                isProtectedScreenDetected = isProtectedScreen,
+                captureStatusMessage = statusMessage
+            )
+        }
+    }
+
+    fun updateQueueTelemetry(queuedCount: Int, skippedRapidIncrement: Int = 0) {
+        _state.update {
+            it.copy(
+                queuedSubtitlesCount = queuedCount.coerceAtLeast(0),
+                skippedRapidCount = it.skippedRapidCount + skippedRapidIncrement.coerceAtLeast(0)
+            )
+        }
+    }
+
+    fun setMlKitModelStatusText(text: String) {
+        _state.update { it.copy(mlKitModelStatusText = text) }
     }
 
     fun setAccessibilityConnected(connected: Boolean) {

@@ -26,7 +26,8 @@ data class OcrExtractionResult(
     val recognizedBlocks: List<DetectedOverlayBlock>,
     val croppedOriginalBitmap: Bitmap,
     val processedBitmap: Bitmap,
-    val usedColorInversion: Boolean
+    val usedColorInversion: Boolean,
+    val skippedUnchangedFrame: Boolean = false
 )
 
 data class DetectedOverlayBlock(
@@ -46,8 +47,17 @@ class ImageProcessor(
     private val recognizer: TextRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 ) {
 
+    @Volatile
+    private var previousRegionLumaSample: IntArray? = null
+
+    fun resetFrameDiffCache() {
+        previousRegionLumaSample = null
+    }
+
     companion object {
         private const val TAG = "ImageProcessor"
+        private const val SAMPLE_GRID_W = 16
+        private const val SAMPLE_GRID_H = 8
 
         private val COLOR_INVERSION_MATRIX = floatArrayOf(
             -1f,  0f,  0f, 0f, 255f,
@@ -62,6 +72,35 @@ class ImageProcessor(
             0f,    0f,    1.25f, 0f, -20f,
             0f,    0f,    0f,    1f,   0f
         )
+
+        /**
+         * Samples an 8x8 luminance grid across the bitmap and returns true if nearly all
+         * pixels are solid black (typical of Android MediaProjection blocking FLAG_SECURE windows).
+         */
+        fun isLikelyProtectedOrBlackFrame(bitmap: Bitmap): Boolean {
+            if (bitmap.isRecycled || bitmap.width < 8 || bitmap.height < 8) return false
+            val stepX = (bitmap.width / 8).coerceAtLeast(1)
+            val stepY = (bitmap.height / 8).coerceAtLeast(1)
+            var maxLuma = 0
+            var varianceAccumulator = 0
+            var prevLuma = -1
+            var y = stepY / 2
+            while (y < bitmap.height) {
+                var x = stepX / 2
+                while (x < bitmap.width) {
+                    val px = bitmap.getPixel(x, y)
+                    val luma = ((Color.red(px) * 77 + Color.green(px) * 150 + Color.blue(px) * 29) shr 8)
+                    if (luma > maxLuma) maxLuma = luma
+                    if (prevLuma >= 0) {
+                        varianceAccumulator += kotlin.math.abs(luma - prevLuma)
+                    }
+                    prevLuma = luma
+                    x += stepX
+                }
+                y += stepY
+            }
+            return maxLuma <= 4 && varianceAccumulator <= 8
+        }
     }
 
     /**
@@ -202,13 +241,29 @@ class ImageProcessor(
         excludeOverlayRect: Rect? = null,
         targetRegionScreenRect: Rect? = null,
         rawScreenWidth: Int = 0,
-        rawScreenHeight: Int = 0
+        rawScreenHeight: Int = 0,
+        skipIfRegionUnchanged: Boolean = true
     ): OcrExtractionResult = withContext(Dispatchers.Default) {
         val regionBitmap = if (targetRegionScreenRect != null && !targetRegionScreenRect.isEmpty && rawScreenWidth > 0 && rawScreenHeight > 0) {
             cropToTargetRegion(source, targetRegionScreenRect, rawScreenWidth, rawScreenHeight)
         } else {
             ensureSoftwareArgbBitmap(source)
         }
+
+        // Battery & CPU optimization: check a lightweight 16x8 luminance sample grid before running
+        // ColorMatrix preprocessing and ML Kit OCR so identical static subtitle frames are skipped cleanly.
+        val currentSample = sampleLuminanceGrid(regionBitmap)
+        if (skipIfRegionUnchanged && !hasSignificantRegionChange(currentSample)) {
+            return@withContext OcrExtractionResult(
+                extractedText = "",
+                recognizedBlocks = emptyList(),
+                croppedOriginalBitmap = regionBitmap,
+                processedBitmap = regionBitmap,
+                usedColorInversion = enableColorInversion,
+                skippedUnchangedFrame = true
+            )
+        }
+        previousRegionLumaSample = currentSample
 
         // Only apply excludeOverlayRect if we didn't already crop to the target bounding box
         val maskRect = if (targetRegionScreenRect == null) excludeOverlayRect else null
@@ -314,16 +369,49 @@ class ImageProcessor(
         isCroppedBox: Boolean
     ): String {
         if (blocks.isEmpty()) return ""
-        // When cropped to the user's draggable bounding box, include ALL text inside the box!
         val targetBlocks = if (isCroppedBox) {
             blocks
         } else {
             val subtitleBlocks = blocks.filter { it.isSubtitleRegion }
             subtitleBlocks.ifEmpty { blocks }
         }
-        return targetBlocks
+        val rawCombined = targetBlocks
             .joinToString("\n") { it.text }
             .trim()
+        return SubtitleTextFilter.filterDialogueText(rawCombined)
+    }
+
+    private fun sampleLuminanceGrid(bitmap: Bitmap): IntArray {
+        val sample = IntArray(SAMPLE_GRID_W * SAMPLE_GRID_H)
+        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return sample
+        val stepX = (bitmap.width.toFloat() / SAMPLE_GRID_W).coerceAtLeast(1f)
+        val stepY = (bitmap.height.toFloat() / SAMPLE_GRID_H).coerceAtLeast(1f)
+        var idx = 0
+        for (gy in 0 until SAMPLE_GRID_H) {
+            val py = ((gy + 0.5f) * stepY).toInt().coerceIn(0, bitmap.height - 1)
+            for (gx in 0 until SAMPLE_GRID_W) {
+                val px = ((gx + 0.5f) * stepX).toInt().coerceIn(0, bitmap.width - 1)
+                val color = bitmap.getPixel(px, py)
+                sample[idx++] = ((Color.red(color) * 77 + Color.green(color) * 150 + Color.blue(color) * 29) shr 8)
+            }
+        }
+        return sample
+    }
+
+    private fun hasSignificantRegionChange(currentSample: IntArray): Boolean {
+        val prev = previousRegionLumaSample ?: return true
+        if (prev.size != currentSample.size) return true
+        var changedCells = 0
+        var totalDiff = 0
+        for (i in currentSample.indices) {
+            val diff = kotlin.math.abs(currentSample[i] - prev[i])
+            totalDiff += diff
+            if (diff >= 14) {
+                changedCells++
+            }
+        }
+        val avgDiff = totalDiff.toFloat() / currentSample.size.toFloat()
+        return changedCells >= 3 || avgDiff >= 5.5f
     }
 
     private fun ensureSoftwareArgbBitmap(source: Bitmap): Bitmap {

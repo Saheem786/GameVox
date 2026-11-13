@@ -1,9 +1,12 @@
 package com.example
 
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
@@ -32,16 +35,23 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Female
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Male
+import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -56,6 +66,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -82,9 +93,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
+import com.example.data.TranslationMode
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfileRepository
 import com.example.engine.OcrTranslationPipeline
+import com.example.firebase.configureAppCheck
 import com.example.service.ForegroundTtsManager
 import com.example.service.GameVoxAccessibilityService
 import com.example.service.ScreenTranslatorService
@@ -105,13 +118,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Must run immediately before enableEdgeToEdge(), ViewModels, or setContent
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
+
         TranslatorStateRepository.loadPreferences(applicationContext)
         lifecycleScope.launch {
             TranslatorStateRepository.loadCloudTtsFromDataStore(applicationContext)
         }
         VoiceProfileRepository.initialize(applicationContext)
         localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
+        localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
 
         setContent {
             MyApplicationTheme {
@@ -144,6 +161,7 @@ fun GameVoxApp(
 
     var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
     var voiceManagerOrigin by remember { mutableStateOf(AppScreen.HOME) }
+    var showAiConsentDialog by remember { mutableStateOf(false) }
 
     var hasOverlayPermission by remember {
         mutableStateOf(Settings.canDrawOverlays(context))
@@ -169,6 +187,37 @@ fun GameVoxApp(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         hasOverlayPermission = Settings.canDrawOverlays(context)
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { }
+
+    val mediaProjectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+            val serviceIntent = Intent(context, ScreenTranslatorService::class.java).apply {
+                action = ScreenTranslatorService.ACTION_START_WITH_PROJECTION
+                putExtra(ScreenTranslatorService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(ScreenTranslatorService.EXTRA_RESULT_DATA, result.data)
+            }
+            ContextCompat.startForegroundService(context, serviceIntent)
+            coroutineScope.launch {
+                snackbarHostState.showSnackbar("Live subtitle dubbing started")
+            }
+        } else {
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = false,
+                statusMessage = "Screen capture permission is required to read game subtitles"
+            )
+            coroutineScope.launch {
+                snackbarHostState.showSnackbar("Screen capture permission is required to read game subtitles.")
+            }
+        }
     }
 
     val accessibilitySettingsLauncher = rememberLauncherForActivityResult(
@@ -279,7 +328,15 @@ fun GameVoxApp(
                 onTargetLanguageChange = { newLang ->
                     TranslatorStateRepository.updateTargetLanguage(context, newLang)
                     localPipeline.resetAntiRepeatMemory()
+                    localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
                     localPipeline.refreshTtsConfiguration()
+                },
+                onTranslationModeChange = { mode, aiConsent ->
+                    TranslatorStateRepository.updateTranslationMode(context, mode, aiConsent)
+                    localPipeline.resetAntiRepeatMemory()
+                },
+                onDownloadOfflinePack = {
+                    localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
                 },
                 onHighQualityVoiceChange = { enabled ->
                     TranslatorStateRepository.updateUseHighQualityNetworkVoice(context, enabled)
@@ -304,6 +361,9 @@ fun GameVoxApp(
                     TranslatorStateRepository.updateTtsSpeechRate(context, newRate)
                     localPipeline.refreshTtsConfiguration()
                 },
+                onVolumeChange = { newVolume ->
+                    TranslatorStateRepository.updateTtsVolume(context, newVolume)
+                },
                 onShowTargetBoxChange = { showBox ->
                     TranslatorStateRepository.updateShowTargetBoxOverlay(context, showBox)
                     if (state.isServiceRunning) {
@@ -312,6 +372,24 @@ fun GameVoxApp(
                         }
                         context.startService(intent)
                     }
+                },
+                onShowSubtitleCaptionsChange = { showCaptions ->
+                    TranslatorStateRepository.setSubtitleVisible(context, showCaptions)
+                    if (state.isServiceRunning) {
+                        val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                            action = ScreenTranslatorService.ACTION_TOGGLE_SCANNING
+                        }
+                        context.startService(intent)
+                    }
+                },
+                onAddGlossaryEntry = { term, spoken ->
+                    TranslatorStateRepository.upsertGlossaryEntry(context, term, spoken)
+                },
+                onRemoveGlossaryEntry = { term ->
+                    TranslatorStateRepository.removeGlossaryEntry(context, term)
+                },
+                onResetGlossaryDefaults = {
+                    TranslatorStateRepository.resetGlossaryToDefaults(context)
                 },
                 onTestHindiTts = {
                     localPipeline.refreshTtsConfiguration()
@@ -331,6 +409,48 @@ fun GameVoxApp(
         }
 
         AppScreen.HOME -> Unit
+    }
+
+    if (showAiConsentDialog) {
+        AlertDialog(
+            onDismissRequest = { showAiConsentDialog = false },
+            title = {
+                Text(
+                    text = "Context-Aware AI (Gemini)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    text = "Only cropped English subtitle text and up to 4 recent dialogue lines are sent to Gemini for modern Hindi dubbing. Requires internet and cloud quota. Free On-Device (ML Kit) works offline anytime.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showAiConsentDialog = false
+                        TranslatorStateRepository.updateTranslationMode(
+                            context,
+                            TranslationMode.CONTEXT_AWARE_AI,
+                            aiPrivacyConsentAccepted = true
+                        )
+                    },
+                    modifier = Modifier.testTag("home_confirm_ai_consent")
+                ) {
+                    Text("Allow AI Mode")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showAiConsentDialog = false },
+                    modifier = Modifier.testTag("home_cancel_ai_consent")
+                ) {
+                    Text("Stay Offline")
+                }
+            }
+        )
     }
 
     val isRunning = state.isServiceRunning
@@ -389,7 +509,8 @@ fun GameVoxApp(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(horizontal = 24.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 16.dp),
             contentAlignment = Alignment.Center
         ) {
             Column(
@@ -401,10 +522,10 @@ fun GameVoxApp(
             ) {
                 // Status Pill
                 Surface(
-                    color = if (isRunning) {
-                        MaterialTheme.colorScheme.secondaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.surfaceVariant
+                    color = when {
+                        state.isProtectedScreenDetected -> MaterialTheme.colorScheme.errorContainer
+                        isRunning -> MaterialTheme.colorScheme.secondaryContainer
+                        else -> MaterialTheme.colorScheme.surfaceVariant
                     },
                     shape = RoundedCornerShape(50),
                     modifier = Modifier.testTag("overlay_status_badge")
@@ -419,29 +540,64 @@ fun GameVoxApp(
                                 .size(8.dp)
                                 .clip(CircleShape)
                                 .background(
-                                    if (isRunning) {
-                                        MaterialTheme.colorScheme.secondary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    when {
+                                        state.isProtectedScreenDetected -> MaterialTheme.colorScheme.error
+                                        isRunning && state.isCapturingOcr -> MaterialTheme.colorScheme.secondary
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
                                     }
                                 )
                         )
                         Text(
-                            text = if (isRunning) "Floating Overlay Active" else "Ready to Start",
+                            text = when {
+                                state.isProtectedScreenDetected -> "Protected Screen (FLAG_SECURE)"
+                                isRunning && state.isCapturingOcr -> "Live Subtitle Dubbing Active"
+                                isRunning -> "Floating Controls Paused"
+                                else -> "Ready to Dub Game Subtitles"
+                            },
                             style = MaterialTheme.typography.labelMedium,
-                            color = if (isRunning) {
-                                MaterialTheme.colorScheme.onSecondaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
+                            color = when {
+                                state.isProtectedScreenDetected -> MaterialTheme.colorScheme.onErrorContainer
+                                isRunning -> MaterialTheme.colorScheme.onSecondaryContainer
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                             fontWeight = FontWeight.Medium
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(28.dp))
+                if (state.isProtectedScreenDetected) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("protected_screen_warning_card")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.WarningAmber,
+                                contentDescription = "Protected screen warning",
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Text(
+                                text = state.captureStatusMessage,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                    }
+                }
 
-                // Large Center Start / Stop (Play / Pause) Button
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Large Center Start / Stop Button (requests fresh MediaProjection consent)
                 Box(
                     modifier = Modifier
                         .size(184.dp)
@@ -465,12 +621,14 @@ fun GameVoxApp(
                                     overlaySettingsLauncher.launch(intent)
                                     return@Surface
                                 }
-                                val startIntent = Intent(context, ScreenTranslatorService::class.java).apply {
-                                    action = ScreenTranslatorService.ACTION_START_DEMO_OVERLAY
-                                }
-                                ContextCompat.startForegroundService(context, startIntent)
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Floating icon started")
+                                val projectionManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                                    as? MediaProjectionManager
+                                if (projectionManager != null) {
+                                    mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                                } else {
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar("Screen capture not supported on this device")
+                                    }
                                 }
                             }
                         },
@@ -493,7 +651,7 @@ fun GameVoxApp(
                         ) {
                             Icon(
                                 imageVector = if (isRunning) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                contentDescription = if (isRunning) "Stop Floating Overlay" else "Start Floating Overlay",
+                                contentDescription = if (isRunning) "Stop Dubbing Service" else "Start Live Subtitle Dubbing",
                                 modifier = Modifier.size(52.dp)
                             )
                             Spacer(modifier = Modifier.height(4.dp))
@@ -506,7 +664,112 @@ fun GameVoxApp(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(36.dp))
+                Spacer(modifier = Modifier.height(28.dp))
+
+                // Quick Translation Mode Card (tapping toggles or opens consent)
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(18.dp))
+                        .clickable {
+                            if (state.translationMode == TranslationMode.ON_DEVICE_MLKIT) {
+                                if (state.aiPrivacyConsentAccepted) {
+                                    TranslatorStateRepository.updateTranslationMode(
+                                        context,
+                                        TranslationMode.CONTEXT_AWARE_AI,
+                                        aiPrivacyConsentAccepted = true
+                                    )
+                                } else {
+                                    showAiConsentDialog = true
+                                }
+                            } else {
+                                TranslatorStateRepository.updateTranslationMode(
+                                    context,
+                                    TranslationMode.ON_DEVICE_MLKIT,
+                                    state.aiPrivacyConsentAccepted
+                                )
+                            }
+                        }
+                        .testTag("home_translation_mode_card")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.secondaryContainer),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = if (state.translationMode == TranslationMode.CONTEXT_AWARE_AI) {
+                                        Icons.Default.AutoAwesome
+                                    } else {
+                                        Icons.Default.OfflinePin
+                                    },
+                                    contentDescription = state.translationMode.displayName,
+                                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(12.dp))
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = state.translationMode.displayName,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = if (state.translationMode == TranslationMode.ON_DEVICE_MLKIT) {
+                                        state.mlKitModelStatusText
+                                    } else {
+                                        "Online • 4-line scene context active"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Text(
+                                text = "Switch",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
 
                 // Compact Active Voice Status Card (tapping opens Voice Manager)
                 Card(
@@ -568,7 +831,7 @@ fun GameVoxApp(
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    text = "${state.cloudTtsProvider.displayLabel} • ${state.targetLanguage.displayName}",
+                                    text = "${state.targetLanguage.displayName} • Speed ${String.format(java.util.Locale.US, "%.1fx", state.ttsSpeechRate)} • Vol ${(state.ttsVolume * 100).toInt()}%",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,

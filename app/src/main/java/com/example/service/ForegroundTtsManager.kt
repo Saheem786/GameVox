@@ -162,6 +162,12 @@ class ForegroundTtsManager private constructor(context: Context) {
     private var activeUtteranceId: String? = null
 
     /**
+     * Callback invoked immediately when an utterance completes (`onDone`), used to drain the
+     * short subtitle dubbing queue seamlessly.
+     */
+    var onUtteranceCompletedImmediately: ((completedUtteranceId: String) -> Unit)? = null
+
+    /**
      * Callback invoked 30 seconds (`delay(30000)`) after [UtteranceProgressListener.onDone]
      * finishes speaking a full sentence/paragraph, allowing the same on-screen text to be spoken again.
      */
@@ -422,6 +428,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                 if (_visualizerState.value.utteranceId == utteranceId) {
                     stopVisualizerSync()
                 }
+                onUtteranceCompletedImmediately?.invoke(utteranceId)
                 // 30-Second Wait Logic: Start Kotlin Coroutine delay(30000) ONLY after TTS finishes speaking full text
                 thirtySecondRepeatDelayJob?.cancel()
                 thirtySecondRepeatDelayJob = managerScope.launch {
@@ -990,7 +997,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             sourceEnglishText = sourceEnglishText,
             gender = targetGender,
             profilePitchOverride = if (voiceProfile?.isCustomCloned == true) voiceProfile.pitch else null,
-            profileRateOverride = if (voiceProfile?.isCustomCloned == true) voiceProfile.speechRate else null
+            profileRateOverride = if (voiceProfile?.isCustomCloned == true) voiceProfile.speechRate else null,
+            masterVolume = state.ttsVolume
         )
 
         TranslatorStateRepository.updateEmotionTelemetry(
@@ -1063,6 +1071,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                         if (_visualizerState.value.utteranceId == cloudUtteranceId) {
                             stopVisualizerSync()
                         }
+                        onUtteranceCompletedImmediately?.invoke(cloudUtteranceId)
                         thirtySecondRepeatDelayJob?.cancel()
                         thirtySecondRepeatDelayJob = managerScope.launch {
                             delay(30000L)
@@ -1202,7 +1211,8 @@ class ForegroundTtsManager private constructor(context: Context) {
                 sourceEnglishText = sourceEnglishText,
                 gender = targetGender,
                 profilePitchOverride = if (effectiveProfile?.isCustomCloned == true) effectiveProfile.pitch else null,
-                profileRateOverride = if (effectiveProfile?.isCustomCloned == true) effectiveProfile.speechRate else null
+                profileRateOverride = if (effectiveProfile?.isCustomCloned == true) effectiveProfile.speechRate else null,
+                masterVolume = state.ttsVolume
             )
 
             TranslatorStateRepository.updateEmotionTelemetry(
@@ -1308,7 +1318,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         val state = TranslatorStateRepository.state.value
         val activePitch = emotionResult?.effectivePitch ?: voiceProfile?.pitch ?: state.ttsPitch
         val activeRate = emotionResult?.effectiveSpeechRate ?: voiceProfile?.speechRate ?: state.ttsSpeechRate
-        val activeVolume = emotionResult?.effectiveVolume ?: 1.0f
+        val activeVolume = emotionResult?.effectiveVolume ?: state.ttsVolume
         val voiceName = overrideVoiceName ?: voiceProfile?.name ?: state.activeVoiceName
         val roleLabel = voiceProfile?.assignedRole?.displayLabel?.substringBefore(" (")
             ?: VoiceProfileRepository.lastDetectedSpeaker.value

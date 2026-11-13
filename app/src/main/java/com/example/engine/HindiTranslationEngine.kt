@@ -4,30 +4,55 @@ import android.util.Log
 import android.util.LruCache
 import com.example.data.ModelDownloadStatus
 import com.example.data.TargetLanguage
+import com.example.data.TranslationMode
 import com.example.data.TranslatorStateRepository
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
+import com.google.mlkit.nl.translate.TranslatorOptions
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.tasks.await
 import org.json.JSONArray
 
 /**
- * Real-time English-to-Modern Casual Hindi (Bolchal ki Hindi / Hinglish) translator combining:
- * 1. Google Translate Neural API (`translate.googleapis.com/translate_a/single`) followed by
- *    [convertFormalHindiToModernCasual] so stiff/formal Sanskritized Hindi (like "मेरे पिता का अंतिम संस्कार")
- *    is automatically transformed into natural, daily-use modern Hindi (like "मेरे पापा का फ्यूनरल").
- * 2. Fast in-memory LRU cache (`translationCache`) so repeated subtitles translate in 0ms.
- * 3. Instant offline conversational Hindi phrasebook & lexicon fallback when offline.
+ * Dual-mode English-to-Modern Casual Hindi translator combining:
+ * 1. **Free On-Device Mode (`TranslationMode.ON_DEVICE_MLKIT`)**: Uses Google ML Kit On-Device
+ *    Translation (`TranslateLanguage.ENGLISH -> targetLanguage`, ~30 MB one-time offline pack)
+ *    with [convertFormalHindiToModernCasual] so textbook Hindi becomes natural everyday spoken Hindi.
+ * 2. **Optional Context-Aware AI Mode (`TranslationMode.CONTEXT_AWARE_AI`)**: Uses Firebase AI Logic
+ *    (`gemini-3.8-flash`) with a rolling window of the last 4 dialogue lines to preserve sarcasm,
+ *    action/fear/comedy/dramatic tone, idioms, and character names.
+ * 3. Fast in-memory LRU cache (`translationCache`) & natural conversational Hindi phrase rules.
  */
 object HindiTranslationEngine {
 
     private const val TAG = "HindiTranslationEngine"
-    private val translationCache = LruCache<String, String>(250)
+    private val translationCache = LruCache<String, String>(300)
+    private val mlKitTranslators = ConcurrentHashMap<String, Translator>()
+    private val downloadedLanguagePacks = ConcurrentHashMap<String, Boolean>()
+    private val recentDialogueContext = ArrayDeque<Pair<String, String>>(6)
 
     private val MULTI_LANG_DIALOGUE_MAP: Map<TargetLanguage, Map<String, String>> = mapOf(
         TargetLanguage.HINDI to mapOf(
+            "are you kidding me?" to "मज़ाक कर रहे हो क्या?",
+            "let's get moving!" to "चलो, जल्दी निकलते हैं!",
+            "lets get moving!" to "चलो, जल्दी निकलते हैं!",
+            "i won't let you down." to "भरोसा रखो, तुम्हें निराश नहीं करूँगा।",
+            "i won't let you down!" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा!",
+            "don't mess with me!" to "मुझसे पंगा मत लो!",
+            "what the hell is going on?" to "ये सब क्या चल रहा है यार?",
+            "get out of here!" to "यहाँ से निकलो जल्दी!",
+            "watch your back!" to "पीछे ध्यान रखना!",
+            "stay right behind me." to "बिल्कुल मेरे पीछे रहना।",
             "wait for me! where are you going so fast?" to "अरे मेरा वेट करो! इतनी जल्दी कहाँ जा रहे हो?",
             "i was at my father's funeral. let's head back home." to "मैं अपने पापा के फ्यूनरल पे था। चलो वापस घर चलते हैं।",
             "my father's funeral" to "मेरे पापा का फ्यूनरल",
@@ -223,6 +248,13 @@ object HindiTranslationEngine {
     // Post-processor rules converting stiff/formal Sanskritized Hindi (from Google Translate)
     // into casual, daily-use conversational Hindi (Bolchal ki Hindi / Hinglish).
     private val FORMAL_TO_CASUAL_HINDI_RULES = listOf(
+        "क्या आप मेरे साथ मज़ाक कर रहे हैं" to "मज़ाक कर रहे हो क्या",
+        "क्या तुम मेरे साथ मज़ाक कर रहे हो" to "मज़ाक कर रहे हो क्या",
+        "क्या आप मज़ाक कर रहे हैं" to "मज़ाक कर रहे हो क्या",
+        "मैं तुम्हें निराश नहीं होने दूंगा" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा",
+        "मैं आपको निराश नहीं करूँगा" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा",
+        "आइए चलते हैं" to "चलो, जल्दी निकलते हैं",
+        "आइए आगे बढ़ें" to "चलो, आगे बढ़ते हैं",
         "मेरे पिता के अंतिम संस्कार" to "मेरे पापा के फ्यूनरल",
         "मेरे पिता का अंतिम संस्कार" to "मेरे पापा का फ्यूनरल",
         "पिता के अंतिम संस्कार" to "पापा के फ्यूनरल",
@@ -350,9 +382,214 @@ object HindiTranslationEngine {
         RegexOption.IGNORE_CASE
     )
 
+    private fun resolveMlKitTargetCode(targetLanguage: TargetLanguage): String? {
+        return TranslateLanguage.fromLanguageTag(targetLanguage.code)
+    }
+
+    private fun getOrCreateMlKitTranslator(mlKitTargetCode: String): Translator {
+        return mlKitTranslators.getOrPut(mlKitTargetCode) {
+            val options = TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.ENGLISH)
+                .setTargetLanguage(mlKitTargetCode)
+                .build()
+            Translation.getClient(options)
+        }
+    }
+
     /**
-     * Translates [englishText] into [targetLanguage] (Hindi by default), converting any formal
-     * Sanskritized Hindi into natural, daily-use modern Hindi (casual Bolchal / Hinglish).
+     * Checks whether the free on-device ML Kit translation pack (~30 MB) for [targetLanguage]
+     * is downloaded and triggers background download if requested.
+     */
+    suspend fun ensureOfflineModelDownloaded(
+        targetLanguage: TargetLanguage = TargetLanguage.HINDI,
+        downloadIfMissing: Boolean = true
+    ): Boolean {
+        val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return false
+        return try {
+            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.CHECKING)
+            val model = TranslateRemoteModel.Builder(mlKitCode).build()
+            val alreadyDownloaded = RemoteModelManager.getInstance()
+                .isModelDownloaded(model)
+                .await()
+
+            if (alreadyDownloaded) {
+                downloadedLanguagePacks[mlKitCode] = true
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                TranslatorStateRepository.setMlKitModelStatusText(
+                    "Offline ${targetLanguage.displayName} pack ready ($0 offline)"
+                )
+                return true
+            }
+
+            if (!downloadIfMissing) {
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
+                TranslatorStateRepository.setMlKitModelStatusText(
+                    "Offline ${targetLanguage.displayName} pack not downloaded yet (~30 MB)"
+                )
+                return false
+            }
+
+            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.DOWNLOADING)
+            TranslatorStateRepository.setMlKitModelStatusText(
+                "Downloading offline ${targetLanguage.displayName} pack (~30 MB)..."
+            )
+            val translator = getOrCreateMlKitTranslator(mlKitCode)
+            val conditions = DownloadConditions.Builder().build()
+            translator.downloadModelIfNeeded(conditions).await()
+            downloadedLanguagePacks[mlKitCode] = true
+            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+            TranslatorStateRepository.setMlKitModelStatusText(
+                "Offline ${targetLanguage.displayName} pack downloaded & ready"
+            )
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "ML Kit offline model check/download failed for ${targetLanguage.displayName}", e)
+            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
+            TranslatorStateRepository.setMlKitModelStatusText(
+                "Offline ${targetLanguage.displayName} pack unavailable: ${e.localizedMessage ?: "network needed once"}"
+            )
+            false
+        }
+    }
+
+    /**
+     * Primary suspend translation entrypoint supporting:
+     * 1. **Context-Aware AI (`TranslationMode.CONTEXT_AWARE_AI`)** via Firebase AI Logic with rolling scene context.
+     * 2. **Free On-Device (`TranslationMode.ON_DEVICE_MLKIT`)** via Google ML Kit Translate + conversational Hindi normalizer.
+     */
+    suspend fun translateSuspend(
+        englishText: String,
+        targetLanguage: TargetLanguage = TargetLanguage.HINDI,
+        mode: TranslationMode = TranslatorStateRepository.state.value.translationMode,
+        speakerName: String? = null
+    ): String {
+        val withoutSpeaker = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
+        val clean = STAGE_DIRECTION_PREFIX_REGEX.replace(withoutSpeaker, "").replace(Regex("\\s+"), " ").trim()
+        if (clean.isEmpty()) return ""
+
+        val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
+        val cacheKey = "${mode.code}:${targetLanguage.code}:v5:$normalized"
+
+        translationCache.get(cacheKey)?.let { cached ->
+            recordContextLine(clean, cached)
+            return cached
+        }
+
+        // Fast-path preset conversational matches (0ms latency)
+        val langDialogues = MULTI_LANG_DIALOGUE_MAP[targetLanguage]
+        if (langDialogues != null) {
+            langDialogues[normalized]?.let { preset ->
+                translationCache.put(cacheKey, preset)
+                recordContextLine(clean, preset)
+                return preset
+            }
+        }
+
+        // Mode A: Context-Aware AI Translation (Gemini via Firebase AI Logic) when enabled & consented
+        val hasAiConsent = TranslatorStateRepository.state.value.aiPrivacyConsentAccepted
+        if (mode == TranslationMode.CONTEXT_AWARE_AI && hasAiConsent) {
+            val snapshotContext = synchronized(recentDialogueContext) { recentDialogueContext.toList() }
+            when (
+                val aiResult = ContextAwareAiTranslator.translateWithContext(
+                    englishDialogue = clean,
+                    targetLanguage = targetLanguage,
+                    speakerName = speakerName,
+                    recentLines = snapshotContext
+                )
+            ) {
+                is ContextAiTranslationResult.Success -> {
+                    val polished = if (targetLanguage == TargetLanguage.HINDI) {
+                        convertFormalHindiToModernCasual(aiResult.translatedText, normalized)
+                    } else {
+                        aiResult.translatedText.trim()
+                    }
+                    translationCache.put(cacheKey, polished)
+                    recordContextLine(clean, polished)
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                    return polished
+                }
+                is ContextAiTranslationResult.Error -> {
+                    TranslatorStateRepository.updateCaptureTelemetry(
+                        statusMessage = "AI translation fallback to On-Device: ${aiResult.message}"
+                    )
+                }
+            }
+        }
+
+        // Mode B: Free On-Device ML Kit Translation
+        val mlKitResult = translateViaOnDeviceMlKit(clean, targetLanguage)
+        if (!mlKitResult.isNullOrBlank()) {
+            val finalResult = if (targetLanguage == TargetLanguage.HINDI) {
+                convertFormalHindiToModernCasual(mlKitResult, normalized)
+            } else {
+                mlKitResult.trim()
+            }
+            translationCache.put(cacheKey, finalResult)
+            recordContextLine(clean, finalResult)
+            return finalResult
+        }
+
+        // Synchronous / Neural / Phrasebook fallback if ML Kit pack is still downloading
+        val fallback = translate(clean, targetLanguage)
+        recordContextLine(clean, fallback)
+        return fallback
+    }
+
+    private suspend fun translateViaOnDeviceMlKit(
+        text: String,
+        targetLanguage: TargetLanguage
+    ): String? {
+        val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return null
+        return try {
+            val translator = getOrCreateMlKitTranslator(mlKitCode)
+            if (downloadedLanguagePacks[mlKitCode] != true) {
+                val model = TranslateRemoteModel.Builder(mlKitCode).build()
+                val isDownloaded = RemoteModelManager.getInstance().isModelDownloaded(model).await()
+                downloadedLanguagePacks[mlKitCode] = isDownloaded
+                if (!isDownloaded) {
+                    // Kick off on-device model download without blocking real-time HUD indefinitely
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.DOWNLOADING)
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Downloading offline ${targetLanguage.displayName} pack (~30 MB)..."
+                    )
+                    translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
+                    downloadedLanguagePacks[mlKitCode] = true
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Offline ${targetLanguage.displayName} pack ready ($0 offline)"
+                    )
+                }
+            }
+            val translated = translator.translate(text).await().trim()
+            if (translated.isNotEmpty()) {
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                translated
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "ML Kit on-device translation unavailable, falling back cleanly", e)
+            null
+        }
+    }
+
+    private fun recordContextLine(english: String, translated: String) {
+        synchronized(recentDialogueContext) {
+            if (recentDialogueContext.lastOrNull()?.first == english) return
+            if (recentDialogueContext.size >= 4) {
+                recentDialogueContext.removeFirst()
+            }
+            recentDialogueContext.addLast(english to translated)
+        }
+    }
+
+    fun clearSceneContext() {
+        synchronized(recentDialogueContext) {
+            recentDialogueContext.clear()
+        }
+    }
+
+    /**
+     * Synchronous English -> [targetLanguage] translation (used for unit tests and fast non-suspend fallback).
      */
     fun translate(
         englishText: String,
@@ -382,7 +619,7 @@ object HindiTranslationEngine {
             }
         }
 
-        // 2. Call Google Translate API and normalize formal Hindi into daily-use modern casual Hindi
+        // 2. Call Google Translate neural endpoint and normalize formal Hindi into daily-use casual Hindi
         val onlineTranslated = translateViaGoogleApi(clean, targetLanguage.code)
         if (!onlineTranslated.isNullOrBlank()) {
             val rawResult = onlineTranslated.trim()

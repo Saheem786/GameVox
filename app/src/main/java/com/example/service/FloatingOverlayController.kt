@@ -31,43 +31,43 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
+import com.example.data.TranslationMode
 import com.example.data.TranslatorStateRepository
+import com.example.data.VoiceProfileRepository
 import java.util.Locale
 import kotlin.math.abs
 
 /**
- * Clean, Minimalist WindowManager Overlay Controller:
- * 1. **Floating Icon (`rootOverlayView`)**:
- *    - Uses [GestureDetector] + `OnTouchListener`.
- *    - **Double Tap (`onDoubleTap`)**: Toggles [isBoxVisible]. When `true`, adds both the
- *      Scan Box and the Hindi-Only Translation Box via `WindowManager.addView()`. When `false`,
- *      removes both via `WindowManager.removeView()`.
- *    - **Single Tap**: Does nothing.
- *    - **Long Press**: Opens the guarded Settings sheet.
- * 2. **Clean Scan Box (`targetBoxView`) with Corner Resize Handle**:
- *    - Configured with `FLAG_NOT_FOCUSABLE`, `FLAG_NOT_TOUCH_MODAL`, `FLAG_LAYOUT_IN_SCREEN`,
- *      `FLAG_LAYOUT_NO_LIMITS`, and `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` so it can be
- *      dragged anywhere on the entire screen (left, right, top, bottom) in both Portrait and
- *      Landscape games without any half-screen restriction.
- *    - Starts centered (`(screenW - width) / 2`, `(screenH - height) / 2`).
- *    - Includes a dedicated 48dp corner resize handle (`CornerResizeGripView`) in the bottom-right
- *      corner that dynamically updates `boxParams.width` and `boxParams.height` via
- *      `WindowManager.updateViewLayout()`.
- * 3. **Hindi-Only Translation Box (`translationBoxView`)**:
- *    - Displays **only** the translated Hindi text (no English text, no status messages).
+ * Compact Floating Overlay Controller for GameVox:
+ *
+ * 1. **Compact Draggable Floating Bubble (`rootOverlayView`)**:
+ *    - **Single Tap (`onSingleTapUp`)**: Starts or pauses live dubbing cleanly.
+ *      (If no active MediaProjection session exists yet, the service prompts fresh screen capture consent.)
+ *    - **Long Press (`onLongPress`)**: Opens a compact options card (subtitle region show/snap-bottom,
+ *      captions toggle, Free On-Device vs Context-Aware AI mode, default Female/Male voice, volume, speed,
+ *      language, and stop service).
+ * 2. **Draggable & Resizable Subtitle Detection Region (`targetBoxView`)**:
+ *    - Initially positioned near the **bottom of the screen** where game dialogue subtitles appear.
+ *    - Supports unrestricted full-screen drag in both Portrait and Landscape plus a 48dp corner resize grip.
+ * 3. **Clean Translated Hindi Caption Box (`translationBoxView`)**:
+ *    - Displays only the translated modern Hindi caption floating neatly above the subtitle box.
  */
 class FloatingOverlayController(
     private val context: Context,
-    private val onBoxVisibilityToggled: (Boolean) -> Unit,
+    private val onStartStopDubbingToggled: () -> Unit = {},
+    private val onBoxVisibilityToggled: (Boolean) -> Unit = {},
     private val onVoiceMuteToggled: (Boolean) -> Unit = {},
-    private val onTestHindiSpeech: () -> Unit,
-    private val onInstallHindiVoiceData: () -> Unit,
-    private val onRefreshTtsCheck: () -> Unit,
-    private val onStopServiceRequested: () -> Unit
+    private val onSnapTargetBoxBottom: () -> Unit = {},
+    private val onTestHindiSpeech: () -> Unit = {},
+    private val onInstallHindiVoiceData: () -> Unit = {},
+    private val onRefreshTtsCheck: () -> Unit = {},
+    private val onStopServiceRequested: () -> Unit = {}
 ) {
     private enum class BoxTouchMode {
         NONE,
@@ -86,7 +86,7 @@ class FloatingOverlayController(
     private var bubbleStatusDot: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
-    // 2. Clean Draggable & Resizable Scan Box with Corner Resize Handle
+    // 2. Draggable & Resizable Subtitle Detection Region
     private var targetBoxView: FrameLayout? = null
     private var targetBoxBorderDrawable: GradientDrawable? = null
     private var targetBoxResizeHandle: View? = null
@@ -94,27 +94,23 @@ class FloatingOverlayController(
     private var lastKnownScreenWidth: Int = 0
     private var lastKnownScreenHeight: Int = 0
 
-    // 3. Clean Hindi-Only Translation Box
+    // 3. Clean Hindi Translation Caption Box
     private var translationBoxView: TextView? = null
     private var translationBoxParams: WindowManager.LayoutParams? = null
     private var latestHindiOnlyText: String = ""
 
-    // Boolean state toggled via Single Tap (onSingleTapConfirmed) — controls ONLY Green Scan Box visibility
     @Volatile
     var isBoxVisible: Boolean = true
         private set
 
-    // Boolean state toggled via Double Tap (onDoubleTap) — controls ONLY Translated Captions Box (Hindi dark box) visibility
     @Volatile
     var isSubtitleVisible: Boolean = true
         private set
 
-    // Boolean state toggled via Long Press (onLongPress) — controls Voice (TTS Mute/Unmute), default false (Voice ON)
     @Volatile
     var isVoiceMuted: Boolean = false
         private set
 
-    // 4. Guarded Settings Sheet
     @Volatile
     private var bottomSheetOverlayView: FrameLayout? = null
 
@@ -124,11 +120,6 @@ class FloatingOverlayController(
     val isAttached: Boolean
         get() = rootOverlayView != null
 
-    /**
-     * Queries the live physical display width and height directly from [DisplayManager]
-     * (`Display.DEFAULT_DISPLAY`), accounting for the active rotation (`ROTATION_90` / `ROTATION_270`)
-     * so Landscape games always report the true landscape width and height.
-     */
     fun getLiveScreenSize(): Pair<Int, Int> {
         return try {
             val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
@@ -163,11 +154,6 @@ class FloatingOverlayController(
         }
     }
 
-    /**
-     * Builds the [WindowManager.LayoutParams] flags required so overlay views can be dragged
-     * freely across the entire screen (including over system bars and display cutouts) without
-     * blocking game touches outside the overlay.
-     */
     private fun createUnrestrictedOverlayFlags(): Int {
         return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -183,9 +169,6 @@ class FloatingOverlayController(
         }
     }
 
-    /**
-     * Returns the current screen bounding box of the floating circular icon.
-     */
     fun getOverlayScreenBounds(): Rect? {
         val view = rootOverlayView ?: return null
         val loc = IntArray(2)
@@ -199,13 +182,8 @@ class FloatingOverlayController(
         )
     }
 
-    /**
-     * Returns the exact screen coordinates (`Rect(left, top, right, bottom)`) of the user's
-     * Draggable & Resizable Target Scan Box so MediaProjection, Accessibility Screenshot OCR,
-     * and AccessibilityNodeInfo ONLY read text inside this box.
-     */
     fun getTargetBoxScreenBounds(): Rect? {
-        if (!isBoxVisible) return null
+        if (!isBoxVisible) return TranslatorStateRepository.state.value.targetBoxScreenRect
         val box = targetBoxView ?: return TranslatorStateRepository.state.value.targetBoxScreenRect
         val params = targetBoxParams
         val loc = IntArray(2)
@@ -222,36 +200,15 @@ class FloatingOverlayController(
         return rect
     }
 
-    /**
-     * Toggles ONLY [isVoiceMuted] (Voice ON/OFF) on Long Press of the floating icon:
-     * - Default is `false` (Voice ON).
-     * - When `true`: mutes/pauses TTS voice output immediately.
-     * - When `false`: unmutes/resumes TTS voice output.
-     */
-    fun toggleVoiceMuteOnSingleTap() {
-        setVoiceMutedState(!isVoiceMuted, notifyCallback = true)
-    }
-
     fun setVoiceMutedState(muted: Boolean, notifyCallback: Boolean = false) {
         mainHandler.post {
             isVoiceMuted = muted
             TranslatorStateRepository.setVoiceMuted(context, muted)
-            updateFloatingIconAppearance(isBoxVisible)
+            updateFloatingIconAppearance(TranslatorStateRepository.state.value.isCapturingOcr)
             if (notifyCallback) {
                 onVoiceMuteToggled(muted)
             }
         }
-    }
-
-    /**
-     * Single Tap (`onSingleTapConfirmed`):
-     * Toggles ONLY [isBoxVisible] (Green Scan Box visibility).
-     * - When `true`: shows ONLY the Green Scan Box (`showDraggableTargetBox()`) and resumes scanning.
-     * - When `false`: hides ONLY the Green Scan Box (`hideDraggableTargetBox()`) and pauses scanning.
-     * - Does NOT affect [isSubtitleVisible] (Translated Captions Box stays as-is)!
-     */
-    fun toggleScanBoxOnSingleTap() {
-        setScanBoxVisibility(!isBoxVisible, notifyCallback = true)
     }
 
     fun setScanBoxVisibility(visible: Boolean, notifyCallback: Boolean = false) {
@@ -263,22 +220,11 @@ class FloatingOverlayController(
             } else {
                 hideDraggableTargetBox()
             }
-            updateFloatingIconAppearance(visible)
+            updateFloatingIconAppearance(TranslatorStateRepository.state.value.isCapturingOcr)
             if (notifyCallback) {
                 onBoxVisibilityToggled(visible)
             }
         }
-    }
-
-    /**
-     * Double Tap (`onDoubleTap`):
-     * Toggles ONLY [isSubtitleVisible] (Translated Captions dark Hindi box on top).
-     * - When `true`: shows ONLY the Translated Captions Box (`showHindiTranslationBox()`).
-     * - When `false`: hides ONLY the Translated Captions Box (`hideHindiTranslationBox()`).
-     * - Does NOT affect [isBoxVisible] (Green Scan Box remains untouched)!
-     */
-    fun toggleSubtitleCaptionsOnDoubleTap() {
-        setSubtitleCaptionsVisibility(!isSubtitleVisible)
     }
 
     fun setSubtitleCaptionsVisibility(visible: Boolean) {
@@ -290,12 +236,8 @@ class FloatingOverlayController(
             } else {
                 hideHindiTranslationBox()
             }
-            updateFloatingIconAppearance(isBoxVisible)
+            updateFloatingIconAppearance(TranslatorStateRepository.state.value.isCapturingOcr)
         }
-    }
-
-    fun toggleBoxesVisibilityOnDoubleTap() {
-        toggleSubtitleCaptionsOnDoubleTap()
     }
 
     fun setBoxesVisibility(visible: Boolean, notifyCallback: Boolean = false) {
@@ -303,9 +245,33 @@ class FloatingOverlayController(
     }
 
     /**
-     * Called when the device changes orientation (e.g. launching a Landscape game) so the
-     * Scan Box and Hindi Translation Box re-center cleanly on the new screen dimensions.
+     * Anchors the subtitle region near the bottom of the current screen cleanly for both
+     * Portrait and Landscape game orientations.
      */
+    fun snapTargetBoxToBottom() {
+        mainHandler.post {
+            val box = targetBoxView ?: return@post
+            val params = targetBoxParams ?: return@post
+            val (liveW, liveH) = getLiveScreenSize()
+            val desiredW = (liveW * 0.86f).toInt().coerceIn(dpToPx(240), dpToPx(640))
+            val desiredH = dpToPx(130).coerceAtMost((liveH * 0.34f).toInt())
+            params.width = desiredW
+            params.height = desiredH.coerceAtLeast(dpToPx(72))
+            params.x = (liveW - params.width) / 2
+            params.y = (liveH - params.height - dpToPx(64)).coerceAtLeast(dpToPx(24))
+            try {
+                windowManager.updateViewLayout(box, params)
+                updateStoredTargetBoxRect(box, params)
+            } catch (_: Exception) {
+            }
+            repositionTranslationBoxAboveRegion(liveW, liveH, params.y)
+        }
+    }
+
+    fun centerTargetBoxOnScreen() {
+        snapTargetBoxToBottom()
+    }
+
     fun onScreenOrientationChanged() {
         mainHandler.post {
             val (liveW, liveH) = getLiveScreenSize()
@@ -316,11 +282,12 @@ class FloatingOverlayController(
             val box = targetBoxView
             val params = targetBoxParams
             if (box != null && params != null) {
-                val maxSpan = maxOf(liveW, liveH)
-                params.width = params.width.coerceIn(dpToPx(130), maxSpan)
-                params.height = params.height.coerceIn(dpToPx(70), maxSpan)
+                val desiredW = (liveW * 0.86f).toInt().coerceIn(dpToPx(240), dpToPx(640))
+                val desiredH = params.height.coerceIn(dpToPx(72), (liveH * 0.36f).toInt().coerceAtLeast(dpToPx(96)))
+                params.width = desiredW
+                params.height = desiredH
                 params.x = (liveW - params.width) / 2
-                params.y = (liveH - params.height) / 2
+                params.y = (liveH - params.height - dpToPx(56)).coerceAtLeast(dpToPx(24))
                 try {
                     windowManager.updateViewLayout(box, params)
                     updateStoredTargetBoxRect(box, params)
@@ -328,57 +295,38 @@ class FloatingOverlayController(
                 }
             }
 
-            val transView = translationBoxView
-            val transParams = translationBoxParams
-            if (transView != null && transParams != null) {
-                val boxY = params?.y ?: (liveH / 2)
-                transParams.x = ((liveW - transView.width.coerceAtLeast(dpToPx(200))) / 2).coerceAtLeast(dpToPx(16))
-                transParams.y = (boxY - dpToPx(64)).coerceAtLeast(dpToPx(24))
-                try {
-                    windowManager.updateViewLayout(transView, transParams)
-                } catch (_: Exception) {
-                }
-            }
+            repositionTranslationBoxAboveRegion(
+                liveW = liveW,
+                liveH = liveH,
+                boxY = params?.y ?: (liveH - dpToPx(190))
+            )
         }
     }
 
-    /**
-     * Centers the Draggable Target Scan Box in the exact middle of the current screen.
-     */
-    fun centerTargetBoxOnScreen() {
-        mainHandler.post {
-            val box = targetBoxView ?: return@post
-            val params = targetBoxParams ?: return@post
-            val (liveW, liveH) = getLiveScreenSize()
-            params.x = (liveW - params.width) / 2
-            params.y = (liveH - params.height) / 2
-            try {
-                windowManager.updateViewLayout(box, params)
-                updateStoredTargetBoxRect(box, params)
-            } catch (_: Exception) {
-            }
+    private fun repositionTranslationBoxAboveRegion(liveW: Int, liveH: Int, boxY: Int) {
+        val transView = translationBoxView ?: return
+        val transParams = translationBoxParams ?: return
+        val viewWidth = transView.width.coerceAtLeast(dpToPx(220))
+        transParams.x = ((liveW - viewWidth) / 2).coerceAtLeast(dpToPx(16))
+        transParams.y = (boxY - dpToPx(66)).coerceIn(dpToPx(24), (liveH - dpToPx(90)).coerceAtLeast(dpToPx(24)))
+        try {
+            windowManager.updateViewLayout(transView, transParams)
+        } catch (_: Exception) {
         }
     }
 
     @SuppressLint("ClickableViewAccessibility", "RtlHardcoded")
     fun showFloatingOverlay(): Boolean {
         if (!Settings.canDrawOverlays(context)) return false
-        isBoxVisible = TranslatorStateRepository.state.value.showTargetBoxOverlay
-        isSubtitleVisible = TranslatorStateRepository.state.value.isSubtitleVisible
-        isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
+        val state = TranslatorStateRepository.state.value
+        isBoxVisible = state.showTargetBoxOverlay
+        isSubtitleVisible = state.isSubtitleVisible
+        isVoiceMuted = state.isVoiceMuted
 
         if (rootOverlayView != null) {
-            if (isBoxVisible) {
-                showDraggableTargetBox()
-            } else {
-                hideDraggableTargetBox()
-            }
-            if (isSubtitleVisible) {
-                showHindiTranslationBox()
-            } else {
-                hideHindiTranslationBox()
-            }
-            updateFloatingIconAppearance(isBoxVisible)
+            if (isBoxVisible) showDraggableTargetBox() else hideDraggableTargetBox()
+            if (isSubtitleVisible) showHindiTranslationBox() else hideHindiTranslationBox()
+            updateFloatingIconAppearance(state.isCapturingOcr)
             return true
         }
 
@@ -403,17 +351,16 @@ class FloatingOverlayController(
         }
         overlayParams = params
 
-        // Modern Sleek Circular Floating Icon
-        val bubbleSize = dpToPx(46)
+        val bubbleSize = dpToPx(48)
         val bubbleFrame = FrameLayout(context).apply {
             layoutParams = FrameLayout.LayoutParams(bubbleSize, bubbleSize)
-            background = createBubbleDrawable(isActive = isBoxVisible)
+            background = createBubbleDrawable(isActive = state.isCapturingOcr)
             elevation = dpToPx(8).toFloat()
+            contentDescription = "GameVox Floating Control: Tap to start or stop dubbing, long press for options"
         }
 
-        val currentLang = TranslatorStateRepository.state.value.targetLanguage
         val glyphText = TextView(context).apply {
-            text = if (isVoiceMuted) "🔇" else currentLang.glyphBadge
+            text = resolveBubbleGlyph(state)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -432,17 +379,7 @@ class FloatingOverlayController(
                 bottomMargin = dpToPx(2)
                 marginEnd = dpToPx(2)
             }
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(
-                    when {
-                        isVoiceMuted -> Color.parseColor("#EF4444")
-                        isBoxVisible -> Color.parseColor("#10B981")
-                        else -> Color.parseColor("#60A5FA")
-                    }
-                )
-                setStroke(dpToPx(2), Color.parseColor("#1E242B"))
-            }
+            background = createStatusDotDrawable(state.isCapturingOcr, state.isProtectedScreenDetected)
         }
         bubbleFrame.addView(statusDot)
 
@@ -453,36 +390,24 @@ class FloatingOverlayController(
         var initialTouchY = 0f
         var isDragging = false
 
+        // No OnDoubleTapListener so single tap fires immediately without 300ms delay!
         val gestureDetector = GestureDetector(
             context,
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDown(e: MotionEvent): Boolean = true
 
-                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    // Single Tap: Strictly hides/shows ONLY the Green Scan Box (targetBoxView).
-                    // Does NOT hide or show the Translated Captions Box!
+                override fun onSingleTapUp(e: MotionEvent): Boolean {
                     if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        toggleScanBoxOnSingleTap()
-                    }
-                    return true
-                }
-
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    // Double Tap: Strictly hides/shows ONLY the Translated Captions Box (translationBoxView).
-                    // Does NOT affect the Green Scan Box!
-                    if (!isDragging) {
-                        bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        toggleSubtitleCaptionsOnDoubleTap()
+                        onStartStopDubbingToggled()
                     }
                     return true
                 }
 
                 override fun onLongPress(e: MotionEvent) {
-                    // Long Press: Toggles Voice ON/OFF (Mute/Unmute)
                     if (!isDragging) {
                         bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        toggleVoiceMuteOnSingleTap()
+                        showOverlaySettingsBottomSheet()
                     }
                 }
             },
@@ -531,29 +456,20 @@ class FloatingOverlayController(
             bubbleLabelView = glyphText
             bubbleStatusDot = statusDot
             true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
 
         if (added) {
-            if (isBoxVisible) {
-                showDraggableTargetBox()
-            }
-            if (isSubtitleVisible) {
-                showHindiTranslationBox()
-            }
+            if (isBoxVisible) showDraggableTargetBox()
+            if (isSubtitleVisible) showHindiTranslationBox()
         }
 
         return added
     }
 
     /**
-     * Adds the Clean Draggable & Resizable Scan Box via [WindowManager.addView]:
-     * - Sets `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_LAYOUT_IN_SCREEN | FLAG_LAYOUT_NO_LIMITS`
-     *   and `Gravity.TOP | Gravity.LEFT` so the Scan Box can be dragged anywhere on the screen
-     *   without any boundary clamping.
-     * - Includes a 48dp corner resize handle ([CornerResizeGripView]) in the bottom-right corner
-     *   that updates `boxParams.width` and `boxParams.height` via [WindowManager.updateViewLayout].
+     * Adds the Draggable & Resizable Subtitle Detection Region initially near the bottom of the screen.
      */
     @SuppressLint("ClickableViewAccessibility", "RtlHardcoded")
     fun showDraggableTargetBox() {
@@ -565,13 +481,27 @@ class FloatingOverlayController(
             lastKnownScreenWidth = screenW
             lastKnownScreenHeight = screenH
 
-            val minDimension = minOf(screenW, screenH)
-            val defaultBoxWidth = (minDimension * 0.80f).toInt().coerceIn(dpToPx(240), dpToPx(500))
-            val defaultBoxHeight = dpToPx(150)
+            val savedRect = TranslatorStateRepository.state.value.targetBoxScreenRect
+            val defaultBoxWidth = (screenW * 0.86f).toInt().coerceIn(dpToPx(240), dpToPx(640))
+            val defaultBoxHeight = dpToPx(130).coerceAtMost((screenH * 0.34f).toInt().coerceAtLeast(dpToPx(90)))
 
-            // Exact center of the screen
-            val defaultX = (screenW - defaultBoxWidth) / 2
-            val defaultY = (screenH - defaultBoxHeight) / 2
+            val useSaved = savedRect != null &&
+                savedRect.width() >= dpToPx(110) &&
+                savedRect.height() >= dpToPx(60) &&
+                savedRect.left >= 0 &&
+                savedRect.top >= 0 &&
+                savedRect.right <= screenW + dpToPx(24) &&
+                savedRect.bottom <= screenH + dpToPx(24)
+
+            val initialWidth = if (useSaved) savedRect!!.width() else defaultBoxWidth
+            val initialHeight = if (useSaved) savedRect!!.height() else defaultBoxHeight
+            val initialX = if (useSaved) savedRect!!.left else (screenW - initialWidth) / 2
+            val initialY = if (useSaved) {
+                savedRect!!.top
+            } else {
+                // Initially near the bottom of the screen where game dialogue subtitles sit
+                (screenH - initialHeight - dpToPx(64)).coerceAtLeast(dpToPx(32))
+            }
 
             val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -581,15 +511,15 @@ class FloatingOverlayController(
             }
 
             val boxParams = WindowManager.LayoutParams(
-                defaultBoxWidth,
-                defaultBoxHeight,
+                initialWidth,
+                initialHeight,
                 overlayType,
                 createUnrestrictedOverlayFlags(),
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.LEFT
-                x = defaultX
-                y = defaultY
+                x = initialX
+                y = initialY
                 applyCutoutModeIfSupported(this)
             }
             targetBoxParams = boxParams
@@ -602,12 +532,12 @@ class FloatingOverlayController(
                 background = borderDrawable
                 clipChildren = false
                 clipToPadding = false
+                contentDescription = "Subtitle detection region, drag to move or drag corner to resize"
             }
 
-            // 48dp Corner Resize Handle in the bottom-right corner of the Scan Box
             val resizeGripSize = dpToPx(48)
             val resizeHandle = CornerResizeGripView(context).apply {
-                contentDescription = "Resize Scan Box Corner Handle"
+                contentDescription = "Resize subtitle region corner handle"
                 layoutParams = FrameLayout.LayoutParams(resizeGripSize, resizeGripSize).apply {
                     gravity = Gravity.BOTTOM or Gravity.RIGHT
                 }
@@ -615,9 +545,9 @@ class FloatingOverlayController(
             targetBoxResizeHandle = resizeHandle
             boxFrame.addView(resizeHandle)
 
-            val minW = dpToPx(110)
-            val minH = dpToPx(60)
-            val cornerHitZonePx = dpToPx(58)
+            val minW = dpToPx(120)
+            val minH = dpToPx(64)
+            val cornerHitZonePx = dpToPx(56)
 
             var activeMode = BoxTouchMode.NONE
             var startParamX = 0
@@ -627,7 +557,7 @@ class FloatingOverlayController(
             var startRawX = 0f
             var startRawY = 0f
 
-            val handleResizeTouch: (MotionEvent) -> Boolean = { event ->
+            resizeHandle.setOnTouchListener { _, event ->
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         activeMode = BoxTouchMode.DRAG_RESIZE
@@ -644,7 +574,6 @@ class FloatingOverlayController(
                         val maxSpan = maxOf(liveW, liveH, 2560)
                         val dw = (event.rawX - startRawX).toInt()
                         val dh = (event.rawY - startRawY).toInt()
-
                         boxParams.width = (startParamW + dw).coerceIn(minW, maxSpan)
                         boxParams.height = (startParamH + dh).coerceIn(minH, maxSpan)
                         applyBoxLayoutUpdate(boxFrame, boxParams)
@@ -657,10 +586,6 @@ class FloatingOverlayController(
                     }
                     else -> false
                 }
-            }
-
-            resizeHandle.setOnTouchListener { _, event ->
-                handleResizeTouch(event)
             }
 
             boxFrame.setOnTouchListener { view, event ->
@@ -697,7 +622,6 @@ class FloatingOverlayController(
                             boxParams.width = (startParamW + dx).coerceIn(minW, maxSpan)
                             boxParams.height = (startParamH + dy).coerceIn(minH, maxSpan)
                         } else {
-                            // Unrestricted full-screen drag enabled by FLAG_LAYOUT_NO_LIMITS
                             boxParams.x = startParamX + dx
                             boxParams.y = startParamY + dy
                         }
@@ -724,11 +648,6 @@ class FloatingOverlayController(
         }
     }
 
-    /**
-     * Custom-drawn 48dp corner resize handle placed in the bottom-right corner of the Scan Box.
-     * Draws an L-shaped corner bracket and diagonal resize grip lines so the user can visually
-     * see and grab the corner without any text clutter.
-     */
     private inner class CornerResizeGripView(context: Context) : View(context) {
         private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
@@ -748,7 +667,6 @@ class FloatingOverlayController(
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            // Draw diagonal corner triangle badge in the bottom-right
             val triSize = minOf(w, h) * 0.72f
             cornerPath.reset()
             cornerPath.moveTo(w, h - triSize)
@@ -757,7 +675,6 @@ class FloatingOverlayController(
             cornerPath.close()
             canvas.drawPath(cornerPath, badgePaint)
 
-            // Draw two diagonal resize grip lines inside the corner badge
             val inset1 = triSize * 0.26f
             val inset2 = triSize * 0.50f
             canvas.drawLine(w - inset1, h - dpToPx(3), w - dpToPx(3), h - inset1, gripLinePaint)
@@ -765,11 +682,6 @@ class FloatingOverlayController(
         }
     }
 
-    /**
-     * Adds the Clean Hindi-Only Translation Box via [WindowManager.addView].
-     * Displays ONLY the translated Hindi text (no English text, no status messages).
-     * Can also be dragged anywhere on the screen.
-     */
     @SuppressLint("ClickableViewAccessibility", "RtlHardcoded")
     fun showHindiTranslationBox() {
         mainHandler.post {
@@ -784,8 +696,8 @@ class FloatingOverlayController(
                 WindowManager.LayoutParams.TYPE_PHONE
             }
 
-            val boxY = targetBoxParams?.y ?: (screenH / 2)
-            val initialY = (boxY - dpToPx(66)).coerceAtLeast(dpToPx(32))
+            val boxY = targetBoxParams?.y ?: (screenH - dpToPx(194))
+            val initialY = (boxY - dpToPx(66)).coerceAtLeast(dpToPx(28))
             val initialX = (screenW - dpToPx(260)) / 2
 
             val params = WindowManager.LayoutParams(
@@ -803,7 +715,7 @@ class FloatingOverlayController(
             translationBoxParams = params
 
             val hindiTv = TextView(context).apply {
-                maxWidth = (minOf(screenW, screenH) * 0.86f).toInt().coerceAtLeast(dpToPx(240))
+                maxWidth = (screenW * 0.88f).toInt().coerceAtLeast(dpToPx(240))
                 minWidth = dpToPx(120)
                 maxLines = 4
                 ellipsize = TextUtils.TruncateAt.END
@@ -815,8 +727,8 @@ class FloatingOverlayController(
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
                     cornerRadius = dpToPx(14).toFloat()
-                    setColor(Color.argb(175, 17, 24, 39))
-                    setStroke(dpToPx(1), Color.argb(45, 255, 255, 255))
+                    setColor(Color.argb(185, 17, 24, 39))
+                    setStroke(dpToPx(1), Color.argb(55, 255, 255, 255))
                 }
                 text = latestHindiOnlyText
                 visibility = if (latestHindiOnlyText.isBlank()) View.GONE else View.VISIBLE
@@ -890,7 +802,6 @@ class FloatingOverlayController(
                 targetBoxView = null
                 targetBoxResizeHandle = null
                 targetBoxBorderDrawable = null
-                TranslatorStateRepository.updateTargetBoxScreenRect(null)
             }
         }
     }
@@ -907,17 +818,20 @@ class FloatingOverlayController(
         )
     }
 
-    private fun updateFloatingIconAppearance(isActive: Boolean) {
-        val state = TranslatorStateRepository.state.value
-        val lang = state.targetLanguage
-        isVoiceMuted = state.isVoiceMuted
-        circularBubbleView?.background = createBubbleDrawable(isActive)
-        bubbleLabelView?.text = if (isVoiceMuted) "🔇" else lang.glyphBadge
-        bubbleStatusDot?.background = GradientDrawable().apply {
+    private fun resolveBubbleGlyph(state: com.example.data.TranslatorAppState): String {
+        return when {
+            state.isProtectedScreenDetected -> "!"
+            state.isVoiceMuted -> "🔇"
+            else -> state.targetLanguage.glyphBadge
+        }
+    }
+
+    private fun createStatusDotDrawable(isActive: Boolean, isProtected: Boolean): GradientDrawable {
+        return GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(
                 when {
-                    isVoiceMuted -> Color.parseColor("#EF4444")
+                    isProtected || isVoiceMuted -> Color.parseColor("#EF4444")
                     isActive -> Color.parseColor("#10B981")
                     else -> Color.parseColor("#60A5FA")
                 }
@@ -926,16 +840,34 @@ class FloatingOverlayController(
         }
     }
 
+    private fun updateFloatingIconAppearance(isActive: Boolean) {
+        val state = TranslatorStateRepository.state.value
+        isVoiceMuted = state.isVoiceMuted
+        circularBubbleView?.background = createBubbleDrawable(isActive)
+        bubbleLabelView?.text = resolveBubbleGlyph(state)
+        bubbleStatusDot?.background = createStatusDotDrawable(isActive, state.isProtectedScreenDetected)
+    }
+
     fun updateScanningState(isScanning: Boolean) {
         mainHandler.post {
-            updateFloatingIconAppearance(isScanning && isBoxVisible)
+            updateFloatingIconAppearance(isScanning)
             targetBoxView?.background = createTargetBoxDrawable(isScanning)
         }
     }
 
-    /**
-     * Updates the Translation Box with ONLY the translated Hindi text.
-     */
+    fun updateProtectedScreenBadge(protected: Boolean, message: String? = null) {
+        mainHandler.post {
+            val state = TranslatorStateRepository.state.value
+            updateFloatingIconAppearance(state.isCapturingOcr)
+            if (protected && !message.isNullOrBlank()) {
+                translationBoxView?.apply {
+                    text = message
+                    if (isSubtitleVisible) visibility = View.VISIBLE
+                }
+            }
+        }
+    }
+
     fun updateDebugReadout(englishText: String, hindiText: String, statusNote: String) {
         mainHandler.post {
             val cleanHindi = hindiText.trim()
@@ -951,7 +883,7 @@ class FloatingOverlayController(
     }
 
     /**
-     * Displays a single guarded Settings BottomSheet over the active game screen.
+     * Compact options card triggered on Long Press of the floating bubble.
      */
     fun showOverlaySettingsBottomSheet() {
         if (isDialogOpeningOrShown || bottomSheetOverlayView != null) return
@@ -989,20 +921,9 @@ class FloatingOverlayController(
                 setOnClickListener { dismissOverlaySettingsBottomSheet() }
             }
 
-            val sheetCard = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                isClickable = true
-                setPadding(dpToPx(20), dpToPx(16), dpToPx(20), dpToPx(24))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadii = floatArrayOf(
-                        dpToPx(24).toFloat(), dpToPx(24).toFloat(),
-                        dpToPx(24).toFloat(), dpToPx(24).toFloat(),
-                        0f, 0f, 0f, 0f
-                    )
-                    setColor(Color.parseColor("#121826"))
-                    setStroke(dpToPx(1), Color.parseColor("#00E5FF"))
-                }
+            val (_, liveH) = getLiveScreenSize()
+            val scrollWrapper = ScrollView(context).apply {
+                isVerticalScrollBarEnabled = true
                 layoutParams = FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT
@@ -1011,40 +932,269 @@ class FloatingOverlayController(
                 }
             }
 
+            val sheetCard = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                minimumHeight = (liveH * 0.25f).toInt()
+                setPadding(dpToPx(18), dpToPx(14), dpToPx(18), dpToPx(20))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadii = floatArrayOf(
+                        dpToPx(22).toFloat(), dpToPx(22).toFloat(),
+                        dpToPx(22).toFloat(), dpToPx(22).toFloat(),
+                        0f, 0f, 0f, 0f
+                    )
+                    setColor(Color.parseColor("#111827"))
+                    setStroke(dpToPx(1), Color.parseColor("#38BDF8"))
+                }
+            }
+
             val handleView = View(context).apply {
-                layoutParams = LinearLayout.LayoutParams(dpToPx(44), dpToPx(5)).apply {
+                layoutParams = LinearLayout.LayoutParams(dpToPx(40), dpToPx(4)).apply {
                     gravity = Gravity.CENTER_HORIZONTAL
-                    bottomMargin = dpToPx(12)
+                    bottomMargin = dpToPx(10)
                 }
                 background = GradientDrawable().apply {
-                    cornerRadius = dpToPx(3).toFloat()
-                    setColor(Color.parseColor("#4A5B78"))
+                    cornerRadius = dpToPx(2).toFloat()
+                    setColor(Color.parseColor("#475569"))
                 }
             }
             sheetCard.addView(handleView)
 
+            val currentState = TranslatorStateRepository.state.value
+
             val titleTv = TextView(context).apply {
-                text = "GameVox • Scan Box & HD Voice Settings"
-                setTextColor(Color.parseColor("#00E5FF"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                text = "GameVox • Quick Dubbing Options"
+                setTextColor(Color.parseColor("#38BDF8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             }
             sheetCard.addView(titleTv)
 
-            val currentState = TranslatorStateRepository.state.value
-
-            val langHeaderTv = TextView(context).apply {
-                text = "Target Language: ${currentState.targetLanguage.displayName} (${currentState.targetLanguage.nativeName})"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                setPadding(0, dpToPx(8), 0, dpToPx(6))
+            val statusTv = TextView(context).apply {
+                text = if (currentState.isProtectedScreenDetected) {
+                    "⚠ Protected screen (FLAG_SECURE) blocked capture"
+                } else {
+                    currentState.captureStatusMessage
+                }
+                setTextColor(
+                    if (currentState.isProtectedScreenDetected) Color.parseColor("#FCA5A5")
+                    else Color.parseColor("#94A3B8")
+                )
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, dpToPx(2), 0, dpToPx(8))
             }
-            sheetCard.addView(langHeaderTv)
+            sheetCard.addView(statusTv)
 
+            // Subtitle Region controls + Snap Bottom
+            val regionRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dpToPx(4), 0, dpToPx(4))
+            }
+            val boxSwitch = Switch(context).apply {
+                text = "Subtitle Region"
+                setTextColor(Color.WHITE)
+                isChecked = isBoxVisible
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                setOnCheckedChangeListener { _, checked ->
+                    setScanBoxVisibility(checked, notifyCallback = true)
+                }
+            }
+            val snapBottomBtn = Button(context).apply {
+                text = "Snap Bottom"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(Color.parseColor("#1E293B"))
+                    setStroke(dpToPx(1), Color.parseColor("#10B981"))
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    dpToPx(36)
+                )
+                setPadding(dpToPx(12), 0, dpToPx(12), 0)
+                setOnClickListener {
+                    if (!isBoxVisible) setScanBoxVisibility(true, notifyCallback = true)
+                    onSnapTargetBoxBottom()
+                    snapTargetBoxToBottom()
+                }
+            }
+            regionRow.addView(boxSwitch)
+            regionRow.addView(snapBottomBtn)
+            sheetCard.addView(regionRow)
+
+            // Hindi Captions Overlay switch + Mute Voice switch
+            val captionsSwitch = Switch(context).apply {
+                text = "Show Hindi Captions Overlay"
+                setTextColor(Color.WHITE)
+                isChecked = isSubtitleVisible
+                setPadding(0, dpToPx(2), 0, dpToPx(2))
+                setOnCheckedChangeListener { _, checked ->
+                    setSubtitleCaptionsVisibility(checked)
+                }
+            }
+            sheetCard.addView(captionsSwitch)
+
+            val muteSwitch = Switch(context).apply {
+                text = "Mute Voice Output"
+                setTextColor(Color.WHITE)
+                isChecked = isVoiceMuted
+                setPadding(0, dpToPx(2), 0, dpToPx(8))
+                setOnCheckedChangeListener { _, checked ->
+                    setVoiceMutedState(checked, notifyCallback = true)
+                }
+            }
+            sheetCard.addView(muteSwitch)
+
+            // Translation Mode 2-Pill Toggle
+            val modeLabel = TextView(context).apply {
+                text = "Translation Mode (${currentState.translationMode.shortBadge})"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setPadding(0, dpToPx(2), 0, dpToPx(6))
+            }
+            sheetCard.addView(modeLabel)
+
+            val modeNoteTv = TextView(context).apply {
+                text = currentState.translationMode.costAndLimitNote
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setPadding(0, dpToPx(4), 0, dpToPx(8))
+            }
+
+            val modeRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 2f
+            }
+            lateinit var offlineModeBtn: Button
+            lateinit var aiModeBtn: Button
+
+            fun refreshModeButtons(activeMode: TranslationMode) {
+                modeLabel.text = "Translation Mode (${activeMode.shortBadge})"
+                modeNoteTv.text = activeMode.costAndLimitNote
+                offlineModeBtn.setTextColor(
+                    if (activeMode == TranslationMode.ON_DEVICE_MLKIT) Color.parseColor("#0F172A") else Color.WHITE
+                )
+                offlineModeBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(
+                        if (activeMode == TranslationMode.ON_DEVICE_MLKIT) Color.parseColor("#38BDF8") else Color.parseColor("#1E293B")
+                    )
+                }
+                aiModeBtn.setTextColor(
+                    if (activeMode == TranslationMode.CONTEXT_AWARE_AI) Color.parseColor("#0F172A") else Color.WHITE
+                )
+                aiModeBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(
+                        if (activeMode == TranslationMode.CONTEXT_AWARE_AI) Color.parseColor("#38BDF8") else Color.parseColor("#1E293B")
+                    )
+                }
+            }
+
+            offlineModeBtn = Button(context).apply {
+                text = "Free Offline"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginEnd = dpToPx(6) }
+                setOnClickListener {
+                    TranslatorStateRepository.updateTranslationMode(context, TranslationMode.ON_DEVICE_MLKIT)
+                    refreshModeButtons(TranslationMode.ON_DEVICE_MLKIT)
+                }
+            }
+            aiModeBtn = Button(context).apply {
+                text = "Context AI (Gemini)"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginStart = dpToPx(6) }
+                setOnClickListener {
+                    TranslatorStateRepository.updateTranslationMode(
+                        context = context,
+                        mode = TranslationMode.CONTEXT_AWARE_AI,
+                        aiPrivacyConsentAccepted = true
+                    )
+                    refreshModeButtons(TranslationMode.CONTEXT_AWARE_AI)
+                }
+            }
+            refreshModeButtons(currentState.translationMode)
+            modeRow.addView(offlineModeBtn)
+            modeRow.addView(aiModeBtn)
+            sheetCard.addView(modeRow)
+            sheetCard.addView(modeNoteTv)
+
+            // Quick Female / Male Voice Switcher
+            val voices = VoiceProfileRepository.voices.value
+            val selectedId = VoiceProfileRepository.selectedVoiceId.value
+            val currentGender = voices.find { it.id == selectedId }?.gender ?: SpeakerGender.FEMALE_18
+
+            val voiceRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 2f
+                setPadding(0, 0, 0, dpToPx(8))
+            }
+            lateinit var femaleVoiceBtn: Button
+            lateinit var maleVoiceBtn: Button
+
+            fun refreshGenderButtons(gender: SpeakerGender) {
+                femaleVoiceBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(
+                        if (gender == SpeakerGender.FEMALE_18) Color.parseColor("#10B981") else Color.parseColor("#1E293B")
+                    )
+                }
+                femaleVoiceBtn.setTextColor(
+                    if (gender == SpeakerGender.FEMALE_18) Color.parseColor("#0F172A") else Color.WHITE
+                )
+                maleVoiceBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(
+                        if (gender == SpeakerGender.MALE_18) Color.parseColor("#10B981") else Color.parseColor("#1E293B")
+                    )
+                }
+                maleVoiceBtn.setTextColor(
+                    if (gender == SpeakerGender.MALE_18) Color.parseColor("#0F172A") else Color.WHITE
+                )
+            }
+
+            femaleVoiceBtn = Button(context).apply {
+                text = "Female Voice"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginEnd = dpToPx(6) }
+                setOnClickListener {
+                    voices.firstOrNull { it.gender == SpeakerGender.FEMALE_18 }?.let {
+                        VoiceProfileRepository.selectVoice(context, it)
+                        onRefreshTtsCheck()
+                        refreshGenderButtons(SpeakerGender.FEMALE_18)
+                    }
+                }
+            }
+            maleVoiceBtn = Button(context).apply {
+                text = "Male Voice"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginStart = dpToPx(6) }
+                setOnClickListener {
+                    voices.firstOrNull { it.gender == SpeakerGender.MALE_18 }?.let {
+                        VoiceProfileRepository.selectVoice(context, it)
+                        onRefreshTtsCheck()
+                        refreshGenderButtons(SpeakerGender.MALE_18)
+                    }
+                }
+            }
+            refreshGenderButtons(currentGender)
+            voiceRow.addView(femaleVoiceBtn)
+            voiceRow.addView(maleVoiceBtn)
+            sheetCard.addView(voiceRow)
+
+            // Target Language Chips
             val langScroll = HorizontalScrollView(context).apply {
                 isHorizontalScrollBarEnabled = false
-                setPadding(0, 0, 0, dpToPx(10))
+                setPadding(0, 0, 0, dpToPx(8))
             }
             val langRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1054,28 +1204,20 @@ class FloatingOverlayController(
                 val chipBtn = Button(context).apply {
                     text = "${lang.nativeName} • ${lang.displayName}"
                     isAllCaps = false
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                    setTextColor(
-                        if (isSelected) Color.parseColor("#090D16") else Color.WHITE
-                    )
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    setTextColor(if (isSelected) Color.parseColor("#0F172A") else Color.WHITE)
                     background = GradientDrawable().apply {
-                        cornerRadius = dpToPx(16).toFloat()
-                        setColor(
-                            if (isSelected) Color.parseColor("#00E5FF") else Color.parseColor("#1C2539")
-                        )
-                        setStroke(dpToPx(1), Color.parseColor("#00E5FF"))
+                        cornerRadius = dpToPx(14).toFloat()
+                        setColor(if (isSelected) Color.parseColor("#38BDF8") else Color.parseColor("#1E293B"))
                     }
                     layoutParams = LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.WRAP_CONTENT,
-                        dpToPx(34)
-                    ).apply {
-                        marginEnd = dpToPx(8)
-                    }
-                    setPadding(dpToPx(12), 0, dpToPx(12), 0)
+                        dpToPx(32)
+                    ).apply { marginEnd = dpToPx(6) }
+                    setPadding(dpToPx(10), 0, dpToPx(10), 0)
                     setOnClickListener {
                         TranslatorStateRepository.updateTargetLanguage(context, lang)
-                        langHeaderTv.text = "Target Language: ${lang.displayName} (${lang.nativeName})"
-                        bubbleLabelView?.text = lang.glyphBadge
+                        bubbleLabelView?.text = resolveBubbleGlyph(TranslatorStateRepository.state.value)
                         onRefreshTtsCheck()
                     }
                 }
@@ -1084,61 +1226,38 @@ class FloatingOverlayController(
             langScroll.addView(langRow)
             sheetCard.addView(langScroll)
 
-            // Toggle Draggable Target Scan Box & Translation Box (also toggled via Double Tap)
-            val boxSwitch = Switch(context).apply {
-                text = "Show Scan Box & Translation Box (Double-Tap Icon)"
+            // Volume Slider (10% - 100%)
+            val volumePct = (currentState.ttsVolume * 100).toInt().coerceIn(10, 100)
+            val volumeLabel = TextView(context).apply {
+                text = "Dubbing Volume: $volumePct%"
                 setTextColor(Color.WHITE)
-                isChecked = isBoxVisible
-                setPadding(0, dpToPx(4), 0, dpToPx(6))
-                setOnCheckedChangeListener { _, checked ->
-                    setBoxesVisibility(checked, notifyCallback = true)
-                }
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             }
-            sheetCard.addView(boxSwitch)
+            sheetCard.addView(volumeLabel)
 
-            // Toggle High-Quality Network Voice
-            val hqVoiceSwitch = Switch(context).apply {
-                text = "High-Quality Network Voice (Non-Robotic)"
-                setTextColor(Color.WHITE)
-                isChecked = currentState.useHighQualityNetworkVoice
-                setPadding(0, dpToPx(4), 0, dpToPx(8))
-                setOnCheckedChangeListener { _, checked ->
-                    TranslatorStateRepository.updateUseHighQualityNetworkVoice(context, checked)
-                    onRefreshTtsCheck()
-                }
-            }
-            sheetCard.addView(hqVoiceSwitch)
-
-            val pitchLabel = TextView(context).apply {
-                text = String.format(Locale.US, "TTS Pitch: %.2fx", currentState.ttsPitch)
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            }
-            sheetCard.addView(pitchLabel)
-
-            val pitchSeek = SeekBar(context).apply {
-                max = 140
-                progress = ((currentState.ttsPitch - 0.4f) * 100f).toInt().coerceIn(0, 140)
+            val volumeSeek = SeekBar(context).apply {
+                max = 90
+                progress = (volumePct - 10).coerceIn(0, 90)
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                        val pitch = (0.4f + progress / 100f)
-                        pitchLabel.text = String.format(Locale.US, "TTS Pitch: %.2fx", pitch)
+                        val pct = 10 + progress
+                        volumeLabel.text = "Dubbing Volume: $pct%"
                         if (fromUser) {
-                            TranslatorStateRepository.updateTtsPitch(context, pitch)
-                            onRefreshTtsCheck()
+                            TranslatorStateRepository.updateTtsVolume(context, pct / 100f)
                         }
                     }
                     override fun onStartTrackingTouch(seekBar: SeekBar?) {}
                     override fun onStopTrackingTouch(seekBar: SeekBar?) {}
                 })
             }
-            sheetCard.addView(pitchSeek)
+            sheetCard.addView(volumeSeek)
 
+            // Speech Speed Slider (0.4x - 1.8x)
             val rateLabel = TextView(context).apply {
-                text = String.format(Locale.US, "TTS Speech Rate: %.2fx", currentState.ttsSpeechRate)
+                text = String.format(Locale.US, "Speech Speed: %.2fx", currentState.ttsSpeechRate)
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-                setPadding(0, dpToPx(6), 0, 0)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(0, dpToPx(4), 0, 0)
             }
             sheetCard.addView(rateLabel)
 
@@ -1148,7 +1267,7 @@ class FloatingOverlayController(
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                         val rate = (0.4f + progress / 100f)
-                        rateLabel.text = String.format(Locale.US, "TTS Speech Rate: %.2fx", rate)
+                        rateLabel.text = String.format(Locale.US, "Speech Speed: %.2fx", rate)
                         if (fromUser) {
                             TranslatorStateRepository.updateTtsSpeechRate(context, rate)
                             onRefreshTtsCheck()
@@ -1160,96 +1279,68 @@ class FloatingOverlayController(
             }
             sheetCard.addView(rateSeek)
 
+            // Bottom Action Buttons
             val actionsRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                weightSum = 2f
-                setPadding(0, dpToPx(12), 0, 0)
+                weightSum = 3f
+                setPadding(0, dpToPx(10), 0, 0)
             }
 
             val testBtn = Button(context).apply {
-                text = "Test HD Voice"
+                text = "Test Voice"
                 isAllCaps = false
-                setTextColor(Color.parseColor("#090D16"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.parseColor("#0F172A"))
                 background = GradientDrawable().apply {
                     cornerRadius = dpToPx(10).toFloat()
-                    setColor(Color.parseColor("#00E5FF"))
+                    setColor(Color.parseColor("#38BDF8"))
                 }
-                layoutParams = LinearLayout.LayoutParams(0, dpToPx(42), 1f).apply {
-                    marginEnd = dpToPx(6)
-                }
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(40), 1f).apply { marginEnd = dpToPx(4) }
                 setOnClickListener {
                     onRefreshTtsCheck()
                     onTestHindiSpeech()
                 }
             }
 
-            val centerBoxBtn = Button(context).apply {
-                text = "Center Scan Box"
-                isAllCaps = false
-                setTextColor(Color.WHITE)
-                background = GradientDrawable().apply {
-                    cornerRadius = dpToPx(10).toFloat()
-                    setColor(Color.parseColor("#232E47"))
-                    setStroke(dpToPx(1), Color.parseColor("#FFB300"))
-                }
-                layoutParams = LinearLayout.LayoutParams(0, dpToPx(42), 1f).apply {
-                    marginStart = dpToPx(6)
-                }
-                setOnClickListener {
-                    if (!isBoxVisible) {
-                        setBoxesVisibility(true, notifyCallback = true)
-                    }
-                    centerTargetBoxOnScreen()
-                    dismissOverlaySettingsBottomSheet()
-                }
-            }
-
-            actionsRow.addView(testBtn)
-            actionsRow.addView(centerBoxBtn)
-            sheetCard.addView(actionsRow)
-
-            val bottomRow = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                weightSum = 2f
-                setPadding(0, dpToPx(10), 0, 0)
-            }
-
             val closeBtn = Button(context).apply {
-                text = "Close / Dismiss"
+                text = "Close"
                 isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.WHITE)
                 background = GradientDrawable().apply {
                     cornerRadius = dpToPx(10).toFloat()
-                    setColor(Color.parseColor("#1C2539"))
+                    setColor(Color.parseColor("#1E293B"))
                 }
-                layoutParams = LinearLayout.LayoutParams(0, dpToPx(42), 1f).apply {
-                    marginEnd = dpToPx(6)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(40), 1f).apply {
+                    marginStart = dpToPx(4)
+                    marginEnd = dpToPx(4)
                 }
                 setOnClickListener { dismissOverlaySettingsBottomSheet() }
             }
 
             val stopBtn = Button(context).apply {
-                text = "Stop Overlay"
+                text = "Stop"
                 isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.WHITE)
                 background = GradientDrawable().apply {
                     cornerRadius = dpToPx(10).toFloat()
-                    setColor(Color.parseColor("#B71C1C"))
+                    setColor(Color.parseColor("#B91C1C"))
                 }
-                layoutParams = LinearLayout.LayoutParams(0, dpToPx(42), 1f).apply {
-                    marginStart = dpToPx(6)
-                }
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(40), 1f).apply { marginStart = dpToPx(4) }
                 setOnClickListener {
                     dismissOverlaySettingsBottomSheet()
                     onStopServiceRequested()
                 }
             }
 
-            bottomRow.addView(closeBtn)
-            bottomRow.addView(stopBtn)
-            sheetCard.addView(bottomRow)
+            actionsRow.addView(testBtn)
+            actionsRow.addView(closeBtn)
+            actionsRow.addView(stopBtn)
+            sheetCard.addView(actionsRow)
 
-            scrimRoot.addView(sheetCard)
+            scrollWrapper.addView(sheetCard)
+            scrimRoot.addView(scrollWrapper)
 
             try {
                 windowManager.addView(scrimRoot, sheetParams)
@@ -1299,13 +1390,14 @@ class FloatingOverlayController(
     }
 
     private fun createBubbleDrawable(isActive: Boolean): GradientDrawable {
+        val state = TranslatorStateRepository.state.value
         return GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(Color.argb(225, 26, 31, 38))
+            setColor(Color.argb(230, 20, 26, 36))
             setStroke(
                 dpToPx(2),
                 when {
-                    isVoiceMuted -> Color.parseColor("#EF4444")
+                    state.isProtectedScreenDetected || isVoiceMuted -> Color.parseColor("#EF4444")
                     isActive -> Color.parseColor("#10B981")
                     else -> Color.parseColor("#60A5FA")
                 }

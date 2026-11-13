@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
@@ -23,12 +24,15 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
+import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
-import com.example.engine.BitmapInverter
+import com.example.engine.ImageProcessor
 import com.example.engine.OcrTranslationPipeline
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,13 +44,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Foreground Service managing:
- * 1. WindowManager Draggable Circular Icon + Draggable & Resizable Transparent Scan Box
- * 2. Continuous 2-second Game Subtitle Extraction strictly inside the Scan Box via:
- *    - Priority A: [GameVoxAccessibilityService] node text intersecting the Scan Box
- *    - Priority B: [MediaProjection] or [GameVoxAccessibilityService] screenshot cropped to the Scan Box + ML Kit OCR
- *    - Priority C: Built-in game dialogue simulator fallback
- * 3. Shared Singleton [OcrTranslationPipeline] for Google Translate API + High-Quality Network TTS
+ * Foreground Service managing real-time game screen subtitle OCR & modern Hindi dubbing:
+ * 1. Compact draggable floating control + bottom-anchored resizable subtitle detection region.
+ * 2. MediaProjection VirtualDisplay + ImageReader cropped strictly to the subtitle box -> ML Kit OCR v2
+ *    (plus Accessibility node extraction fallback if enabled for supported UI views).
+ * 3. Orientation/Landscape handling recreating VirtualDisplay & ImageReader on config changes.
+ * 4. Protected screen (FLAG_SECURE) detection & revoked projection cleanup requiring fresh consent.
  */
 class ScreenTranslatorService : Service() {
 
@@ -56,10 +59,9 @@ class ScreenTranslatorService : Service() {
         private const val CHANNEL_ID = "gamevox_hindi_capture_channel"
 
         const val ACTION_START_WITH_PROJECTION = "com.example.action.START_WITH_PROJECTION"
-        const val ACTION_START_DEMO_OVERLAY = "com.example.action.START_DEMO_OVERLAY"
+        const val ACTION_TOGGLE_DUBBING = "com.example.action.TOGGLE_DUBBING"
         const val ACTION_TOGGLE_SCANNING = "com.example.action.TOGGLE_SCANNING"
         const val ACTION_TOGGLE_TARGET_BOX = "com.example.action.TOGGLE_TARGET_BOX"
-        const val ACTION_PROCESS_SIMULATED_FRAME = "com.example.action.PROCESS_SIMULATED_FRAME"
         const val ACTION_INIT_TTS = "com.example.action.INIT_TTS"
         const val ACTION_DOWNLOAD_VOICE_DATA = "com.example.action.DOWNLOAD_VOICE_DATA"
         const val ACTION_TEST_TTS = "com.example.action.TEST_TTS"
@@ -68,8 +70,6 @@ class ScreenTranslatorService : Service() {
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
-        const val EXTRA_SIMULATED_SPEAKER = "extra_simulated_speaker"
-        const val EXTRA_SIMULATED_SUBTITLE = "extra_simulated_subtitle"
         const val EXTRA_OPEN_SYSTEM_TTS_INSTALLER = "extra_open_system_tts_installer"
     }
 
@@ -81,6 +81,7 @@ class ScreenTranslatorService : Service() {
     private var overlayController: FloatingOverlayController? = null
 
     private var mediaProjectionManager: MediaProjectionManager? = null
+    private var displayManager: DisplayManager? = null
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
@@ -91,59 +92,58 @@ class ScreenTranslatorService : Service() {
     private var captureWidth: Int = 720
     private var captureHeight: Int = 1280
     private var screenDensityDpi: Int = DisplayMetrics.DENSITY_HIGH
-
-    private var simulatedPresetIndex = 0
-    private val builtInGameDialogues = listOf(
-        "Jenny" to "Wait for me! Where are you going so fast?",
-        "Anon" to "I was at my father's funeral. Let's head back home.",
-        "Cybernetic Guard" to "Alert! Target secured in Sector 7. Engage protocols.",
-        "Ancient Dragon" to "You dare challenge the keeper of the eternal flame?",
-        "Squad Leader" to "Hold your position! Reinforcements arriving in thirty seconds.",
-        "Mystic Oracle" to "Seek the hidden temple beyond the crimson mountains before dawn.",
-        "System Terminal" to "Security override complete. Main vault door unlocked."
-    )
+    private var consecutiveProtectedBlackFrames: Int = 0
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            Log.i(TAG, "MediaProjection stopped by system")
-            teardownVirtualDisplay()
+            Log.i(TAG, "MediaProjection stopped by system/user — clearing session")
+            serviceScope.launch(Dispatchers.Main) {
+                teardownVirtualDisplay()
+                mediaProjection = null
+                consecutiveProtectedBlackFrames = 0
+                stopCaptureLoop()
+                ttsManager.stopSpeaking()
+                TranslatorStateRepository.setCapturingOcr(false)
+                TranslatorStateRepository.updateCaptureTelemetry(
+                    hasActiveProjection = false,
+                    isProtectedScreen = false,
+                    statusMessage = "Capture ended — tap floating icon to grant fresh permission"
+                )
+                overlayController?.updateScanningState(false)
+                updateNotification(isScanning = false)
+            }
         }
     }
 
     private val serviceVoiceDataListener = object : ForegroundTtsManager.VoiceDataDownloadListener {
         override fun onHighQualityNetworkVoiceAvailable(
-            language: com.example.data.TargetLanguage,
+            language: TargetLanguage,
             voiceName: String,
             quality: Int
         ) {
-            Log.i(TAG, "High-quality network voice ready for ${language.displayName}: $voiceName (quality=$quality)")
             updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
         }
 
         override fun onVoiceDataMissing(
-            language: com.example.data.TargetLanguage,
+            language: TargetLanguage,
             missingVoiceNames: List<String>,
             reason: String
         ) {
-            Log.w(TAG, "Voice data missing for ${language.displayName}: $reason (missing=$missingVoiceNames)")
             updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
-            // Start background async download watcher automatically
             ttsManager.startAsyncLanguageDataDownloadWatcher(
                 targetLang = language,
                 speakConfirmationWhenReady = false
             )
         }
 
-        override fun onVoiceDataDownloadStarted(language: com.example.data.TargetLanguage) {
-            Log.i(TAG, "Asynchronous voice data download started for ${language.displayName}")
+        override fun onVoiceDataDownloadStarted(language: TargetLanguage) {
             updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
         }
 
         override fun onVoiceDataInstalled(
-            language: com.example.data.TargetLanguage,
+            language: TargetLanguage,
             installedVoiceName: String
         ) {
-            Log.i(TAG, "Voice data installed for ${language.displayName}: $installedVoiceName")
             updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
         }
     }
@@ -151,34 +151,46 @@ class ScreenTranslatorService : Service() {
     override fun onCreate() {
         super.onCreate()
         TranslatorStateRepository.loadPreferences(applicationContext)
+        serviceScope.launch {
+            TranslatorStateRepository.loadCloudTtsFromDataStore(applicationContext)
+        }
         createNotificationChannel()
+
+        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         computeCaptureMetrics()
 
-        // Initialize ForegroundTtsManager inside the Foreground Service for High-Quality Network Voices
-        // and Asynchronous Language Data Downloads
         ttsManager = ForegroundTtsManager.getInstance(applicationContext)
         ttsManager.addVoiceDataDownloadListener(serviceVoiceDataListener)
         ttsManager.registerTtsDataBroadcastReceiver()
         ttsManager.initializeAsync()
 
         pipeline = OcrTranslationPipeline.getInstance(applicationContext)
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         overlayController = FloatingOverlayController(
             context = applicationContext,
+            onStartStopDubbingToggled = {
+                handleSingleTapStartStopDubbing()
+            },
             onBoxVisibilityToggled = { visible ->
-                handleBoxesVisibilityToggled(visible)
+                overlayController?.updateScanningState(TranslatorStateRepository.state.value.isCapturingOcr)
+                if (visible) {
+                    pipeline.resetAntiRepeatMemory()
+                }
             },
             onVoiceMuteToggled = { muted ->
                 if (muted) {
                     ttsManager.stopSpeaking()
                 } else {
                     val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
-                    if (latestHindi.isNotBlank() && latestHindi != "स्कैन बॉक्स को गेम के टेक्स्ट पर ले जाएं...") {
+                    if (latestHindi.isNotBlank() && latestHindi != "सबटायटल बॉक्स को गेम टेक्स्ट पर रखें...") {
                         pipeline.speakHindiNonBlocking(latestHindi, forceSpeakEvenIfRepeat = true)
                     }
                 }
                 updateNotification(TranslatorStateRepository.state.value.isCapturingOcr)
+            },
+            onSnapTargetBoxBottom = {
+                pipeline.resetAntiRepeatMemory()
             },
             onTestHindiSpeech = {
                 val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
@@ -199,14 +211,18 @@ class ScreenTranslatorService : Service() {
         )
     }
 
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+    override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         computeCaptureMetrics()
         overlayController?.onScreenOrientationChanged()
+        if (mediaProjection != null) {
+            recreateVirtualDisplayOnConfigChange()
+        }
+        pipeline.imageProcessor.resetFrameDiffCache()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START_DEMO_OVERLAY
+        val action = intent?.action ?: ACTION_TOGGLE_DUBBING
 
         when (action) {
             ACTION_STOP_SERVICE -> {
@@ -214,9 +230,13 @@ class ScreenTranslatorService : Service() {
                 return START_NOT_STICKY
             }
 
+            ACTION_TOGGLE_DUBBING -> {
+                handleSingleTapStartStopDubbing()
+                return START_STICKY
+            }
+
             ACTION_TOGGLE_SCANNING -> {
-                val showCaptions = TranslatorStateRepository.state.value.isSubtitleVisible
-                overlayController?.setSubtitleCaptionsVisibility(showCaptions)
+                handleSingleTapStartStopDubbing()
                 return START_STICKY
             }
 
@@ -252,30 +272,7 @@ class ScreenTranslatorService : Service() {
                 return START_STICKY
             }
 
-            ACTION_PROCESS_SIMULATED_FRAME -> {
-                val speaker = intent?.getStringExtra(EXTRA_SIMULATED_SPEAKER).orEmpty()
-                val subtitle = intent?.getStringExtra(EXTRA_SIMULATED_SUBTITLE).orEmpty()
-                if (subtitle.isNotBlank()) {
-                    serviceScope.launch {
-                        // If a genuinely new subtitle is requested manually, flush ongoing speech so the new text speaks
-                        ttsManager.stopSpeaking()
-                        val sampleBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, subtitle)
-                        pipeline.processCapturedFrame(
-                            rawBitmap = sampleBitmap,
-                            excludeOverlayRect = null,
-                            targetRegionScreenRect = null,
-                            onDebugTextUpdate = { eng, hin, note ->
-                                overlayController?.updateDebugReadout(eng, hin, note)
-                            }
-                        )
-                    }
-                }
-                return START_STICKY
-            }
-
             ACTION_START_WITH_PROJECTION -> {
-                promoteToForeground(isScanning = true, withMediaProjectionType = true)
-
                 val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                     ?: Activity.RESULT_CANCELED
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -285,37 +282,83 @@ class ScreenTranslatorService : Service() {
                     intent?.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
 
+                if (resultCode != Activity.RESULT_OK || resultData == null) {
+                    TranslatorStateRepository.updateCaptureTelemetry(
+                        hasActiveProjection = false,
+                        isProtectedScreen = false,
+                        statusMessage = "Screen capture permission required"
+                    )
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+
+                val promoted = promoteToForeground(isScanning = true)
+                if (!promoted) {
+                    TranslatorStateRepository.updateCaptureTelemetry(
+                        hasActiveProjection = false,
+                        statusMessage = "Foreground MediaProjection permission blocked by OS"
+                    )
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+
                 TranslatorStateRepository.updateShowTargetBoxOverlay(applicationContext, true)
                 overlayController?.showFloatingOverlay()
 
-                if (resultCode == Activity.RESULT_OK && resultData != null) {
-                    setupMediaProjection(resultCode, resultData)
-                    TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = false)
-                    handleBoxesVisibilityToggled(true)
-                } else {
-                    TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = true)
-                    handleBoxesVisibilityToggled(true)
-                }
-            }
-
-            ACTION_START_DEMO_OVERLAY -> {
-                val initialVisible = TranslatorStateRepository.state.value.showTargetBoxOverlay
-                promoteToForeground(isScanning = initialVisible, withMediaProjectionType = false)
-                overlayController?.showFloatingOverlay()
-                TranslatorStateRepository.setServiceRunning(running = true, isOverlayDemo = true)
-                handleBoxesVisibilityToggled(initialVisible)
+                val projectionReady = setupMediaProjection(resultCode, resultData)
+                TranslatorStateRepository.setServiceRunning(
+                    running = true,
+                    isOverlayDemo = false,
+                    hasActiveProjection = projectionReady
+                )
+                handleDubbingStateChanged(projectionReady)
+                return START_STICKY
             }
         }
 
         return START_STICKY
     }
 
-    private fun handleBoxesVisibilityToggled(isVisible: Boolean) {
-        TranslatorStateRepository.setCapturingOcr(isVisible)
-        overlayController?.updateScanningState(isVisible)
-        updateNotification(isVisible)
+    private fun handleSingleTapStartStopDubbing() {
+        val state = TranslatorStateRepository.state.value
+        if (state.isCapturingOcr) {
+            handleDubbingStateChanged(false)
+            ttsManager.stopSpeaking()
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = mediaProjection != null,
+                isProtectedScreen = false,
+                statusMessage = "Paused — tap floating icon to resume"
+            )
+            return
+        }
 
-        if (isVisible) {
+        if (mediaProjection != null) {
+            handleDubbingStateChanged(true)
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = true,
+                isProtectedScreen = false,
+                statusMessage = "Live OCR dubbing active"
+            )
+        } else {
+            // Fresh per-session MediaProjection consent required before scanning
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = false,
+                statusMessage = "Requesting screen capture permission..."
+            )
+            val consentIntent = Intent(applicationContext, MediaProjectionConsentActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            }
+            startActivity(consentIntent)
+        }
+    }
+
+    private fun handleDubbingStateChanged(active: Boolean) {
+        consecutiveProtectedBlackFrames = 0
+        TranslatorStateRepository.setCapturingOcr(active)
+        overlayController?.updateScanningState(active)
+        updateNotification(active)
+
+        if (active) {
             pipeline.resetAntiRepeatMemory()
             startCaptureLoop()
         } else {
@@ -327,38 +370,44 @@ class ScreenTranslatorService : Service() {
         captureLoopJob?.cancel()
         captureLoopJob = serviceScope.launch {
             while (isActive && TranslatorStateRepository.state.value.isCapturingOcr) {
-                // Wait until the current utterance finishes speaking completely before triggering a new scan
-                if (pipeline.isTtsSpeakingNow()) {
-                    delay(400L)
-                    continue
-                }
-
                 val intervalMs = TranslatorStateRepository.state.value.captureIntervalMs
                 try {
                     val a11yService = GameVoxAccessibilityService.instance
                     val overlayRect = overlayController?.getOverlayScreenBounds()
-                    val targetBoxRect = if (TranslatorStateRepository.state.value.showTargetBoxOverlay) {
-                        overlayController?.getTargetBoxScreenBounds()
-                    } else {
-                        null
-                    }
+                    val targetBoxRect = overlayController?.getTargetBoxScreenBounds()
+                        ?: TranslatorStateRepository.state.value.targetBoxScreenRect
 
-                    // Priority 1: Direct AccessibilityNodeInfo text strictly inside the Target Scan Box
-                    val nodeText = a11yService?.extractVisibleGameText(targetBoxRect).orEmpty()
-                    if (nodeText.isNotBlank()) {
-                        pipeline.processExtractedRawText(
-                            rawEnglishText = nodeText,
-                            onDebugTextUpdate = { eng, hin, note ->
-                                overlayController?.updateDebugReadout(eng, hin, note)
+                    val capturedBitmap = acquireLatestScreenBitmap()
+                        ?: a11yService?.captureScreenBitmapViaAccessibility()
+
+                    if (capturedBitmap != null) {
+                        val isAllBlackFrame = ImageProcessor.isLikelyProtectedOrBlackFrame(capturedBitmap)
+
+                        if (isAllBlackFrame) {
+                            consecutiveProtectedBlackFrames++
+                            if (consecutiveProtectedBlackFrames >= 4) {
+                                TranslatorStateRepository.updateCaptureTelemetry(
+                                    hasActiveProjection = mediaProjection != null,
+                                    isProtectedScreen = true,
+                                    statusMessage = "Protected screen blocked capture (FLAG_SECURE)"
+                                )
+                                overlayController?.updateProtectedScreenBadge(
+                                    protected = true,
+                                    message = "Protected screen (FLAG_SECURE) blocked capture"
+                                )
                             }
-                        )
-                    } else {
-                        // Priority 2: MediaProjection frame OR Android 11+ Accessibility takeScreenshot
-                        // cropped strictly to targetBoxRect before running ImageProcessor + ML Kit OCR!
-                        val capturedBitmap = acquireLatestScreenBitmap()
-                            ?: a11yService?.captureScreenBitmapViaAccessibility()
+                            capturedBitmap.recycle()
+                        } else {
+                            if (consecutiveProtectedBlackFrames > 0 || TranslatorStateRepository.state.value.isProtectedScreenDetected) {
+                                consecutiveProtectedBlackFrames = 0
+                                TranslatorStateRepository.updateCaptureTelemetry(
+                                    hasActiveProjection = mediaProjection != null,
+                                    isProtectedScreen = false,
+                                    statusMessage = "Live OCR dubbing active"
+                                )
+                                overlayController?.updateProtectedScreenBadge(protected = false)
+                            }
 
-                        if (capturedBitmap != null) {
                             val (liveW, liveH) = overlayController?.getLiveScreenSize()
                                 ?: (rawScreenWidth to rawScreenHeight)
                             pipeline.processCapturedFrame(
@@ -367,26 +416,35 @@ class ScreenTranslatorService : Service() {
                                 targetRegionScreenRect = targetBoxRect,
                                 rawScreenWidth = liveW,
                                 rawScreenHeight = liveH,
+                                skipIfRegionUnchanged = true,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
                             )
-                        } else {
-                            // Priority 3: Interactive Game Subtitle Simulator fallback
-                            // Keep the active simulated subtitle stable so it speaks once in full,
-                            // waits 30 seconds after onDone(), and only repeats after 30 seconds if still on screen.
-                            val (speaker, line) = builtInGameDialogues[simulatedPresetIndex % builtInGameDialogues.size]
-                            val simBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, line)
-                            pipeline.processCapturedFrame(
-                                rawBitmap = simBitmap,
-                                excludeOverlayRect = null,
-                                targetRegionScreenRect = null,
+                        }
+                    } else {
+                        // Fall back to Accessibility node text ONLY for apps that expose standard UI nodes
+                        val nodeText = a11yService?.extractVisibleGameText(targetBoxRect).orEmpty()
+                        if (nodeText.isNotBlank()) {
+                            pipeline.processExtractedRawText(
+                                rawEnglishText = nodeText,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
                             )
                         }
                     }
+                } catch (sec: SecurityException) {
+                    Log.w(TAG, "SecurityException in screen capture loop", sec)
+                    TranslatorStateRepository.updateCaptureTelemetry(
+                        hasActiveProjection = false,
+                        isProtectedScreen = true,
+                        statusMessage = "Protected screen or revoked capture permission"
+                    )
+                    overlayController?.updateProtectedScreenBadge(
+                        protected = true,
+                        message = "Protected screen or revoked permission"
+                    )
                 } catch (e: Exception) {
                     Log.w(TAG, "Error in screen capture OCR loop", e)
                 }
@@ -400,8 +458,8 @@ class ScreenTranslatorService : Service() {
         captureLoopJob = null
     }
 
-    private fun setupMediaProjection(resultCode: Int, resultData: Intent) {
-        try {
+    private fun setupMediaProjection(resultCode: Int, resultData: Intent): Boolean {
+        return try {
             teardownVirtualDisplay()
             mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()
@@ -409,33 +467,65 @@ class ScreenTranslatorService : Service() {
             val projection = mediaProjectionManager?.getMediaProjection(resultCode, resultData)
             if (projection == null) {
                 Log.w(TAG, "getMediaProjection returned null")
-                return
+                TranslatorStateRepository.updateCaptureTelemetry(
+                    hasActiveProjection = false,
+                    statusMessage = "Unable to start MediaProjection session"
+                )
+                return false
             }
 
             projection.registerCallback(projectionCallback, imageReaderHandler)
             mediaProjection = projection
-
-            val reader = ImageReader.newInstance(
-                captureWidth,
-                captureHeight,
-                PixelFormat.RGBA_8888,
-                2
+            createVirtualDisplayAndReader(projection)
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = true,
+                isProtectedScreen = false,
+                statusMessage = "Live OCR dubbing active"
             )
-            imageReader = reader
-
-            virtualDisplay = projection.createVirtualDisplay(
-                "GameVoxHindiScreenCapture",
-                captureWidth,
-                captureHeight,
-                screenDensityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.surface,
-                null,
-                imageReaderHandler
+            true
+        } catch (sec: SecurityException) {
+            Log.e(TAG, "SecurityException starting MediaProjection", sec)
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = false,
+                isProtectedScreen = true,
+                statusMessage = "Screen capture permission denied by system"
             )
+            false
         } catch (e: Exception) {
             Log.w(TAG, "Failed to setup MediaProjection VirtualDisplay", e)
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = false,
+                statusMessage = "Capture initialization error: ${e.message ?: "unknown"}"
+            )
+            false
         }
+    }
+
+    private fun recreateVirtualDisplayOnConfigChange() {
+        val projection = mediaProjection ?: return
+        teardownVirtualDisplay()
+        createVirtualDisplayAndReader(projection)
+    }
+
+    private fun createVirtualDisplayAndReader(projection: MediaProjection) {
+        val reader = ImageReader.newInstance(
+            captureWidth.coerceAtLeast(320),
+            captureHeight.coerceAtLeast(320),
+            PixelFormat.RGBA_8888,
+            2
+        )
+        imageReader = reader
+
+        virtualDisplay = projection.createVirtualDisplay(
+            "GameVoxHindiScreenCapture",
+            captureWidth.coerceAtLeast(320),
+            captureHeight.coerceAtLeast(320),
+            screenDensityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader.surface,
+            null,
+            imageReaderHandler
+        )
     }
 
     private fun acquireLatestScreenBitmap(): Bitmap? {
@@ -462,7 +552,9 @@ class ScreenTranslatorService : Service() {
                 fullBitmap.recycle()
                 cropped
             }
-        } catch (e: Exception) {
+        } catch (sec: SecurityException) {
+            throw sec
+        } catch (_: Exception) {
             null
         } finally {
             try {
@@ -474,33 +566,52 @@ class ScreenTranslatorService : Service() {
 
     private fun computeCaptureMetrics() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = resources.displayMetrics
-        screenDensityDpi = metrics.densityDpi
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            rawScreenWidth = bounds.width().coerceAtLeast(360)
-            rawScreenHeight = bounds.height().coerceAtLeast(640)
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        val dm = DisplayMetrics()
+        if (display != null) {
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(dm)
+            screenDensityDpi = dm.densityDpi
+            var w = dm.widthPixels.coerceAtLeast(360)
+            var h = dm.heightPixels.coerceAtLeast(360)
+            val rot = display.rotation
+            val isLandscape = rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270
+            if (isLandscape && w < h) {
+                val tmp = w; w = h; h = tmp
+            } else if (!isLandscape && w > h) {
+                val tmp = w; w = h; h = tmp
+            }
+            rawScreenWidth = w
+            rawScreenHeight = h
         } else {
-            rawScreenWidth = metrics.widthPixels.coerceAtLeast(360)
-            rawScreenHeight = metrics.heightPixels.coerceAtLeast(640)
+            val metrics = resources.displayMetrics
+            screenDensityDpi = metrics.densityDpi
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = wm.currentWindowMetrics.bounds
+                rawScreenWidth = bounds.width().coerceAtLeast(360)
+                rawScreenHeight = bounds.height().coerceAtLeast(360)
+            } else {
+                rawScreenWidth = metrics.widthPixels.coerceAtLeast(360)
+                rawScreenHeight = metrics.heightPixels.coerceAtLeast(360)
+            }
         }
 
         val maxDim = 960
-        if (rawScreenWidth > maxDim) {
-            val scale = maxDim.toFloat() / rawScreenWidth.toFloat()
-            captureWidth = maxDim
-            captureHeight = (rawScreenHeight * scale).toInt().coerceAtLeast(360)
+        if (rawScreenWidth > maxDim || rawScreenHeight > maxDim) {
+            val longest = maxOf(rawScreenWidth, rawScreenHeight)
+            val scale = maxDim.toFloat() / longest.toFloat()
+            captureWidth = (rawScreenWidth * scale).toInt().coerceAtLeast(320)
+            captureHeight = (rawScreenHeight * scale).toInt().coerceAtLeast(320)
         } else {
             captureWidth = rawScreenWidth
             captureHeight = rawScreenHeight
         }
     }
 
-    private fun promoteToForeground(isScanning: Boolean, withMediaProjectionType: Boolean) {
+    private fun promoteToForeground(isScanning: Boolean): Boolean {
         val notification = buildForegroundNotification(isScanning)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && withMediaProjectionType) {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIFICATION_ID,
                     notification,
@@ -509,11 +620,13 @@ class ScreenTranslatorService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
+            true
+        } catch (sec: SecurityException) {
+            Log.e(TAG, "Failed startForeground with MEDIA_PROJECTION type", sec)
+            false
         } catch (e: Exception) {
-            try {
-                startForeground(NOTIFICATION_ID, notification)
-            } catch (_: Exception) {
-            }
+            Log.e(TAG, "Failed startForeground", e)
+            false
         }
     }
 
@@ -534,7 +647,7 @@ class ScreenTranslatorService : Service() {
         )
 
         val toggleIntent = Intent(this, ScreenTranslatorService::class.java).apply {
-            action = ACTION_TOGGLE_SCANNING
+            action = ACTION_TOGGLE_DUBBING
         }
         val togglePendingIntent = PendingIntent.getService(
             this,
@@ -570,7 +683,7 @@ class ScreenTranslatorService : Service() {
             .setContentIntent(contentPendingIntent)
             .addAction(
                 android.R.drawable.ic_media_play,
-                if (isScanning) "Pause OCR" else "Start OCR",
+                if (isScanning) "Pause Dubbing" else "Resume Dubbing",
                 togglePendingIntent
             )
             .addAction(
@@ -588,7 +701,7 @@ class ScreenTranslatorService : Service() {
                 getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Persistent status for GameVox Hindi floating subtitle OCR & TTS"
+                description = "Persistent status for GameVox live subtitle OCR & Hindi TTS"
                 setShowBadge(false)
             }
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -611,6 +724,7 @@ class ScreenTranslatorService : Service() {
 
     private fun stopTranslatorServiceCleanly() {
         stopCaptureLoop()
+        ttsManager.stopSpeaking()
         overlayController?.destroyOverlay()
         teardownVirtualDisplay()
         try {
@@ -619,7 +733,16 @@ class ScreenTranslatorService : Service() {
             mediaProjection = null
         } catch (_: Exception) {
         }
-        TranslatorStateRepository.setServiceRunning(running = false, isOverlayDemo = false)
+        TranslatorStateRepository.setServiceRunning(
+            running = false,
+            isOverlayDemo = false,
+            hasActiveProjection = false
+        )
+        TranslatorStateRepository.updateCaptureTelemetry(
+            hasActiveProjection = false,
+            isProtectedScreen = false,
+            statusMessage = "Ready — tap Start to capture subtitles"
+        )
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -638,7 +761,11 @@ class ScreenTranslatorService : Service() {
         } catch (_: Exception) {
         }
         serviceScope.cancel()
-        TranslatorStateRepository.setServiceRunning(running = false, isOverlayDemo = false)
+        TranslatorStateRepository.setServiceRunning(
+            running = false,
+            isOverlayDemo = false,
+            hasActiveProjection = false
+        )
         super.onDestroy()
     }
 
