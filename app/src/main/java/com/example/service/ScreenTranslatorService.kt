@@ -41,13 +41,12 @@ import kotlinx.coroutines.launch
 
 /**
  * Foreground Service managing:
- * 1. WindowManager Draggable Floating Circular Icon + Live Debug TextView below it
- * 2. Continuous 2-second Game Subtitle Extraction via:
- *    - Priority A: [GameVoxAccessibilityService] node text extraction
- *    - Priority B: [GameVoxAccessibilityService] Android 11+ screenshot + ColorMatrix OCR
- *    - Priority C: [MediaProjection] VirtualDisplay + ColorMatrix OCR
- *    - Priority D: Built-in game dialogue simulator fallback
- * 3. Shared Singleton [OcrTranslationPipeline] for Hindi translation + Android TextToSpeech (hi-IN)
+ * 1. WindowManager Draggable Circular Icon + Draggable & Resizable Transparent Scan Box
+ * 2. Continuous 2-second Game Subtitle Extraction strictly inside the Scan Box via:
+ *    - Priority A: [GameVoxAccessibilityService] node text intersecting the Scan Box
+ *    - Priority B: [MediaProjection] or [GameVoxAccessibilityService] screenshot cropped to the Scan Box + ML Kit OCR
+ *    - Priority C: Built-in game dialogue simulator fallback
+ * 3. Shared Singleton [OcrTranslationPipeline] for Google Translate API + High-Quality Network TTS
  */
 class ScreenTranslatorService : Service() {
 
@@ -59,6 +58,7 @@ class ScreenTranslatorService : Service() {
         const val ACTION_START_WITH_PROJECTION = "com.example.action.START_WITH_PROJECTION"
         const val ACTION_START_DEMO_OVERLAY = "com.example.action.START_DEMO_OVERLAY"
         const val ACTION_TOGGLE_SCANNING = "com.example.action.TOGGLE_SCANNING"
+        const val ACTION_TOGGLE_TARGET_BOX = "com.example.action.TOGGLE_TARGET_BOX"
         const val ACTION_PROCESS_SIMULATED_FRAME = "com.example.action.PROCESS_SIMULATED_FRAME"
         const val ACTION_TEST_TTS = "com.example.action.TEST_TTS"
         const val ACTION_REFRESH_TTS = "com.example.action.REFRESH_TTS"
@@ -82,8 +82,10 @@ class ScreenTranslatorService : Service() {
     private var imageReader: ImageReader? = null
     private val imageReaderHandler = Handler(Looper.getMainLooper())
 
-    private var screenWidth: Int = 720
-    private var screenHeight: Int = 1280
+    private var rawScreenWidth: Int = 1080
+    private var rawScreenHeight: Int = 2400
+    private var captureWidth: Int = 720
+    private var captureHeight: Int = 1280
     private var screenDensityDpi: Int = DisplayMetrics.DENSITY_HIGH
 
     private var simulatedPresetIndex = 0
@@ -115,10 +117,8 @@ class ScreenTranslatorService : Service() {
             context = applicationContext,
             onSingleTapToggleCapture = { handleToggleCapture() },
             onTestHindiSpeech = {
-                pipeline.speakHindiNonBlocking(
-                    "नमस्ते गेमर! गेमवॉक्स हिंदी सबटाइटल अनुवादक तैयार है।",
-                    forceSpeakEvenIfRepeat = true
-                )
+                val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
+                pipeline.speakHindiNonBlocking(greeting, forceSpeakEvenIfRepeat = true)
             },
             onInstallHindiVoiceData = {
                 pipeline.promptInstallHindiTtsData(applicationContext)
@@ -146,12 +146,20 @@ class ScreenTranslatorService : Service() {
                 return START_STICKY
             }
 
+            ACTION_TOGGLE_TARGET_BOX -> {
+                val showBox = TranslatorStateRepository.state.value.showTargetBoxOverlay
+                if (showBox) {
+                    overlayController?.showDraggableTargetBox()
+                } else {
+                    overlayController?.hideDraggableTargetBox()
+                }
+                return START_STICKY
+            }
+
             ACTION_TEST_TTS -> {
                 pipeline.refreshTtsConfiguration()
-                pipeline.speakHindiNonBlocking(
-                    "नमस्ते गेमर! आपकी हिंदी आवाज की पिच और गति सेट हो गई है।",
-                    forceSpeakEvenIfRepeat = true
-                )
+                val greeting = TranslatorStateRepository.state.value.targetLanguage.sampleGreeting
+                pipeline.speakHindiNonBlocking(greeting, forceSpeakEvenIfRepeat = true)
                 return START_STICKY
             }
 
@@ -169,6 +177,7 @@ class ScreenTranslatorService : Service() {
                         pipeline.processCapturedFrame(
                             rawBitmap = sampleBitmap,
                             excludeOverlayRect = null,
+                            targetRegionScreenRect = null,
                             onDebugTextUpdate = { eng, hin, note ->
                                 overlayController?.updateDebugReadout(eng, hin, note)
                             }
@@ -221,8 +230,6 @@ class ScreenTranslatorService : Service() {
         updateNotification(nowScanning)
 
         if (nowScanning) {
-            // Reset anti-repeat when the user explicitly taps the floating icon to start scanning
-            // so the very first subtitle on screen is immediately spoken out loud!
             pipeline.resetAntiRepeatMemory()
             startCaptureLoop()
         } else {
@@ -238,9 +245,14 @@ class ScreenTranslatorService : Service() {
                 try {
                     val a11yService = GameVoxAccessibilityService.instance
                     val overlayRect = overlayController?.getOverlayScreenBounds()
+                    val targetBoxRect = if (TranslatorStateRepository.state.value.showTargetBoxOverlay) {
+                        overlayController?.getTargetBoxScreenBounds()
+                    } else {
+                        null
+                    }
 
-                    // Priority 1: Direct AccessibilityNodeInfo text from active game window
-                    val nodeText = a11yService?.extractVisibleGameText().orEmpty()
+                    // Priority 1: Direct AccessibilityNodeInfo text strictly inside the Target Scan Box
+                    val nodeText = a11yService?.extractVisibleGameText(targetBoxRect).orEmpty()
                     if (nodeText.isNotBlank()) {
                         pipeline.processExtractedRawText(
                             rawEnglishText = nodeText,
@@ -250,6 +262,7 @@ class ScreenTranslatorService : Service() {
                         )
                     } else {
                         // Priority 2: MediaProjection frame OR Android 11+ Accessibility takeScreenshot
+                        // cropped strictly to targetBoxRect before running ImageProcessor + ML Kit OCR!
                         val capturedBitmap = acquireLatestScreenBitmap()
                             ?: a11yService?.captureScreenBitmapViaAccessibility()
 
@@ -257,19 +270,22 @@ class ScreenTranslatorService : Service() {
                             pipeline.processCapturedFrame(
                                 rawBitmap = capturedBitmap,
                                 excludeOverlayRect = overlayRect,
+                                targetRegionScreenRect = targetBoxRect,
+                                rawScreenWidth = rawScreenWidth,
+                                rawScreenHeight = rawScreenHeight,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
                             )
                         } else {
-                            // Priority 3: Interactive Game Subtitle Simulator frame so tapping
-                            // the floating icon always reads & speaks Hindi dialogue out loud!
+                            // Priority 3: Interactive Game Subtitle Simulator fallback
                             val (speaker, line) = builtInGameDialogues[simulatedPresetIndex % builtInGameDialogues.size]
                             simulatedPresetIndex++
                             val simBitmap = BitmapInverter.createSampleGameSubtitleBitmap(speaker, line)
                             pipeline.processCapturedFrame(
                                 rawBitmap = simBitmap,
                                 excludeOverlayRect = null,
+                                targetRegionScreenRect = null,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
@@ -305,8 +321,8 @@ class ScreenTranslatorService : Service() {
             mediaProjection = projection
 
             val reader = ImageReader.newInstance(
-                screenWidth,
-                screenHeight,
+                captureWidth,
+                captureHeight,
                 PixelFormat.RGBA_8888,
                 2
             )
@@ -314,8 +330,8 @@ class ScreenTranslatorService : Service() {
 
             virtualDisplay = projection.createVirtualDisplay(
                 "GameVoxHindiScreenCapture",
-                screenWidth,
-                screenHeight,
+                captureWidth,
+                captureHeight,
                 screenDensityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader.surface,
@@ -366,25 +382,23 @@ class ScreenTranslatorService : Service() {
         val metrics = resources.displayMetrics
         screenDensityDpi = metrics.densityDpi
 
-        val rawW: Int
-        val rawH: Int
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = wm.currentWindowMetrics.bounds
-            rawW = bounds.width()
-            rawH = bounds.height()
+            rawScreenWidth = bounds.width().coerceAtLeast(360)
+            rawScreenHeight = bounds.height().coerceAtLeast(640)
         } else {
-            rawW = metrics.widthPixels
-            rawH = metrics.heightPixels
+            rawScreenWidth = metrics.widthPixels.coerceAtLeast(360)
+            rawScreenHeight = metrics.heightPixels.coerceAtLeast(640)
         }
 
         val maxDim = 960
-        if (rawW > maxDim) {
-            val scale = maxDim.toFloat() / rawW.toFloat()
-            screenWidth = maxDim
-            screenHeight = (rawH * scale).toInt().coerceAtLeast(360)
+        if (rawScreenWidth > maxDim) {
+            val scale = maxDim.toFloat() / rawScreenWidth.toFloat()
+            captureWidth = maxDim
+            captureHeight = (rawScreenHeight * scale).toInt().coerceAtLeast(360)
         } else {
-            screenWidth = rawW.coerceAtLeast(360)
-            screenHeight = rawH.coerceAtLeast(360)
+            captureWidth = rawScreenWidth
+            captureHeight = rawScreenHeight
         }
     }
 

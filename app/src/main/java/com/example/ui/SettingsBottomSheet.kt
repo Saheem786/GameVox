@@ -3,6 +3,8 @@ package com.example.ui
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,9 +18,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.InvertColors
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
@@ -30,6 +34,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,22 +54,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.data.TargetLanguage
 import com.example.data.TranslatorAppState
 import com.example.data.TtsEngineStatus
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.NeonEmerald
+import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.SaffronGold
 import com.example.ui.theme.SlateCardElevated
 import com.example.ui.theme.SlateSurface
 import java.util.Locale
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsBottomSheet(
     state: TranslatorAppState,
     onDismiss: () -> Unit,
+    onTargetLanguageChange: (TargetLanguage) -> Unit,
+    onHighQualityVoiceChange: (Boolean) -> Unit,
+    onShowTargetBoxChange: (Boolean) -> Unit,
     onPitchChange: (Float) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onInvertColorsChange: (Boolean) -> Unit,
@@ -122,12 +132,12 @@ fun SettingsBottomSheet(
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = "TTS & OCR Engine Settings",
+                            text = "Translator, HD Voice & Scan Box",
                             style = MaterialTheme.typography.titleLarge,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Tune Hindi Voice Pitch, Speed & Screen Reader",
+                            text = "Google Translate API • Neural Network TTS • Draggable Scan Box",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -148,7 +158,74 @@ fun SettingsBottomSheet(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
-            // 1. Hindi TTS Installation & Voice Check Card
+            // 1. Target Translation & TTS Language Selector Card
+            Surface(
+                color = SlateCardElevated,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.dp,
+                        color = ElectricCyan.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Language,
+                            contentDescription = "Target Language Selection",
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Target Language: ${state.targetLanguage.displayName} (${state.targetLanguage.nativeName})",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Translates English game text via Google Translate API + Offline Fallback",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("target_language_selector_group")
+                    ) {
+                        TargetLanguage.entries.forEach { lang ->
+                            val isSelected = state.targetLanguage == lang
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { onTargetLanguageChange(lang) },
+                                label = {
+                                    Text(
+                                        text = "${lang.nativeName} • ${lang.displayName}",
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = ElectricCyan,
+                                    selectedLabelColor = ObsidianBg
+                                ),
+                                modifier = Modifier.testTag("target_lang_chip_${lang.code}")
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 2. High-Quality Neural / Network TTS Voice Card
             val isTtsWorking = state.ttsStatus == TtsEngineStatus.READY ||
                 state.ttsStatus == TtsEngineStatus.FALLBACK_VOICE_READY
 
@@ -178,16 +255,23 @@ fun SettingsBottomSheet(
                         ) {
                             Icon(
                                 imageVector = if (isTtsWorking) Icons.Default.CheckCircle else Icons.Default.Warning,
-                                contentDescription = "Hindi TTS Status",
+                                contentDescription = "TTS Status",
                                 tint = if (isTtsWorking) NeonEmerald else SaffronGold,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Hindi TTS: ${state.ttsStatus.label}",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                            Column {
+                                Text(
+                                    text = "${state.targetLanguage.displayName} TTS (${state.targetLanguage.ttsLocaleTag}): ${state.ttsStatus.label}",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "Active Voice: ${state.activeVoiceName}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = ElectricCyan
+                                )
+                            }
                         }
 
                         AssistChip(
@@ -196,11 +280,38 @@ fun SettingsBottomSheet(
                             leadingIcon = {
                                 Icon(
                                     imageVector = Icons.Default.Refresh,
-                                    contentDescription = "Re-check Hindi TTS",
+                                    contentDescription = "Re-check TTS",
                                     modifier = Modifier.size(16.dp)
                                 )
                             },
                             modifier = Modifier.testTag("recheck_tts_chip")
+                        )
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "High-Quality Network Voice (Non-Robotic)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Selects Google TTS QUALITY_HIGH / VERY_HIGH neural voice & enables KEY_FEATURE_NETWORK_SYNTHESIS",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = state.useHighQualityNetworkVoice,
+                            onCheckedChange = onHighQualityVoiceChange,
+                            modifier = Modifier.testTag("high_quality_voice_switch")
                         )
                     }
 
@@ -217,11 +328,14 @@ fun SettingsBottomSheet(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.VolumeUp,
-                                contentDescription = "Speak Sample Hindi",
+                                contentDescription = "Speak Sample Voice",
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Test Hindi Voice", fontWeight = FontWeight.Bold)
+                            Text(
+                                text = "Test ${state.targetLanguage.displayName} Voice",
+                                fontWeight = FontWeight.Bold
+                            )
                         }
 
                         OutlinedButton(
@@ -232,18 +346,81 @@ fun SettingsBottomSheet(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Download,
-                                contentDescription = "Install Hindi Voice Data",
+                                contentDescription = "Install Voice Data",
                                 tint = SaffronGold,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Hindi Voice Data", color = SaffronGold)
+                            Text("Voice Data", color = SaffronGold)
                         }
                     }
                 }
             }
 
-            // 2. TTS Pitch Slider (Default 0.8f)
+            // 3. Draggable & Resizable Target Scan Box Card
+            Surface(
+                color = SlateCardElevated,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.dp,
+                        color = NeonEmerald.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CropFree,
+                                contentDescription = "Draggable Target Scan Box",
+                                tint = NeonEmerald,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "Draggable & Resizable Scan Box",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Text(
+                                    text = "Drag the transparent square box over any game subtitle area & resize via the bottom-right corner grip (◢). Only text inside this box is read.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = state.showTargetBoxOverlay,
+                            onCheckedChange = onShowTargetBoxChange,
+                            modifier = Modifier.testTag("show_target_box_switch")
+                        )
+                    }
+
+                    val rect = state.targetBoxScreenRect
+                    if (rect != null && rect.width() > 0 && rect.height() > 0) {
+                        Text(
+                            text = "Active Scan Region: [${rect.left}, ${rect.top}] → [${rect.right}, ${rect.bottom}] (${rect.width()}×${rect.height()} px)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = NeonEmerald
+                        )
+                    }
+                }
+            }
+
+            // 4. TTS Pitch Slider (Default 0.95f)
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -269,8 +446,8 @@ fun SettingsBottomSheet(
                             )
                         }
                         AssistChip(
-                            onClick = { onPitchChange(0.8f) },
-                            label = { Text("Default 0.8f") },
+                            onClick = { onPitchChange(0.95f) },
+                            label = { Text("Natural 0.95f") },
                             modifier = Modifier.testTag("reset_pitch_chip")
                         )
                     }
@@ -287,7 +464,7 @@ fun SettingsBottomSheet(
                 }
             }
 
-            // 3. TTS Speech Rate Slider (Default 0.9f)
+            // 5. TTS Speech Rate Slider (Default 0.95f)
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -313,8 +490,8 @@ fun SettingsBottomSheet(
                             )
                         }
                         AssistChip(
-                            onClick = { onSpeechRateChange(0.9f) },
-                            label = { Text("Default 0.9f") },
+                            onClick = { onSpeechRateChange(0.95f) },
+                            label = { Text("Natural 0.95f") },
                             modifier = Modifier.testTag("reset_rate_chip")
                         )
                     }
@@ -331,7 +508,7 @@ fun SettingsBottomSheet(
                 }
             }
 
-            // 4. ColorMatrix Bitmap Inversion & Capture Interval
+            // 6. ImageProcessor Grayscale + ColorMatrix Inversion & Capture Interval
             Surface(
                 color = SlateCardElevated,
                 shape = RoundedCornerShape(16.dp),
@@ -359,11 +536,11 @@ fun SettingsBottomSheet(
                             Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
-                                    text = "ColorMatrix Bitmap Inversion",
+                                    text = "ImageProcessor Grayscale & Inversion",
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text = "Inverts white game subtitles on dark scenes into black text before ML Kit OCR.",
+                                    text = "Crops to the Draggable Scan Box, converts to grayscale, and inverts white-on-dark overlays before ML Kit OCR.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )

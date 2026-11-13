@@ -2,6 +2,7 @@ package com.example.service
 
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.os.Build
 import android.util.Log
 import android.view.Display
@@ -9,20 +10,20 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.example.data.TranslatorStateRepository
 import com.example.engine.OcrTranslationPipeline
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * AccessibilityService that extracts text from other running games and apps in two ways:
- * 1. Direct Accessibility Node Hierarchy traversal ([extractVisibleGameText]) for games/apps
- *    that expose text or dialogue views.
- * 2. Android 11+ (API 30+) [takeScreenshot] OCR capture ([captureAndOcrScreen]) for OpenGL/Unity/Unreal
- *    games that render subtitles directly onto a canvas surface — requiring ZERO MediaProjection dialogs!
+ * AccessibilityService that extracts text strictly from inside the user's Draggable & Resizable
+ * Target Bounding Box ([targetRegionRect]) in two ways:
+ * 1. Direct Accessibility Node Hierarchy traversal ([extractVisibleGameText]) filtering nodes
+ *    whose screen bounds (`node.getBoundsInScreen`) intersect the user's Target Scan Box!
+ * 2. Android 11+ (API 30+) [takeScreenshot] OCR capture cropped strictly to the Target Scan Box!
  */
 class GameVoxAccessibilityService : AccessibilityService() {
 
@@ -53,7 +54,6 @@ class GameVoxAccessibilityService : AccessibilityService() {
         val state = TranslatorStateRepository.state.value
         if (!state.isCapturingOcr) return
 
-        // Ignore events originating from our own package so we never read our own UI/overlay in a loop
         val eventPkg = event.packageName?.toString().orEmpty()
         if (eventPkg == packageName) return
 
@@ -61,19 +61,35 @@ class GameVoxAccessibilityService : AccessibilityService() {
         if (now - lastAutoEventScanTimeMs < 1800L) return
         lastAutoEventScanTimeMs = now
 
-        val extractedNodeText = extractVisibleGameText()
+        val targetBoxRect = state.targetBoxScreenRect
+        val extractedNodeText = extractVisibleGameText(targetBoxRect)
         if (extractedNodeText.isNotBlank()) {
             a11yScope.launch {
                 pipeline.processExtractedRawText(extractedNodeText)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = resources.displayMetrics
+            val rawW = metrics.widthPixels
+            val rawH = metrics.heightPixels
+            a11yScope.launch {
+                val screenBitmap = captureScreenBitmapViaAccessibility()
+                if (screenBitmap != null) {
+                    pipeline.processCapturedFrame(
+                        rawBitmap = screenBitmap,
+                        targetRegionScreenRect = targetBoxRect,
+                        rawScreenWidth = rawW,
+                        rawScreenHeight = rawH
+                    )
+                }
             }
         }
     }
 
     /**
-     * Traverses the active window's AccessibilityNodeInfo tree and returns visible game/dialogue text,
-     * ignoring system status bar and our own app package.
+     * Traverses the active window's [AccessibilityNodeInfo] tree and returns visible game/dialogue text
+     * ONLY from nodes whose screen coordinates intersect [targetBoxRect] (when the Scan Box is active).
      */
-    fun extractVisibleGameText(): String {
+    fun extractVisibleGameText(targetBoxRect: Rect? = TranslatorStateRepository.state.value.targetBoxScreenRect): String {
         val rootNode = try {
             rootInActiveWindow
         } catch (_: Exception) {
@@ -86,18 +102,19 @@ class GameVoxAccessibilityService : AccessibilityService() {
         }
 
         val collectedLines = mutableListOf<String>()
-        collectNodeTextRecursive(rootNode, collectedLines, depth = 0)
+        collectNodeTextRecursive(rootNode, targetBoxRect, collectedLines, depth = 0)
 
         return collectedLines
             .map { it.trim() }
-            .filter { it.length >= 3 }
+            .filter { it.length >= 2 }
             .distinct()
-            .takeLast(3)
+            .takeLast(4)
             .joinToString(" ")
     }
 
     private fun collectNodeTextRecursive(
         node: AccessibilityNodeInfo?,
+        targetBoxRect: Rect?,
         outList: MutableList<String>,
         depth: Int
     ) {
@@ -105,22 +122,32 @@ class GameVoxAccessibilityService : AccessibilityService() {
         if (node.isVisibleToUser) {
             val text = node.text?.toString()?.trim().orEmpty()
             val desc = node.contentDescription?.toString()?.trim().orEmpty()
-            if (text.length >= 3) {
-                outList.add(text)
-            } else if (desc.length >= 4) {
-                outList.add(desc)
+            val candidate = if (text.length >= 2) text else if (desc.length >= 3) desc else ""
+
+            if (candidate.isNotEmpty()) {
+                val isInsideTargetBox = if (targetBoxRect != null && !targetBoxRect.isEmpty) {
+                    val nodeBounds = Rect()
+                    node.getBoundsInScreen(nodeBounds)
+                    !nodeBounds.isEmpty && Rect.intersects(targetBoxRect, nodeBounds)
+                } else {
+                    true
+                }
+
+                if (isInsideTargetBox) {
+                    outList.add(candidate)
+                }
             }
         }
         val childCount = node.childCount
         for (i in 0 until childCount) {
-            collectNodeTextRecursive(node.getChild(i), outList, depth + 1)
+            collectNodeTextRecursive(node.getChild(i), targetBoxRect, outList, depth + 1)
         }
     }
 
     /**
      * Captures the screen using Android 11+ (API 30+) [takeScreenshot] without requiring
      * any MediaProjection consent dialog, then converts the HardwareBuffer to a software
-     * ARGB_8888 [Bitmap] for ColorMatrix inversion and ML Kit OCR.
+     * ARGB_8888 [Bitmap] for target-box cropping, grayscale + color-inversion, and ML Kit OCR.
      */
     suspend fun captureScreenBitmapViaAccessibility(): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {

@@ -523,6 +523,30 @@ fun GameVoxHindiDashboard(
         SettingsBottomSheet(
             state = state,
             onDismiss = { TranslatorStateRepository.setShowSettingsBottomSheet(false) },
+            onTargetLanguageChange = { newLang ->
+                TranslatorStateRepository.updateTargetLanguage(context, newLang)
+                localPipeline.resetAntiRepeatMemory()
+                localPipeline.refreshTtsConfiguration()
+                coroutineScope.launch {
+                    val currentEng = state.lastExtractedEnglish
+                    if (currentEng.isNotBlank() && currentEng != "Waiting for game subtitles...") {
+                        localPipeline.processExtractedRawText(currentEng)
+                    }
+                }
+            },
+            onHighQualityVoiceChange = { enabled ->
+                TranslatorStateRepository.updateUseHighQualityNetworkVoice(context, enabled)
+                localPipeline.refreshTtsConfiguration()
+            },
+            onShowTargetBoxChange = { showBox ->
+                TranslatorStateRepository.updateShowTargetBoxOverlay(context, showBox)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, ScreenTranslatorService::class.java).apply {
+                        action = ScreenTranslatorService.ACTION_TOGGLE_TARGET_BOX
+                    }
+                    context.startService(intent)
+                }
+            },
             onPitchChange = { newPitch ->
                 TranslatorStateRepository.updateTtsPitch(context, newPitch)
                 localPipeline.refreshTtsConfiguration()
@@ -540,7 +564,7 @@ fun GameVoxHindiDashboard(
             onTestHindiTts = {
                 localPipeline.refreshTtsConfiguration()
                 localPipeline.speakHindiNonBlocking(
-                    "नमस्ते गेमर! आपकी हिंदी आवाज की पिच और गति सेट हो गई है।",
+                    state.targetLanguage.sampleGreeting,
                     forceSpeakEvenIfRepeat = true
                 )
             },
@@ -625,8 +649,8 @@ private fun HeroControlBanner(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = when {
-                                state.isCapturingOcr -> "SCANNING EVERY ${state.captureIntervalMs / 1000.0}s"
-                                state.isServiceRunning -> "FLOATING ICON READY"
+                                state.isCapturingOcr -> "SCANNING BOX EVERY ${state.captureIntervalMs / 1000.0}s"
+                                state.isServiceRunning -> "SCAN BOX & ICON READY"
                                 else -> "STANDBY"
                             },
                             style = MaterialTheme.typography.labelSmall,
@@ -647,7 +671,7 @@ private fun HeroControlBanner(
                         color = Color.White
                     )
                     Text(
-                        text = "Single-Tap Floating Icon: Start/Stop Speech • Hold: TTS Settings",
+                        text = "Drag & Resize Scan Box Over Subtitles • Tap Icon: Start/Stop • Hold: Settings",
                         style = MaterialTheme.typography.bodyMedium,
                         color = ElectricCyan
                     )
@@ -677,9 +701,9 @@ private fun HeroControlBanner(
                             text = if (!hasOverlayPermission) {
                                 "1. Grant Overlay Permission"
                             } else if (isAccessibilityEnabled) {
-                                "Launch Floating Icon (Accessibility + OCR Ready)"
+                                "Launch Floating Icon + Draggable Scan Box"
                             } else {
-                                "Launch Draggable Floating Icon"
+                                "Launch Floating Icon + Draggable Scan Box"
                             },
                             color = ObsidianBg,
                             style = MaterialTheme.typography.labelLarge
@@ -780,17 +804,17 @@ private fun PermissionsAndEngineStatusCard(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "Permissions, Accessibility Reader & Hindi TTS",
+                text = "Permissions, Draggable Scan Box & HD Hindi TTS",
                 style = MaterialTheme.typography.titleMedium,
                 color = ElectricCyan
             )
 
-            // Row 1: AccessibilityService for reading text across other games
+            // Row 1: AccessibilityService for reading text inside the target bounding box
             PermissionStatusRow(
                 icon = Icons.Default.AccessibilityNew,
                 title = "Game Screen Reader (AccessibilityService)",
                 subtitle = if (isAccessibilityEnabled) {
-                    "Active — Reads game text & takes OCR screenshots without popups"
+                    "Active — Extracts game text strictly inside the Draggable Scan Box"
                 } else {
                     "Enable 'GameVox Hindi' in Accessibility Settings to read other games"
                 },
@@ -800,15 +824,22 @@ private fun PermissionsAndEngineStatusCard(
                 testTag = "enable_accessibility_button"
             )
 
-            // Row 2: SYSTEM_ALERT_WINDOW (Floating Overlay)
+            // Row 2: SYSTEM_ALERT_WINDOW (Floating Overlay + Draggable Target Scan Box)
+            val boxRect = state.targetBoxScreenRect
+            val boxSubtitle = if (hasOverlayPermission) {
+                if (boxRect != null && boxRect.width() > 0) {
+                    "Granted — Draggable Scan Box active (${boxRect.width()}×${boxRect.height()} px)"
+                } else {
+                    "Granted — Floating Icon + Resizable Target Scan Box ready"
+                }
+            } else {
+                "Required to draw the Floating Icon and Draggable Target Scan Box over games"
+            }
+
             PermissionStatusRow(
                 icon = Icons.Default.Layers,
-                title = "Floating Overlay (SYSTEM_ALERT_WINDOW)",
-                subtitle = if (hasOverlayPermission) {
-                    "Granted — Draggable circular icon + Debug TextView enabled"
-                } else {
-                    "Required to draw the floating icon over running games"
-                },
+                title = "Overlay & Resizable Scan Box (SYSTEM_ALERT_WINDOW)",
+                subtitle = boxSubtitle,
                 isReady = hasOverlayPermission,
                 actionLabel = if (hasOverlayPermission) "Ready" else "Grant",
                 onActionClick = onGrantOverlay,
@@ -830,14 +861,14 @@ private fun PermissionsAndEngineStatusCard(
                 testTag = "grant_notification_permission_button"
             )
 
-            // Row 4: Hindi TTS (hi-IN)
+            // Row 4: High-Quality Neural / Network Hindi TTS (hi-IN)
             val isTtsWorking = state.ttsStatus == TtsEngineStatus.READY ||
                 state.ttsStatus == TtsEngineStatus.FALLBACK_VOICE_READY
 
             PermissionStatusRow(
                 icon = Icons.Default.RecordVoiceOver,
-                title = "Native Hindi TTS (Pitch ${state.ttsPitch}x • Rate ${state.ttsSpeechRate}x)",
-                subtitle = state.ttsStatus.label,
+                title = "HD Neural Voice (${state.activeVoiceName})",
+                subtitle = "${state.ttsStatus.label} • Pitch ${state.ttsPitch}x • Rate ${state.ttsSpeechRate}x",
                 isReady = isTtsWorking,
                 actionLabel = if (state.ttsStatus == TtsEngineStatus.MISSING_HINDI_DATA) {
                     "Install Data"
