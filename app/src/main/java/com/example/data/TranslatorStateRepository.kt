@@ -153,8 +153,8 @@ data class TranslatorAppState(
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
     val availableVoicesCount: Int = 0,
     val voiceDownloadMessage: String = "HD Network Synthesis Active",
-    val ttsPitch: Float = 0.95f,
-    val ttsSpeechRate: Float = 0.95f,
+    val ttsPitch: Float = 1.0f,
+    val ttsSpeechRate: Float = 1.0f,
     val invertColorsEnabled: Boolean = true,
     val captureIntervalMs: Long = 2000L,
     val lastExtractedEnglish: String = "Drag the cyan Scan Box over game text...",
@@ -177,8 +177,8 @@ object TranslatorStateRepository {
     private const val KEY_SHOW_SCAN_BOX = "show_target_box_overlay"
     private const val KEY_SHOW_SUBTITLE_BOX = "show_subtitle_captions_box_v1"
     private const val KEY_VOICE_MUTED = "is_voice_muted_v1"
-    private const val KEY_PITCH = "tts_pitch_v2"
-    private const val KEY_RATE = "tts_speech_rate_v2"
+    private const val KEY_PITCH = "tts_pitch_v3"
+    private const val KEY_RATE = "tts_speech_rate_v3"
     private const val KEY_INVERT = "invert_colors_enabled"
     private const val KEY_INTERVAL = "capture_interval_ms"
 
@@ -197,8 +197,8 @@ object TranslatorStateRepository {
         val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
         // Voice is ON (unmuted = false) by default
         val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
-        val pitch = prefs.getFloat(KEY_PITCH, 0.95f).coerceIn(0.4f, 1.8f)
-        val rate = prefs.getFloat(KEY_RATE, 0.95f).coerceIn(0.4f, 1.8f)
+        val pitch = prefs.getFloat(KEY_PITCH, 1.0f).coerceIn(0.4f, 1.8f)
+        val rate = prefs.getFloat(KEY_RATE, 1.0f).coerceIn(0.4f, 1.8f)
         val invert = prefs.getBoolean(KEY_INVERT, true)
         val interval = prefs.getLong(KEY_INTERVAL, 2000L).coerceIn(1000L, 5000L)
         _state.update {

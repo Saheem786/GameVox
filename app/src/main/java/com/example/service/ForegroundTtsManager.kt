@@ -163,17 +163,27 @@ class ForegroundTtsManager private constructor(context: Context) {
     private val _visualizerState = MutableStateFlow(TtsVisualizerState())
     val visualizerState: StateFlow<TtsVisualizerState> = _visualizerState.asStateFlow()
 
-    // Maps utteranceId -> spoken text so network synthesis failures can auto-fallback to local voice
-    private val activeNetworkUtterances = ConcurrentHashMap<String, String>()
+    private data class PendingNetworkUtterance(
+        val text: String,
+        val voiceProfile: VoiceProfile?
+    )
+
+    // Maps utteranceId -> spoken text & profile so network synthesis failures can auto-fallback to local/default voice
+    private val activeNetworkUtterances = ConcurrentHashMap<String, PendingNetworkUtterance>()
+
+    @Volatile
+    private var defaultEngineVoice: Voice? = null
 
     /**
      * Available Female TTS Voices fetched from `TextToSpeech.getVoices()` (`engine.voices`),
+     * prioritized by High-Quality Network voices (e.g. `hi-in-x-hif-network`),
      * used when a Female character (e.g. "Jenny", 18yo Girl) is detected in scanned text.
      */
     val femaleVoices = CopyOnWriteArrayList<Voice>()
 
     /**
      * Available Male TTS Voices fetched from `TextToSpeech.getVoices()` (`engine.voices`),
+     * prioritized by High-Quality Network voices (e.g. `hi-in-x-him-network`),
      * used when a Male character (e.g. "Anon", 18yo Boy) is detected in scanned text.
      */
     val maleVoices = CopyOnWriteArrayList<Voice>()
@@ -434,7 +444,7 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private fun handleUtteranceFailure(utteranceId: String?, errorCode: Int) {
         if (utteranceId == null) return
-        activeNetworkUtterances.remove(utteranceId)
+        val failedNetworkUtterance = activeNetworkUtterances.remove(utteranceId)
         Log.w(TAG, "TTS utterance error ($errorCode) for $utteranceId")
         if (activeUtteranceId == utteranceId) {
             isSpeakingUtterance = false
@@ -443,6 +453,19 @@ class ForegroundTtsManager private constructor(context: Context) {
         if (_visualizerState.value.utteranceId == utteranceId) {
             stopVisualizerSync()
         }
+
+        // If a High-Quality Network voice failed (e.g. offline), auto-fallback once to local/default voice
+        if (failedNetworkUtterance != null) {
+            managerScope.launch {
+                speakInternal(
+                    text = failedNetworkUtterance.text,
+                    allowNetworkSynthesis = false,
+                    voiceProfile = failedNetworkUtterance.voiceProfile
+                )
+            }
+            return
+        }
+
         // Still apply the 30-second cooldown on failure so the same line does not loop endlessly
         thirtySecondRepeatDelayJob?.cancel()
         thirtySecondRepeatDelayJob = managerScope.launch {
@@ -482,8 +505,9 @@ class ForegroundTtsManager private constructor(context: Context) {
         } catch (_: Exception) {
         }
 
-        engine.setPitch(state.ttsPitch)
-        engine.setSpeechRate(state.ttsSpeechRate)
+        // Always apply natural pitch and normal speechRate (1.0f) during TTS initialization
+        engine.setPitch(state.ttsPitch.coerceIn(0.5f, 1.6f))
+        engine.setSpeechRate(state.ttsSpeechRate.coerceIn(0.6f, 1.4f))
 
         val hindiAvailability = try {
             engine.isLanguageAvailable(HINDI_LOCALE)
@@ -517,21 +541,30 @@ class ForegroundTtsManager private constructor(context: Context) {
             preferNetworkVoice = state.useHighQualityNetworkVoice
         )
 
-        // Populate Female & Male TTS voice lists from engine.voices for automatic character gender switching
-        populateGenderVoiceCatalog(engine, targetLang)
-
-        val chosenVoice = voiceSelection.bestInstalledVoice
-            ?: voiceSelection.bestInstalledNetworkVoice
-            ?: voiceSelection.bestDownloadableVoice
+        val chosenVoice = (if (state.useHighQualityNetworkVoice) {
+            voiceSelection.bestInstalledNetworkVoice ?: voiceSelection.bestDownloadableVoice
+        } else {
+            null
+        }) ?: voiceSelection.bestInstalledVoice ?: voiceSelection.bestDownloadableVoice
 
         if (chosenVoice != null) {
+            defaultEngineVoice = chosenVoice
             try {
                 if (engine.voice?.name != chosenVoice.name) {
                     engine.setVoice(chosenVoice)
                 }
             } catch (_: Exception) {
             }
+        } else {
+            defaultEngineVoice = try {
+                engine.defaultVoice ?: engine.voice
+            } catch (_: Exception) {
+                null
+            }
         }
+
+        // Populate Female (`hi-in-x-hif-network` / Female) & Male (`hi-in-x-him-network` / Male) TTS voice lists
+        populateGenderVoiceCatalog(engine, targetLang, preferNetworkVoice = state.useHighQualityNetworkVoice)
 
         isTtsReady = true
 
@@ -995,34 +1028,58 @@ class ForegroundTtsManager private constructor(context: Context) {
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
 
-            if (voiceProfile != null) {
-                selectGenderBasedTtsVoice(
-                    engine = engine,
-                    targetLanguage = state.targetLanguage,
-                    gender = voiceProfile.gender,
-                    voiceIndex = voiceProfile.engineVoiceIndex,
-                    preferNetworkVoice = allowNetworkSynthesis
-                )
-                engine.setPitch(voiceProfile.pitch)
-                engine.setSpeechRate(voiceProfile.speechRate)
-            } else {
-                val detectedGender = VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
-                    ?: SpeakerGender.MALE_18
-                selectGenderBasedTtsVoice(
-                    engine = engine,
-                    targetLanguage = state.targetLanguage,
-                    gender = detectedGender,
-                    voiceIndex = 0,
-                    preferNetworkVoice = allowNetworkSynthesis
-                )
-                engine.setPitch(detectedGender.defaultPitch18Yo)
-                engine.setSpeechRate(detectedGender.defaultSpeechRate18Yo)
+            val effectiveProfile = voiceProfile
+            val targetGender = effectiveProfile?.gender
+                ?: VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
+                ?: SpeakerGender.MALE_18
+
+            // Select High-Quality Female (Jenny) or Male (Anon) voice from tts.voices, or default voice if unavailable
+            val appliedVoice = selectGenderBasedTtsVoice(
+                engine = engine,
+                targetLanguage = state.targetLanguage,
+                gender = targetGender,
+                voiceIndex = effectiveProfile?.engineVoiceIndex ?: 0,
+                preferNetworkVoice = allowNetworkSynthesis
+            )
+
+            // Apply 18-Year-Old Natural Pitch & Normal Speed (1.0f):
+            // - Girl (Jenny): pitch ~1.18f (1.15f - 1.2f range), speechRate = 1.0f
+            // - Boy (Anon): pitch ~0.90f, speechRate = 1.0f
+            val appliedPitch = when {
+                effectiveProfile != null -> effectiveProfile.pitch
+                else -> targetGender.defaultPitch18Yo
+            }
+            val appliedSpeechRate = when {
+                effectiveProfile != null -> effectiveProfile.speechRate
+                else -> targetGender.defaultSpeechRate18Yo
+            }
+
+            engine.setPitch(appliedPitch)
+            engine.setSpeechRate(appliedSpeechRate)
+
+            if (appliedVoice != null) {
+                val qualityTag = if (isNetworkHighQualityVoice(appliedVoice)) "HD Network" else "Standard"
+                TranslatorStateRepository.setActiveVoiceName("$qualityTag (${appliedVoice.name})")
             }
 
             val utteranceId = "gamevox_${UUID.randomUUID()}"
+            val useNetworkBundle = allowNetworkSynthesis &&
+                (appliedVoice == null || isNetworkHighQualityVoice(appliedVoice))
+
             val params = Bundle().apply {
                 putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                if (useNetworkBundle) {
+                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "true")
+                    putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_TIMEOUT_MS, "4000")
+                }
+            }
+
+            if (useNetworkBundle) {
+                activeNetworkUtterances[utteranceId] = PendingNetworkUtterance(
+                    text = fullContinuousText,
+                    voiceProfile = voiceProfile
+                )
             }
 
             isSpeakingUtterance = true
@@ -1034,6 +1091,13 @@ class ForegroundTtsManager private constructor(context: Context) {
                 activeNetworkUtterances.remove(utteranceId)
                 isSpeakingUtterance = false
                 activeUtteranceId = null
+                if (useNetworkBundle) {
+                    return speakInternal(
+                        text = text,
+                        allowNetworkSynthesis = false,
+                        voiceProfile = voiceProfile
+                    )
+                }
             } else {
                 startRealtimeVisualizerSync(
                     utteranceId = utteranceId,
@@ -1226,42 +1290,65 @@ class ForegroundTtsManager private constructor(context: Context) {
         return rms to bands
     }
 
+    private fun isNetworkHighQualityVoice(voice: Voice): Boolean {
+        val features = voice.features.orEmpty()
+        return voice.isNetworkConnectionRequired ||
+            features.contains(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS) ||
+            voice.name.contains("network", ignoreCase = true) ||
+            voice.name.contains("wavenet", ignoreCase = true) ||
+            voice.name.contains("neural", ignoreCase = true) ||
+            voice.quality >= Voice.QUALITY_HIGH
+    }
+
     /**
      * Fetches all available voices from [TextToSpeech.getVoices] (`engine.voices`) and populates
-     * [femaleVoices] and [maleVoices] so character names (e.g., "Jenny" -> Female, "Anon" -> Male)
-     * can immediately switch the active TTS voice via `tts.setVoice()`.
+     * [femaleVoices] (e.g. `hi-in-x-hif-network`) and [maleVoices] (e.g. `hi-in-x-him-network`),
+     * prioritizing High-Quality Network Voices over robotic local voices.
      */
     private fun populateGenderVoiceCatalog(
         engine: TextToSpeech,
-        targetLanguage: TargetLanguage
+        targetLanguage: TargetLanguage,
+        preferNetworkVoice: Boolean = TranslatorStateRepository.state.value.useHighQualityNetworkVoice
     ) {
         try {
             val allVoices = engine.voices ?: return
-            val installedForLang = allVoices.filter { voice ->
+            val candidateVoices = allVoices.filter { voice ->
                 val features = voice.features.orEmpty()
-                voice.locale != null &&
+                val isNotInstalled = features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) ||
+                    features.contains("notInstalled")
+                val isNetVoice = isNetworkHighQualityVoice(voice)
+                val langMatches = voice.locale != null &&
                     (voice.locale.language.equals(targetLanguage.code, ignoreCase = true) ||
-                        voice.locale.language.equals("hi", ignoreCase = true) ||
-                        voice.locale.language.equals("en", ignoreCase = true)) &&
-                    !features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) &&
-                    !features.contains("notInstalled")
+                        voice.locale.language.equals("hi", ignoreCase = true))
+
+                // Include all installed voices AND online -network voices when High-Quality Network Voice is enabled
+                langMatches && (!isNotInstalled || (preferNetworkVoice && isNetVoice))
             }.sortedWith(
                 compareByDescending<Voice> {
                     it.locale.language.equals(targetLanguage.code, ignoreCase = true)
                 }.thenByDescending { voice ->
-                    val isNet = voice.isNetworkConnectionRequired ||
-                        voice.name.contains("network", ignoreCase = true)
-                    if (!isNet) 2 else 1
-                }.thenByDescending { it.quality }.thenBy { it.name }
+                    val features = voice.features.orEmpty()
+                    val isInstalled = !features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) &&
+                        !features.contains("notInstalled")
+                    val isNet = isNetworkHighQualityVoice(voice)
+                    // Priority: 1) Installed HD Network voice, 2) Cloud Network voice, 3) Installed Local voice
+                    when {
+                        preferNetworkVoice && isNet && isInstalled -> 4
+                        preferNetworkVoice && isNet -> 3
+                        isInstalled -> 2
+                        else -> 1
+                    }
+                }.thenByDescending { it.quality }
+                    .thenBy { it.latency }
+                    .thenBy { it.name }
             )
 
-            if (installedForLang.isEmpty()) return
+            if (candidateVoices.isEmpty()) return
 
             val detectedFemales = mutableListOf<Voice>()
             val detectedMales = mutableListOf<Voice>()
-            val unclassified = mutableListOf<Voice>()
 
-            for (voice in installedForLang) {
+            for (voice in candidateVoices) {
                 val lowerName = voice.name.lowercase(Locale.ROOT)
                 val lowerFeatures = voice.features.orEmpty().joinToString(" ").lowercase(Locale.ROOT)
                 val combined = "$lowerName $lowerFeatures"
@@ -1270,10 +1357,12 @@ class ForegroundTtsManager private constructor(context: Context) {
                     lowerName.contains("-f-") ||
                     lowerName.contains("_f_") ||
                     lowerName.endsWith("-f") ||
-                    // Google TTS hi-IN / en-IN standard female voice codes (A, C, E, hia, hic, hie)
+                    // Google TTS hi-IN female voice IDs (hif, hia, hic, hie, cfn)
+                    lowerName.contains("hi-in-x-hif") ||
                     lowerName.contains("hi-in-x-hia") ||
                     lowerName.contains("hi-in-x-hic") ||
                     lowerName.contains("hi-in-x-hie") ||
+                    lowerName.contains("hi-in-x-cfn") ||
                     lowerName.contains("wavenet-a") ||
                     lowerName.contains("wavenet-c") ||
                     lowerName.contains("standard-a") ||
@@ -1282,14 +1371,14 @@ class ForegroundTtsManager private constructor(context: Context) {
                     lowerName.contains("en-in-x-enc") ||
                     lowerName.contains("en-in-x-ene")
 
-                val isExplicitMale = combined.contains("male") && !combined.contains("female") ||
+                val isExplicitMale = (combined.contains("male") && !combined.contains("female")) ||
                     lowerName.contains("-m-") ||
                     lowerName.contains("_m_") ||
                     lowerName.endsWith("-m") ||
-                    // Google TTS hi-IN / en-IN standard male voice codes (B, D, hib, hid, hif)
-                    lowerName.contains("hi-in-x-hib") ||
+                    // Google TTS hi-IN male voice IDs (him, hid, hib)
+                    lowerName.contains("hi-in-x-him") ||
                     lowerName.contains("hi-in-x-hid") ||
-                    lowerName.contains("hi-in-x-hif") ||
+                    lowerName.contains("hi-in-x-hib") ||
                     lowerName.contains("wavenet-b") ||
                     lowerName.contains("wavenet-d") ||
                     lowerName.contains("standard-b") ||
@@ -1300,38 +1389,43 @@ class ForegroundTtsManager private constructor(context: Context) {
                 when {
                     isExplicitFemale -> detectedFemales.add(voice)
                     isExplicitMale -> detectedMales.add(voice)
-                    else -> unclassified.add(voice)
                 }
             }
 
-            // Partition any remaining unclassified voices evenly so both femaleVoices and maleVoices are always non-empty
-            unclassified.forEachIndexed { idx, voice ->
-                if (idx % 2 == 0) {
-                    detectedFemales.add(voice)
-                } else {
-                    detectedMales.add(voice)
-                }
-            }
+            // Rank `hi-in-x-hif-network` / `-network` female voices at the front of femaleVoices
+            val rankedFemales = detectedFemales.sortedWith(
+                compareByDescending<Voice> {
+                    it.name.contains("hif", ignoreCase = true) && it.name.contains("network", ignoreCase = true)
+                }.thenByDescending {
+                    preferNetworkVoice && isNetworkHighQualityVoice(it)
+                }.thenByDescending { it.quality }
+            )
 
-            if (detectedFemales.isEmpty() && installedForLang.isNotEmpty()) {
-                detectedFemales.add(installedForLang.first())
-            }
-            if (detectedMales.isEmpty() && installedForLang.isNotEmpty()) {
-                detectedMales.add(installedForLang.last())
-            }
+            // Rank `hi-in-x-him-network` / `-network` male voices at the front of maleVoices
+            val rankedMales = detectedMales.sortedWith(
+                compareByDescending<Voice> {
+                    it.name.contains("him", ignoreCase = true) && it.name.contains("network", ignoreCase = true)
+                }.thenByDescending {
+                    preferNetworkVoice && isNetworkHighQualityVoice(it)
+                }.thenByDescending { it.quality }
+            )
 
             femaleVoices.clear()
-            femaleVoices.addAll(detectedFemales)
+            femaleVoices.addAll(rankedFemales)
             maleVoices.clear()
-            maleVoices.addAll(detectedMales)
+            maleVoices.addAll(rankedMales)
         } catch (_: Exception) {
         }
     }
 
     /**
-     * Automatically selects a Female TTS Voice (from [femaleVoices]) or Male TTS Voice (from [maleVoices])
-     * based on the detected character's [gender] (e.g. "Jenny" -> [SpeakerGender.FEMALE_18],
-     * "Anon" -> [SpeakerGender.MALE_18]) and calls `engine.setVoice(chosenVoice)` (`tts.setVoice()`).
+     * Automatically selects a Female TTS Voice (e.g. `hi-in-x-hif-network` from [femaleVoices]) or
+     * Male TTS Voice (e.g. `hi-in-x-him-network` from [maleVoices]) based on the detected character's
+     * [gender] ("Jenny" -> [SpeakerGender.FEMALE_18], "Anon" -> [SpeakerGender.MALE_18]) and calls
+     * `engine.setVoice(chosenVoice)`.
+     *
+     * If a voice for that specific gender is not available on the device, switches cleanly to
+     * [defaultEngineVoice] (and applies natural 18yo pitch & normal speechRate).
      */
     private fun selectGenderBasedTtsVoice(
         engine: TextToSpeech,
@@ -1339,10 +1433,10 @@ class ForegroundTtsManager private constructor(context: Context) {
         gender: SpeakerGender,
         voiceIndex: Int,
         preferNetworkVoice: Boolean
-    ) {
-        try {
-            if (femaleVoices.isEmpty() || maleVoices.isEmpty()) {
-                populateGenderVoiceCatalog(engine, targetLanguage)
+    ): Voice? {
+        return try {
+            if (femaleVoices.isEmpty() && maleVoices.isEmpty()) {
+                populateGenderVoiceCatalog(engine, targetLanguage, preferNetworkVoice)
             }
 
             val genderPool: List<Voice> = when (gender) {
@@ -1350,17 +1444,36 @@ class ForegroundTtsManager private constructor(context: Context) {
                 SpeakerGender.MALE_18 -> maleVoices
             }
 
-            if (genderPool.isNotEmpty()) {
+            val fallbackDefault: Voice? = defaultEngineVoice ?: try {
+                engine.defaultVoice ?: engine.voice
+            } catch (_: Exception) {
+                null
+            }
+
+            val chosenVoice: Voice? = if (genderPool.isNotEmpty()) {
                 val langFiltered = genderPool.filter {
                     it.locale?.language.equals(targetLanguage.code, ignoreCase = true)
                 }.ifEmpty { genderPool }
 
-                val chosenVoice = langFiltered[voiceIndex.coerceAtLeast(0) % langFiltered.size]
-                if (engine.voice?.name != chosenVoice.name) {
-                    engine.setVoice(chosenVoice)
+                val orderedPool = if (preferNetworkVoice) {
+                    langFiltered.sortedByDescending { isNetworkHighQualityVoice(it) }
+                } else {
+                    langFiltered.sortedBy { isNetworkHighQualityVoice(it) }
                 }
+
+                // Index 0 always picks the top-ranked network voice (e.g. hi-in-x-hif-network or hi-in-x-him-network)
+                orderedPool[voiceIndex.coerceAtLeast(0) % orderedPool.size]
+            } else {
+                // Specific gender voice not found on device -> gracefully switch to default voice
+                fallbackDefault
             }
+
+            if (chosenVoice != null && engine.voice?.name != chosenVoice.name) {
+                engine.setVoice(chosenVoice)
+            }
+            chosenVoice ?: fallbackDefault
         } catch (_: Exception) {
+            null
         }
     }
 

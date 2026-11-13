@@ -41,14 +41,14 @@ enum class SpeakerGender(
     FEMALE_18(
         code = "female_18",
         displayLabel = "18yo Girl (Female TTS Voice)",
-        defaultPitch18Yo = 1.22f,
-        defaultSpeechRate18Yo = 1.04f
+        defaultPitch18Yo = 1.18f,
+        defaultSpeechRate18Yo = 1.0f
     ),
     MALE_18(
         code = "male_18",
         displayLabel = "18yo Boy (Male TTS Voice)",
         defaultPitch18Yo = 0.90f,
-        defaultSpeechRate18Yo = 1.02f
+        defaultSpeechRate18Yo = 1.0f
     );
 
     companion object {
@@ -142,7 +142,7 @@ object VoiceProfileRepository {
             description = "Bright, expressive 18-year-old young female TTS voice for Jenny & female characters",
             pitch = SpeakerGender.FEMALE_18.defaultPitch18Yo,
             speechRate = SpeakerGender.FEMALE_18.defaultSpeechRate18Yo,
-            engineVoiceIndex = 1,
+            engineVoiceIndex = 0,
             assignedRole = SpeakerRole.CHARACTER_B,
             gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
@@ -151,9 +151,9 @@ object VoiceProfileRepository {
             id = "preset_char_c_boss",
             name = "Kaal • Male Boss Voice",
             description = "Deep male voice for bosses, guards & villains",
-            pitch = 0.76f,
-            speechRate = 0.94f,
-            engineVoiceIndex = 2,
+            pitch = 0.78f,
+            speechRate = 0.98f,
+            engineVoiceIndex = 1,
             assignedRole = SpeakerRole.CHARACTER_C,
             gender = SpeakerGender.MALE_18,
             isCustomCloned = false
@@ -162,9 +162,9 @@ object VoiceProfileRepository {
             id = "preset_narrator_ai",
             name = "Ira-AI • Female Narrator",
             description = "Crisp young female voice for game terminals, quests & narration",
-            pitch = 1.16f,
-            speechRate = 1.04f,
-            engineVoiceIndex = 3,
+            pitch = 1.15f,
+            speechRate = 1.0f,
+            engineVoiceIndex = 1,
             assignedRole = SpeakerRole.NARRATOR,
             gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
@@ -220,11 +220,16 @@ object VoiceProfileRepository {
                 _voices.value = defaultPresets
                 _selectedVoiceId.value = defaultPresets.first().id
             } else {
-                _voices.value = loaded
-                _selectedVoiceId.value = if (loaded.any { it.id == selectedId }) {
+                // Keep user-created custom cloned voices intact while ensuring built-in presets use updated 18yo natural pitch/rate
+                val updatedWithLatestPresets = loaded.map { existing ->
+                    val matchingPreset = defaultPresets.find { it.id == existing.id && !existing.isCustomCloned }
+                    matchingPreset ?: existing
+                }
+                _voices.value = updatedWithLatestPresets
+                _selectedVoiceId.value = if (updatedWithLatestPresets.any { it.id == selectedId }) {
                     selectedId
                 } else {
-                    loaded.first().id
+                    updatedWithLatestPresets.first().id
                 }
             }
         }
