@@ -39,6 +39,7 @@ import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
 import com.example.data.TranslatorStateRepository
+import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
 import java.util.Locale
 import kotlin.math.abs
@@ -1001,6 +1002,173 @@ class FloatingOverlayController(
                 setPadding(0, dpToPx(2), 0, dpToPx(8))
             }
             sheetCard.addView(statusTv)
+
+            // P0: Change Current Character Voice Quick Panel
+            val activeCharAssignment = VoiceProfileRepository.activeCharacterAssignment.value
+                ?: VoiceProfileRepository.characterAssignments.value.first()
+            var currentPreviewSid = activeCharAssignment.speakerId
+            val charDisplayName = activeCharAssignment.displayName
+
+            val voiceBox = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dpToPx(12), dpToPx(10), dpToPx(12), dpToPx(12))
+                val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dpToPx(12)
+                }
+                layoutParams = lp
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(14).toFloat()
+                    setColor(Color.parseColor("#1E293B"))
+                    setStroke(dpToPx(1), Color.parseColor("#818CF8"))
+                }
+            }
+
+            val voiceHeaderTv = TextView(context).apply {
+                text = "Change Current Character Voice"
+                setTextColor(Color.parseColor("#A5B4FC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            voiceBox.addView(voiceHeaderTv)
+
+            val charNameTv = TextView(context).apply {
+                text = "Character: $charDisplayName (Supertonic 3 • sid: 0..9)"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, dpToPx(2), 0, dpToPx(8))
+            }
+            voiceBox.addView(charNameTv)
+
+            val speakerLabels = listOf(
+                "Sid 0: Anon (Male Lead)",
+                "Sid 1: Jenny (Female Lead)",
+                "Sid 2: Alex (Scout)",
+                "Sid 3: Ira (AI Narrator)",
+                "Sid 4: Guard (Sentinel)",
+                "Sid 5: Sarah (Commander)",
+                "Sid 6: Kaal (Boss / Villain)",
+                "Sid 7: Priya (Princess)",
+                "Sid 8: Vikram (Veteran)",
+                "Sid 9: Oracle (Mystic)"
+            )
+
+            val cyclerRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dpToPx(10)
+                }
+                layoutParams = lp
+            }
+
+            val sidLabelTv = TextView(context).apply {
+                text = speakerLabels.getOrElse(currentPreviewSid) { "Sid $currentPreviewSid" }
+                setTextColor(Color.parseColor("#38BDF8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val prevSidBtn = Button(context).apply {
+                text = "◀ Prev"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(8).toFloat()
+                    setColor(Color.parseColor("#334155"))
+                }
+                layoutParams = LinearLayout.LayoutParams(dpToPx(72), dpToPx(34))
+                setOnClickListener {
+                    currentPreviewSid = (currentPreviewSid - 1 + 10) % 10
+                    sidLabelTv.text = speakerLabels.getOrElse(currentPreviewSid) { "Sid $currentPreviewSid" }
+                }
+            }
+
+            val nextSidBtn = Button(context).apply {
+                text = "Next ▶"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(8).toFloat()
+                    setColor(Color.parseColor("#334155"))
+                }
+                layoutParams = LinearLayout.LayoutParams(dpToPx(72), dpToPx(34))
+                setOnClickListener {
+                    currentPreviewSid = (currentPreviewSid + 1) % 10
+                    sidLabelTv.text = speakerLabels.getOrElse(currentPreviewSid) { "Sid $currentPreviewSid" }
+                }
+            }
+
+            cyclerRow.addView(prevSidBtn)
+            cyclerRow.addView(sidLabelTv)
+            cyclerRow.addView(nextSidBtn)
+            voiceBox.addView(cyclerRow)
+
+            val voiceActionRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val previewBtn = Button(context).apply {
+                text = "▶ Preview"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(8).toFloat()
+                    setColor(Color.parseColor("#4338CA"))
+                }
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(36), 1f).apply {
+                    marginEnd = dpToPx(6)
+                }
+                setOnClickListener {
+                    val previewProfile = VoiceProfile(
+                        id = "preview_sid_$currentPreviewSid",
+                        name = "Supertonic Sid #$currentPreviewSid",
+                        description = "Preview",
+                        pitch = 1.0f,
+                        speechRate = 1.0f,
+                        engineVoiceIndex = currentPreviewSid
+                    )
+                    ForegroundTtsManager.getInstance(context).speakNonBlocking(
+                        text = "नमस्ते, मैं $charDisplayName की आवाज़ हूँ।",
+                        voiceProfile = previewProfile
+                    )
+                }
+            }
+
+            val saveOverrideBtn = Button(context).apply {
+                text = "✓ Always Use"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(8).toFloat()
+                    setColor(Color.parseColor("#059669"))
+                }
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(36), 1f).apply {
+                    marginStart = dpToPx(6)
+                }
+                setOnClickListener {
+                    VoiceProfileRepository.setUserOverrideForCharacter(
+                        context = context,
+                        characterName = activeCharAssignment.characterName,
+                        sid = currentPreviewSid,
+                        displayName = charDisplayName
+                    )
+                    text = "Saved!"
+                    postDelayed({ text = "✓ Always Use" }, 2000L)
+                }
+            }
+
+            voiceActionRow.addView(previewBtn)
+            voiceActionRow.addView(saveOverrideBtn)
+            voiceBox.addView(voiceActionRow)
+
+            sheetCard.addView(voiceBox)
 
             // Subtitle Region controls + Snap Bottom
             val regionRow = LinearLayout(context).apply {

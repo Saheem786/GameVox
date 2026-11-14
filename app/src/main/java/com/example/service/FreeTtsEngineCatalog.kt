@@ -15,6 +15,11 @@ enum class FreeVoiceBackend(
     val displayLabel: String,
     val subtitle: String
 ) {
+    SHERPA_SUPERTONIC_DIRECT(
+        code = "sherpa_supertonic_direct",
+        displayLabel = "Sherpa-ONNX Supertonic 3 (In-Process Neural)",
+        subtitle = "Direct on-device neural voice with 10 speaker IDs & 20+ persistent character profiles (Zero API keys)"
+    ),
     ANDROID_USER_SELECTED(
         code = "android_user_selected",
         displayLabel = "Android System / Supertonic 3 TTS (Free)",

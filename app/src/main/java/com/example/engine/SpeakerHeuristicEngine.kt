@@ -282,6 +282,7 @@ object SpeakerHeuristicEngine {
             }
 
             return dynamicTagGenderMemory.getOrPut(normFull) {
+                // Unknown speaker: do not infer gender with certainty; assign default profile with user override
                 SpeakerGender.MALE_18
             }
         }

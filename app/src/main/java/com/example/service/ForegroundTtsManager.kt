@@ -133,6 +133,7 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private val appContext: Context = context.applicationContext
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    val sherpaEngine = SherpaSupertonicBackend(appContext)
     private val kokoroEngine = KokoroMediaPipeTtsEngine.getInstance(appContext)
 
     private val downloadListeners = CopyOnWriteArraySet<VoiceDataDownloadListener>()
@@ -1233,6 +1234,107 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
+        // 1. Direct in-process Sherpa-ONNX Supertonic 3 Neural TTS Path
+        if (state.freeVoiceBackend == FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT || SupertonicModelManager.isModelReady(appContext)) {
+            val epoch = _playbackEpoch.incrementAndGet()
+            val activeAssignment = VoiceProfileRepository.activeCharacterAssignment.value
+            val sid = activeAssignment?.speakerId ?: (voiceProfile?.engineVoiceIndex ?: 0)
+            val speed = activeAssignment?.speed ?: (voiceProfile?.speechRate ?: 1.0f)
+            val pitch = activeAssignment?.pitch ?: (voiceProfile?.pitch ?: 1.0f)
+            val utteranceId = "sherpa_${UUID.randomUUID().toString().take(8)}"
+
+            isSpeakingUtterance = true
+            activeUtteranceId = utteranceId
+            startRealtimeVisualizerSync(
+                utteranceId = utteranceId,
+                text = emotionResult.cleanSpokenText,
+                voiceProfile = voiceProfile,
+                emotionResult = emotionResult,
+                overrideVoiceName = "Supertonic 3 (Sid #$sid • ${activeAssignment?.displayName ?: "Voice"})"
+            )
+
+            managerScope.launch(Dispatchers.Default) {
+                val success = sherpaEngine.synthesizeAndPlay(
+                    text = emotionResult.cleanSpokenText,
+                    sid = sid,
+                    speed = speed,
+                    pitch = pitch,
+                    epoch = epoch,
+                    onFirstAudioStarted = { latencyMs ->
+                        TranslatorStateRepository.updateDiagnosisMetrics(
+                            ttsFirstAudioLatencyMs = latencyMs,
+                            activeVoiceName = "Supertonic 3 (Sid #$sid • ${activeAssignment?.displayName ?: "Voice"})"
+                        )
+                    },
+                    onCompleted = {
+                        if (_playbackEpoch.get() == epoch) {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                            TranslatorStateRepository.updateDiagnosisMetrics(
+                                ttsSynthesisRtf = sherpaEngine.lastSynthesisRtf,
+                                activeVoiceName = "Supertonic 3 (Sid #$sid • ${activeAssignment?.displayName ?: "Voice"})"
+                            )
+                            TranslatorStateRepository.updateTtsLifecycleEvent(
+                                event = "onDone(SherpaSupertonic)",
+                                utteranceId = utteranceId,
+                                error = ""
+                            )
+                            onUtteranceCompletedImmediately?.invoke(utteranceId)
+                            thirtySecondRepeatDelayJob?.cancel()
+                            thirtySecondRepeatDelayJob = managerScope.launch {
+                                delay(30000L)
+                                onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
+                            }
+                        }
+                    },
+                    onError = { err ->
+                        Log.w(TAG, "Sherpa Supertonic fallback: $err")
+                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                            backendType = "SYSTEM_FALLBACK",
+                            modelLoaded = false,
+                            modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
+                            speakerCount = sherpaEngine.numSpeakers,
+                            selectedSid = sid,
+                            modelVersion = SupertonicModelManager.modelInfo.version,
+                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                            configuredSteps = sherpaEngine.configuredNumSteps,
+                            lastError = err
+                        )
+                        TranslatorStateRepository.updateDiagnosisMetrics(
+                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($err)"
+                        )
+                        if (_playbackEpoch.get() == epoch) {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                            if (!isBenchmarkRun) {
+                                speakOnAndroidTts(
+                                    text = text,
+                                    sourceEnglishText = sourceEnglishText,
+                                    voiceProfile = voiceProfile,
+                                    isBenchmarkRun = false
+                                )
+                            }
+                        }
+                    }
+                )
+
+                if (!success && _playbackEpoch.get() == epoch && !isBenchmarkRun) {
+                    managerScope.launch(Dispatchers.Main) {
+                        speakOnAndroidTts(
+                            text = text,
+                            sourceEnglishText = sourceEnglishText,
+                            voiceProfile = voiceProfile,
+                            isBenchmarkRun = false
+                        )
+                    }
+                }
+            }
+            return true
+        }
+
+        // 2. Optional Google MediaPipe Kokoro-82M on-device model path
         if (state.freeVoiceBackend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
             val discovery = kokoroEngine.discoverModelFile(state.kokoroModelPath)
             if (discovery.resolvedFile != null) {
@@ -1297,6 +1399,7 @@ class ForegroundTtsManager private constructor(context: Context) {
             }
         }
 
+        // 3. Android System / Preferred Engine Fallback
         return speakOnAndroidTts(
             text = text,
             sourceEnglishText = sourceEnglishText,
@@ -1313,6 +1416,42 @@ class ForegroundTtsManager private constructor(context: Context) {
     fun runVoiceBenchmark(sampleText: String? = null): Boolean {
         val state = TranslatorStateRepository.state.value
         val text = sampleText?.trim().orEmpty().ifBlank { state.targetLanguage.sampleGreeting }
+
+        if (state.freeVoiceBackend == FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT) {
+            if (!sherpaEngine.isReady && !sherpaEngine.initialize()) {
+                TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                    isRunningBenchmark = false,
+                    summary = "Cannot benchmark Sherpa-ONNX: Supertonic model not installed in filesDir. Download model first."
+                )
+                return false
+            }
+            TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                isRunningBenchmark = true,
+                summary = "Benchmarking Sherpa-ONNX Supertonic 3 (5 vs 8 steps on CPU)..."
+            )
+            managerScope.launch(Dispatchers.Default) {
+                val results = sherpaEngine.benchmarkSteps(text, listOf(5, 8))
+                val summaryText = if (results.isNotEmpty()) {
+                    results.joinToString(" • ") { res ->
+                        "${res.numSteps} steps: ${res.generationTimeMs}ms (RTF: ${String.format(Locale.US, "%.2fx", res.realTimeFactor)})"
+                    }
+                } else {
+                    "Sherpa benchmark completed with no audio samples"
+                }
+                TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                    isRunningBenchmark = false,
+                    summary = "Supertonic Hindi: $summaryText"
+                )
+                val firstResult = results.firstOrNull()
+                if (firstResult != null) {
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        ttsFirstAudioLatencyMs = firstResult.generationTimeMs,
+                        ttsSynthesisRtf = firstResult.realTimeFactor
+                    )
+                }
+            }
+            return true
+        }
 
         if (state.freeVoiceBackend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
             val discovery = kokoroEngine.discoverModelFile(state.kokoroModelPath)
@@ -1976,6 +2115,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         activeUtteranceId = null
         CloudTtsService.stopPlayback()
         kokoroEngine.stopPlayback()
+        sherpaEngine.stop()
         try {
             tts?.stop()
         } catch (_: Exception) {

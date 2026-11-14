@@ -1,0 +1,59 @@
+ROLE: Senior Android Engineer + On-device TTS Engineer + QA Lead.
+TASK: IMPLEMENT (not merely describe) a proper FREE, DIRECT, ON-DEVICE neural Hindi voice backend with 20+ persistent character assignments in my EXISTING GameVox Android Kotlin app.
+
+CURRENT VERIFIED CONTEXT:
+- Device: POCO X7 Pro, Android 16. In system Preferred Engine screen, "TTS Engine: Next-gen Kaldi" is selected and Google's Speech Recognition and Synthesis is also installed.
+- Current GameVox project already contains OCR / English-to-modern-Hindi translator / MediaProjection / floating overlay / speaker heuristic / voice profiles / Android TextToSpeech / free-only policy.
+- Actual defect: Android system TTS selection does not expose reliable per-dialogue sid changes for 15–20 characters; simply changing pitch/rate or voiceIndex is NOT equivalent to independent neural voices.
+- Only 10 Supertonic-3 base speaker IDs (0–9). Support 20+ CHARACTER PROFILES, but DO NOT claim 20 acoustically unique base voices.
+- Previous P0/P1 rotation, OCR, free-only fixes and tests must not be lost.
+
+FIRST: INSPECT ACTUAL PROJECT FILES BEFORE MODIFYING.
+Priority files (paths relative to app/src/main/java/com/example):
+- data/VoiceProfileRepository.kt
+- engine/SpeakerHeuristicEngine.kt
+- engine/OcrTranslationPipeline.kt
+- engine/SubtitleDubbingQueue.kt
+- service/ForegroundTtsManager.kt
+- service/ScreenTranslatorService.kt
+- service/FloatingOverlayController.kt
+- ui/VoiceManagerScreen.kt
+- ui/VoiceManagerSection.kt
+- ui/DiagnosisScreen.kt
+- service/FreeVoicePolicy.kt
+- app/build.gradle.kts and AndroidManifest.xml
+Preserve existing code and stored user custom-character bindings. Report source-backed defect details first.
+
+IMPLEMENTATION — P0 (required):
+1. Implement an actual IN-PROCESS sherpa-onnx Supertonic 3 Hindi voice backend. Obtain official Android arm64-v8a JNI/AAR binaries and matching Supertonic 3 INT8 model assets ONLY from the official k2-fsa/sherpa-onnx release and model pages. Do not use unofficial binaries or a paid hosted API. Include version, license and SHA-256 / integrity checking for downloaded model files; user-initiated download over Wi-Fi, app-private storage, model size warning, status and uninstall/delete.
+   Official references:
+   https://github.com/k2-fsa/sherpa-onnx/blob/master/sherpa-onnx/kotlin-api/Tts.kt
+   https://k2-fsa.github.io/sherpa/onnx/tts/all/Hindi/supertonic-3-hi.html
+   https://github.com/k2-fsa/sherpa-onnx/tree/master/android/SherpaOnnxTtsEngine
+2. Follow the Kotlin API of THE PINNED SHERPA VERSION. Initialize an OfflineTts once using the correct Supertonic-3 model config (duration_predictor, text_encoder, vector_estimator, vocoder, tts_json, unicode_indexer, voice_style, appropriate data files). Verify tts.numSpeakers() and allow only sid in 0 until numSpeakers()-1. Use GenerationConfig(sid = selectedSid, speed = selectedSpeed, numSteps = benchmarkedValue) with generateWithConfigAndCallback() where supported. Do not assume the Android system TextToSpeech.setVoice() or Google voice names can control Supertonic sid.
+3. Implement a NeuralTtsEngine interface plus SherpaSupertonicBackend and AndroidSystemTtsFallback. Generate PCM off the main thread and stream to AudioTrack with the model's reported sample rate and correct mono PCM conversion. Add a single synthesis queue, explicit cancellation/session epoch, AudioTrack stop/release, buffer cleanup, and safe shutdown when overlay stops. Ensure no double playback. Do not conflate generation complete with first audible audio time.
+4. True per-character voice assignment: persistent per-game normalized characterName -> backendId + modelId + speakerId + speed + pitch (only where supported) + userOverride. Use Room/DataStore/SharedPreferences migration as appropriate. Preserve existing customTagVoiceBindings and previous voice profiles. Support 20+ character profiles (not 20 distinct base voices). Use the existing speaker OCR parser, remove speaker name from speech text and update current speaker on every subtitle. Never infer gender with certainty from a name; unknown speakers get a default and editable override.
+5. Add a usable Character Voice Manager: detected character list, search, rename/correct OCR name, preview each actual Supertonic speaker, select sid, persist assignment, delete/reassign, and restore defaults. Manual selections must take priority over heuristic guesses across app restarts. Do not assign every female to the same pitch-shifted voice while claiming they're unique.
+6. Floating button long-press -> "Change current character voice" quick panel with the actual detected character name, current model/speaker ID, previous and next voice, play preview, Save / Always use for this name. Single tap remains start/stop; do not break existing gestures.
+7. Keep strict free-only voice generation. No ElevenLabs, Google Cloud TTS, Azure, paid APIs, cloud quota or credit schemes in the default or fallback paths. Local downloaded model may require Internet for FIRST download only. Google/Android system TTS can remain as no-cost fallback if model unavailable; explicitly label which backend is active.
+8. Important: existing 'custom cloned' profile based on microphone F0/pitch/rate analysis is NOT true voice cloning. Do not label it as real voice cloning. Rename to 'voice-style preset' unless independently implementing a supported, license-compliant true voice-clone model and validating output.
+
+IMPLEMENTATION — P1 (after P0 works):
+9. Performance: warm up inference in a background coroutine after user enables dubbing; avoid OCR/MediaProjection frame drops; release resources when game stops. For each subtitle measure timestamp from first OCR detection to translated text ready, synthesis first PCM chunk, and audible AudioTrack start. Report p50/p95 plus audio length, device temperature/FPS qualitative observations and CPU/memory. The <=1.5s time-to-first-audio is a TARGET only, never assert without device measurement.
+10. Spoken Hindi: natural contemporary Hindi, proper names pronunciation, no textbook Sanskritized Hindi, no repetitive interjections, and proper punctuation. Use on-device translation and local glossary in free-only mode. Emotion controls only where actual model supports them; do not fake 'anger' or 'sadness' with arbitrary pitch alone.
+11. Optionally benchmark Kokoro Hindi as a SECOND engine only after a working Supertonic P0; honor separate model/license/ABI/voice-count constraints. Do not download all models silently.
+
+TESTS AND ACCEPTANCE:
+A. Automated unit tests for normalized names, case/spacing, exact user overrides, per-game memory, migration from existing bindings, duplicate OCR lines, unknown speaker, 20 or more profiles, sid bounds, queue cancellation and same-name voice persistence.
+B. Android tests or debug telemetry proving 2 subsequent lines labelled 'Anon' and 'Jenny' invoke Supertonic-3 with DIFFERENT sid values and audible outputs. Verify the real audio files (not just UI names) differ, and check that repeating a name restores the same sid.
+C. Strictly no paid API requests in Free Only mode. Unplug network AFTER model download; verify Hindi voice still plays.
+D. Real POCO X7 Pro Android 16 device testing is REQUIRED for audible voice quality, latency, crashes, GameVox overlay, and FPS. If no device/adb, state NOT TESTED on device; do not claim success just because Robolectric or APK compile passed.
+E. Display diagnostics: Active backend [Sherpa-ONNX Direct / Android system], model version, speaker sid, recognized character name, user override, TTS start/onError, OCR-to-first-audio latency. The system setting 'Next-gen Kaldi' does NOT by itself prove in-app direct neural mode is working.
+F. Run ./gradlew testDebugUnitTest assembleDebug --no-daemon --stacktrace; if dependencies cannot download or Android SDK unavailable, report it as a blocker, not a passing test.
+
+OUTPUT REQUIRED:
+- Start by listing existing source defects with file and function names.
+- Then WRITE the changed/added Kotlin/Gradle/Manifest/UI files in THIS EXISTING project, not pseudocode.
+- Provide complete list of changed files, compatible model downloads and installation steps, unit/build logs and a debug APK if built.
+- Clearly state which of these are VERIFIED BY CODE, VERIFIED BY BUILD, VERIFIED BY DEVICE or NOT VERIFIED.
+- Stop if you cannot fetch verified official sherpa-onnx binary/model; provide the real blocker and don't simulate neural speech.

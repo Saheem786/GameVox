@@ -207,6 +207,15 @@ data class TranslatorAppState(
     val userElevenLabsApiKey: String = "",
     val userOpenAiApiKey: String = "",
     val activeApiKeyStatusNote: String = "100% Free Neural / On-Device TTS (No API key or billing)",
+    val voiceBackendType: String = "SYSTEM_FALLBACK", // "SHERPA_DIRECT" or "SYSTEM_FALLBACK"
+    val sherpaModelLoaded: Boolean = false,
+    val sherpaModelPath: String = "",
+    val sherpaSpeakerCount: Int = 10,
+    val sherpaSelectedSid: Int = 0,
+    val sherpaModelVersion: String = "v3.0.0-int8-2026-05-11 (OpenRAIL-M)",
+    val sherpaJniLoadResult: String = "NOT TESTED (Physical Android device required)",
+    val ttsSynthesisRtf: Float = 0.0f,
+    val sherpaConfiguredSteps: Int = 5,
     val activeVoiceName: String = "User-Selected Android TTS (hi-IN)",
     val availableVoicesCount: Int = 0,
     val voiceDownloadMessage: String = "Checking user-selected Android TTS engine...",
@@ -219,8 +228,12 @@ data class TranslatorAppState(
     val totalPipelineLatencyMs: Long = 0L,
     val ttsInitLatencyMs: Long = 0L,
     val ttsFirstAudioLatencyMs: Long = 0L,
+    val ttsFirstPcmChunkLatencyMs: Long = 0L,
+    val ttsAudioTrackWriteLatencyMs: Long = 0L,
+    val ttsEstimatedPlayoutLatencyMs: Long = 0L,
     val ttsSpeechDurationMs: Long = 0L,
     val isRunningTtsBenchmark: Boolean = false,
+    val isRealHardwareBenchmark: Boolean = false,
     val ttsBenchmarkSummary: String = "Not run yet — tap Run TTS Benchmark on an Android device",
     val roiDimensionsText: String = "—",
     val lastTtsEvent: String = "IDLE",
@@ -468,16 +481,24 @@ object TranslatorStateRepository {
     fun updateTtsLatencyBenchmarks(
         initLatencyMs: Long? = null,
         firstAudioLatencyMs: Long? = null,
+        firstPcmChunkLatencyMs: Long? = null,
+        audioTrackWriteLatencyMs: Long? = null,
+        estimatedPlayoutLatencyMs: Long? = null,
         speechDurationMs: Long? = null,
         isRunningBenchmark: Boolean? = null,
+        isRealHardware: Boolean? = null,
         summary: String? = null
     ) {
         _state.update { current ->
             current.copy(
                 ttsInitLatencyMs = initLatencyMs ?: current.ttsInitLatencyMs,
                 ttsFirstAudioLatencyMs = firstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs,
+                ttsFirstPcmChunkLatencyMs = firstPcmChunkLatencyMs ?: current.ttsFirstPcmChunkLatencyMs,
+                ttsAudioTrackWriteLatencyMs = audioTrackWriteLatencyMs ?: current.ttsAudioTrackWriteLatencyMs,
+                ttsEstimatedPlayoutLatencyMs = estimatedPlayoutLatencyMs ?: current.ttsEstimatedPlayoutLatencyMs,
                 ttsSpeechDurationMs = speechDurationMs ?: current.ttsSpeechDurationMs,
                 isRunningTtsBenchmark = isRunningBenchmark ?: current.isRunningTtsBenchmark,
+                isRealHardwareBenchmark = isRealHardware ?: current.isRealHardwareBenchmark,
                 ttsBenchmarkSummary = summary ?: current.ttsBenchmarkSummary
             )
         }
@@ -780,7 +801,13 @@ object TranslatorStateRepository {
         totalPipelineLatencyMs: Long? = null,
         roiDimensionsText: String? = null,
         translationSourceLabel: String? = null,
-        lastPipelineError: String? = null
+        lastPipelineError: String? = null,
+        ttsFirstAudioLatencyMs: Long? = null,
+        ttsFirstPcmChunkLatencyMs: Long? = null,
+        ttsAudioTrackWriteLatencyMs: Long? = null,
+        ttsEstimatedPlayoutLatencyMs: Long? = null,
+        ttsSynthesisRtf: Float? = null,
+        activeVoiceName: String? = null
     ) {
         _state.update { current ->
             current.copy(
@@ -790,7 +817,49 @@ object TranslatorStateRepository {
                 totalPipelineLatencyMs = totalPipelineLatencyMs ?: current.totalPipelineLatencyMs,
                 roiDimensionsText = roiDimensionsText ?: current.roiDimensionsText,
                 translationSourceLabel = translationSourceLabel ?: current.translationSourceLabel,
-                lastPipelineError = lastPipelineError ?: current.lastPipelineError
+                lastPipelineError = lastPipelineError ?: current.lastPipelineError,
+                ttsFirstAudioLatencyMs = ttsFirstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs,
+                ttsFirstPcmChunkLatencyMs = ttsFirstPcmChunkLatencyMs ?: current.ttsFirstPcmChunkLatencyMs,
+                ttsAudioTrackWriteLatencyMs = ttsAudioTrackWriteLatencyMs ?: current.ttsAudioTrackWriteLatencyMs,
+                ttsEstimatedPlayoutLatencyMs = ttsEstimatedPlayoutLatencyMs ?: current.ttsEstimatedPlayoutLatencyMs,
+                ttsSynthesisRtf = ttsSynthesisRtf ?: current.ttsSynthesisRtf,
+                activeVoiceName = activeVoiceName ?: current.activeVoiceName
+            )
+        }
+    }
+
+    fun updateVoiceEngineDiagnostics(
+        backendType: String,
+        modelLoaded: Boolean,
+        modelPath: String,
+        speakerCount: Int,
+        selectedSid: Int,
+        modelVersion: String,
+        jniLoadResult: String,
+        configuredSteps: Int,
+        firstAudioLatencyMs: Long? = null,
+        firstPcmChunkLatencyMs: Long? = null,
+        audioTrackWriteLatencyMs: Long? = null,
+        estimatedPlayoutLatencyMs: Long? = null,
+        synthesisRtf: Float? = null,
+        lastError: String? = null
+    ) {
+        _state.update { current ->
+            current.copy(
+                voiceBackendType = backendType,
+                sherpaModelLoaded = modelLoaded,
+                sherpaModelPath = modelPath,
+                sherpaSpeakerCount = speakerCount,
+                sherpaSelectedSid = selectedSid,
+                sherpaModelVersion = modelVersion,
+                sherpaJniLoadResult = jniLoadResult,
+                sherpaConfiguredSteps = configuredSteps,
+                ttsFirstAudioLatencyMs = firstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs,
+                ttsFirstPcmChunkLatencyMs = firstPcmChunkLatencyMs ?: current.ttsFirstPcmChunkLatencyMs,
+                ttsAudioTrackWriteLatencyMs = audioTrackWriteLatencyMs ?: current.ttsAudioTrackWriteLatencyMs,
+                ttsEstimatedPlayoutLatencyMs = estimatedPlayoutLatencyMs ?: current.ttsEstimatedPlayoutLatencyMs,
+                ttsSynthesisRtf = synthesisRtf ?: current.ttsSynthesisRtf,
+                lastTtsError = lastError ?: current.lastTtsError
             )
         }
     }

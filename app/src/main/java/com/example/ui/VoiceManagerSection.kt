@@ -349,7 +349,7 @@ internal fun VoiceProfileCardItem(
                                     contentColor = SaffronGold
                                 ) {
                                     Text(
-                                        text = "CLONED",
+                                        text = "PRESET",
                                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                                     )
                                 }
@@ -522,7 +522,7 @@ internal fun AddClonedVoiceDialog(
         containerColor = MaterialTheme.colorScheme.surface,
         title = {
             Text(
-                text = "Add New Voice",
+                text = "Add Voice-Style Preset",
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface
             )

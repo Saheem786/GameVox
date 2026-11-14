@@ -123,6 +123,7 @@ object VoiceProfileRepository {
     private const val KEY_MULTI_SPEAKER_ENABLED = "multi_speaker_enabled_v1"
     private const val KEY_ROLE_ASSIGNMENTS_JSON = "role_voice_assignments_json_v1"
     private const val KEY_CUSTOM_TAG_BINDINGS_JSON = "custom_tag_voice_bindings_json_v1"
+    private const val KEY_CHARACTER_ASSIGNMENTS_JSON = "character_voice_assignments_json_v2"
 
     private val defaultPresets = listOf(
         VoiceProfile(
@@ -142,7 +143,7 @@ object VoiceProfileRepository {
             description = "Bright, expressive 18-year-old young female TTS voice for Jenny & female characters",
             pitch = SpeakerGender.FEMALE_18.defaultPitch18Yo,
             speechRate = SpeakerGender.FEMALE_18.defaultSpeechRate18Yo,
-            engineVoiceIndex = 0,
+            engineVoiceIndex = 1,
             assignedRole = SpeakerRole.CHARACTER_B,
             gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
@@ -153,7 +154,7 @@ object VoiceProfileRepository {
             description = "Deep male voice for bosses, guards & villains",
             pitch = 0.78f,
             speechRate = 0.98f,
-            engineVoiceIndex = 1,
+            engineVoiceIndex = 6,
             assignedRole = SpeakerRole.CHARACTER_C,
             gender = SpeakerGender.MALE_18,
             isCustomCloned = false
@@ -164,7 +165,7 @@ object VoiceProfileRepository {
             description = "Crisp young female voice for game terminals, quests & narration",
             pitch = 1.15f,
             speechRate = 1.0f,
-            engineVoiceIndex = 1,
+            engineVoiceIndex = 3,
             assignedRole = SpeakerRole.NARRATOR,
             gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
@@ -186,6 +187,9 @@ object VoiceProfileRepository {
     private val _lastAssignedVoiceName = MutableStateFlow(defaultPresets.first().name)
     val lastAssignedVoiceName: StateFlow<String> = _lastAssignedVoiceName.asStateFlow()
 
+    private val _lastAssignedSpeakerId = MutableStateFlow(0)
+    val lastAssignedSpeakerId: StateFlow<Int> = _lastAssignedSpeakerId.asStateFlow()
+
     private val _lastHeuristicRule = MutableStateFlow("Colon Prefix Tag ('Character A' → Character A)")
     val lastHeuristicRule: StateFlow<String> = _lastHeuristicRule.asStateFlow()
 
@@ -200,9 +204,62 @@ object VoiceProfileRepository {
     private val _customTagVoiceBindings = MutableStateFlow<Map<String, String>>(emptyMap())
     val customTagVoiceBindings: StateFlow<Map<String, String>> = _customTagVoiceBindings.asStateFlow()
 
+    // 20+ Persistent Character Voice Assignments
+    private val _characterAssignments = MutableStateFlow<List<CharacterVoiceAssignment>>(
+        CharacterVoiceAssignment.DEFAULT_PRESETS
+    )
+    val characterAssignments: StateFlow<List<CharacterVoiceAssignment>> = _characterAssignments.asStateFlow()
+
+    private val _activeCharacterAssignment = MutableStateFlow<CharacterVoiceAssignment?>(
+        CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+    )
+    val activeCharacterAssignment: StateFlow<CharacterVoiceAssignment?> = _activeCharacterAssignment.asStateFlow()
+
     private var activeMediaPlayer: MediaPlayer? = null
+    private var appContext: Context? = null
+
+    @Volatile
+    private var availableSpeakerCount: Int = 10
+
+    @Volatile
+    private var activeGameNamespace: String = "default_game"
+
+    fun updateAvailableSpeakerCount(count: Int) {
+        if (count > 0) {
+            availableSpeakerCount = count
+            Log.i(TAG, "Updated available Supertonic speaker count to $count")
+        }
+    }
+
+    fun getAvailableSpeakerCount(): Int = availableSpeakerCount
+
+    fun setGameNamespace(context: Context, namespace: String) {
+        val clean = namespace.trim().lowercase(Locale.ROOT).ifBlank { "default_game" }
+        if (activeGameNamespace != clean) {
+            activeGameNamespace = clean
+            appContext = context.applicationContext
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val gameKey = "${KEY_CHARACTER_ASSIGNMENTS_JSON}_$clean"
+            val rawAssignments = prefs.getString(gameKey, null)
+                ?: prefs.getString(KEY_CHARACTER_ASSIGNMENTS_JSON, null)
+            if (!rawAssignments.isNullOrBlank()) {
+                val loadedAssignments = CharacterVoiceAssignment.parseList(rawAssignments)
+                if (loadedAssignments.isNotEmpty()) {
+                    val merged = mutableMapOf<String, CharacterVoiceAssignment>()
+                    for (preset in CharacterVoiceAssignment.DEFAULT_PRESETS) {
+                        merged[preset.characterName] = preset
+                    }
+                    for (loaded in loadedAssignments) {
+                        merged[loaded.characterName] = loaded
+                    }
+                    _characterAssignments.value = merged.values.toList()
+                }
+            }
+        }
+    }
 
     fun initialize(context: Context) {
+        appContext = context.applicationContext
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val selectedId = prefs.getString(KEY_SELECTED_VOICE_ID, defaultPresets.first().id)
             ?: defaultPresets.first().id
@@ -220,7 +277,6 @@ object VoiceProfileRepository {
                 _voices.value = defaultPresets
                 _selectedVoiceId.value = defaultPresets.first().id
             } else {
-                // Keep user-created custom cloned voices intact while ensuring built-in presets use updated 18yo natural pitch/rate
                 val updatedWithLatestPresets = loaded.map { existing ->
                     val matchingPreset = defaultPresets.find { it.id == existing.id && !existing.isCustomCloned }
                     matchingPreset ?: existing
@@ -245,6 +301,28 @@ object VoiceProfileRepository {
         val rawTags = prefs.getString(KEY_CUSTOM_TAG_BINDINGS_JSON, null)
         if (!rawTags.isNullOrBlank()) {
             _customTagVoiceBindings.value = parseCustomTagBindingsJson(rawTags)
+        }
+
+        // Load 20+ persistent Character Voice Assignments
+        val rawAssignments = prefs.getString(KEY_CHARACTER_ASSIGNMENTS_JSON, null)
+        if (!rawAssignments.isNullOrBlank()) {
+            val loadedAssignments = CharacterVoiceAssignment.parseList(rawAssignments)
+            if (loadedAssignments.isNotEmpty()) {
+                // Merge with default presets to preserve any new defaults while honoring user overrides
+                val merged = mutableMapOf<String, CharacterVoiceAssignment>()
+                for (preset in CharacterVoiceAssignment.DEFAULT_PRESETS) {
+                    merged[preset.characterName] = preset
+                }
+                for (loaded in loadedAssignments) {
+                    merged[loaded.characterName] = loaded
+                }
+                _characterAssignments.value = merged.values.toList()
+            } else {
+                _characterAssignments.value = CharacterVoiceAssignment.DEFAULT_PRESETS
+            }
+        } else {
+            _characterAssignments.value = CharacterVoiceAssignment.DEFAULT_PRESETS
+            saveCharacterAssignmentsToDisk(context, CharacterVoiceAssignment.DEFAULT_PRESETS)
         }
     }
 
@@ -343,7 +421,11 @@ object VoiceProfileRepository {
         saveVoicesToDisk(context, merged, _selectedVoiceId.value)
     }
 
-    fun addCustomClonedVoice(
+    /**
+     * Adds a user-recorded or imported voice-style preset derived from microphone F0/cadence analysis.
+     * Note: This is an acoustic pitch/rate preset, NOT true neural voice cloning.
+     */
+    fun addCustomVoiceStylePreset(
         context: Context,
         name: String,
         description: String,
@@ -352,11 +434,11 @@ object VoiceProfileRepository {
         assignedRole: SpeakerRole,
         sampleAudioPath: String?
     ): VoiceProfile {
-        val cleanName = name.trim().ifEmpty { "Cloned Voice ${_voices.value.size + 1}" }
+        val cleanName = name.trim().ifEmpty { "Voice Preset ${_voices.value.size + 1}" }
         val newProfile = VoiceProfile(
-            id = "custom_clone_${System.currentTimeMillis()}",
+            id = "voice_preset_${System.currentTimeMillis()}",
             name = cleanName,
-            description = description,
+            description = description.ifBlank { "Acoustic Voice-Style Preset" },
             pitch = pitch.coerceIn(0.45f, 1.75f),
             speechRate = speechRate.coerceIn(0.55f, 1.65f),
             engineVoiceIndex = (_voices.value.size) % 5,
@@ -371,6 +453,25 @@ object VoiceProfileRepository {
         selectVoice(context, newProfile)
         return newProfile
     }
+
+    // Backward compatibility alias
+    fun addCustomClonedVoice(
+        context: Context,
+        name: String,
+        description: String,
+        pitch: Float,
+        speechRate: Float,
+        assignedRole: SpeakerRole,
+        sampleAudioPath: String?
+    ): VoiceProfile = addCustomVoiceStylePreset(
+        context = context,
+        name = name,
+        description = description,
+        pitch = pitch,
+        speechRate = speechRate,
+        assignedRole = assignedRole,
+        sampleAudioPath = sampleAudioPath
+    )
 
     /**
      * Records a 3–5 second 16kHz Mono PCM audio sample from the device microphone,
@@ -554,11 +655,191 @@ object VoiceProfileRepository {
         }
     }
 
+    fun getAssignmentForCharacter(rawName: String, context: Context? = null): CharacterVoiceAssignment {
+        val norm = CharacterVoiceAssignment.normalizeName(rawName)
+        if (norm.isBlank()) {
+            return _characterAssignments.value.firstOrNull { it.characterName == "anon" }
+                ?: CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+        }
+
+        val currentList = _characterAssignments.value
+        // 1. User overrides and exact matches take absolute priority
+        val exactMatch = currentList.find { it.characterName == norm }
+        if (exactMatch != null) {
+            return exactMatch
+        }
+
+        // 2. Check prefix / contains match from presets or detected list
+        val partialMatch = currentList.find { norm.contains(it.characterName) || it.characterName.contains(norm) }
+        if (partialMatch != null) {
+            return partialMatch
+        }
+
+        // 3. Deterministic assignment for newly encountered character:
+        // Audited Supertonic 3 voice.bin mapping:
+        // sid 0..4 = female F1..F5, sid 5..9 = male M1..M5
+        val speakerCount = availableSpeakerCount.coerceAtLeast(1)
+        val inferredGender = SpeakerHeuristicEngine.detectCharacterGender(rawName)
+        val assignedSid = if (speakerCount >= 10) {
+            if (inferredGender == SpeakerGender.FEMALE_18) {
+                // Female characters mapped to F1..F5 (sid 0..4)
+                Math.floorMod(norm.hashCode(), 5)
+            } else {
+                // Male characters mapped to M1..M5 (sid 5..9)
+                5 + Math.floorMod(norm.hashCode(), 5)
+            }
+        } else {
+            Math.floorMod(norm.hashCode(), speakerCount)
+        }
+
+        val cleanDisplay = rawName.trim()
+            .trim('[', ']', '<', '>', '(', ')', '{', '}', ':', '：', '-', '–', '—', ' ', '【', '】', '《', '》', '「', '」', '`', '"', '\'')
+            .replace(Regex("\\s+"), " ")
+            .ifBlank { "Character ${currentList.size + 1}" }
+
+        val genderTag = if (assignedSid in 0..4) "F${assignedSid + 1} (Female)" else "M${assignedSid - 4} (Male)"
+        val newAssignment = CharacterVoiceAssignment(
+            characterName = norm,
+            displayName = cleanDisplay,
+            speakerId = assignedSid,
+            speed = 1.0f,
+            pitch = 1.0f,
+            isUserOverride = false,
+            characterRoleNote = "Dynamically Discovered • $genderTag (sid: $assignedSid)"
+        )
+
+        // Add to state list and persist dynamically discovered character name
+        val updated = currentList + newAssignment
+        _characterAssignments.value = updated
+        val targetContext = context ?: appContext
+        if (targetContext != null) {
+            saveCharacterAssignmentsToDisk(targetContext, updated)
+        }
+        return newAssignment
+    }
+
+    fun setUserOverrideForCharacter(
+        context: Context,
+        characterName: String,
+        sid: Int,
+        speed: Float = 1.0f,
+        pitch: Float = 1.0f,
+        displayName: String? = null
+    ): CharacterVoiceAssignment {
+        val norm = CharacterVoiceAssignment.normalizeName(characterName)
+        val currentList = _characterAssignments.value
+        val clampedSid = sid.coerceIn(0, 9)
+        val clampedSpeed = speed.coerceIn(0.6f, 1.5f)
+        val clampedPitch = pitch.coerceIn(0.6f, 1.5f)
+
+        val existing = currentList.find { it.characterName == norm }
+        val updatedAssignment = if (existing != null) {
+            existing.copy(
+                displayName = displayName?.trim()?.ifBlank { null } ?: existing.displayName,
+                speakerId = clampedSid,
+                speed = clampedSpeed,
+                pitch = clampedPitch,
+                isUserOverride = true,
+                lastDetectedTimestamp = System.currentTimeMillis()
+            )
+        } else {
+            CharacterVoiceAssignment(
+                characterName = norm,
+                displayName = displayName?.trim()?.ifBlank { null } ?: characterName.trim(),
+                speakerId = clampedSid,
+                speed = clampedSpeed,
+                pitch = clampedPitch,
+                isUserOverride = true,
+                lastDetectedTimestamp = System.currentTimeMillis(),
+                characterRoleNote = "User Override (sid: $clampedSid)"
+            )
+        }
+
+        val updatedList = currentList.filterNot { it.characterName == norm } + updatedAssignment
+        _characterAssignments.value = updatedList
+        _activeCharacterAssignment.value = updatedAssignment
+        _lastAssignedSpeakerId.value = clampedSid
+
+        saveCharacterAssignmentsToDisk(context, updatedList)
+        return updatedAssignment
+    }
+
+    fun renameCharacter(
+        context: Context,
+        oldNormalizedName: String,
+        newDisplayName: String
+    ): CharacterVoiceAssignment? {
+        val normOld = CharacterVoiceAssignment.normalizeName(oldNormalizedName)
+        val cleanNew = newDisplayName.trim().ifBlank { return null }
+        val normNew = CharacterVoiceAssignment.normalizeName(cleanNew)
+
+        val currentList = _characterAssignments.value
+        val existing = currentList.find { it.characterName == normOld } ?: return null
+
+        val renamed = existing.copy(
+            characterName = normNew,
+            displayName = cleanNew,
+            isUserOverride = true
+        )
+
+        val updatedList = currentList.filterNot { it.characterName == normOld || it.characterName == normNew } + renamed
+        _characterAssignments.value = updatedList
+        if (_activeCharacterAssignment.value?.characterName == normOld) {
+            _activeCharacterAssignment.value = renamed
+        }
+
+        saveCharacterAssignmentsToDisk(context, updatedList)
+        return renamed
+    }
+
+    fun resetCharacterToDefault(context: Context, characterName: String) {
+        val norm = CharacterVoiceAssignment.normalizeName(characterName)
+        val defaultMatch = CharacterVoiceAssignment.DEFAULT_PRESETS.find { it.characterName == norm }
+        val currentList = _characterAssignments.value
+
+        val updatedList = if (defaultMatch != null) {
+            currentList.filterNot { it.characterName == norm } + defaultMatch
+        } else {
+            currentList.filterNot { it.characterName == norm }
+        }
+
+        _characterAssignments.value = updatedList
+        saveCharacterAssignmentsToDisk(context, updatedList)
+    }
+
+    fun restoreAllCharacterDefaults(context: Context) {
+        _characterAssignments.value = CharacterVoiceAssignment.DEFAULT_PRESETS
+        _activeCharacterAssignment.value = CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+        saveCharacterAssignmentsToDisk(context, CharacterVoiceAssignment.DEFAULT_PRESETS)
+    }
+
+    fun deleteCharacterAssignment(context: Context, characterName: String) {
+        val norm = CharacterVoiceAssignment.normalizeName(characterName)
+        val currentList = _characterAssignments.value
+        if (currentList.size <= 1) return // Keep at least one profile
+        val updated = currentList.filterNot { it.characterName == norm }
+        _characterAssignments.value = updated
+        saveCharacterAssignmentsToDisk(context, updated)
+    }
+
+    private fun saveCharacterAssignmentsToDisk(
+        context: Context,
+        assignments: List<CharacterVoiceAssignment>
+    ) {
+        val json = CharacterVoiceAssignment.serializeList(assignments)
+        val gameKey = "${KEY_CHARACTER_ASSIGNMENTS_JSON}_$activeGameNamespace"
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CHARACTER_ASSIGNMENTS_JSON, json)
+            .putString(gameKey, json)
+            .apply()
+    }
+
     /**
      * Multi-Speaker Heuristic Dialogue Analyzer:
      * Analyzes scan results via [SpeakerHeuristicEngine] to identify character name tags
-     * (e.g., `"Character A:"`, `"[Character B]"`, `"Cybernetic Guard: ..."`, or RPG nameplate headers)
-     * and maps them to the corresponding [VoiceProfile] selected in the Voice Manager.
+     * (e.g., `"Jenny:"`, `"[Anon]"`, `"Kaal: ..."`, or RPG nameplate headers)
+     * and maps them to the corresponding persistent [CharacterVoiceAssignment] and [VoiceProfile].
      */
     fun resolveSpeakerAndVoiceForSubtitle(rawSubtitleText: String): ParsedDialogueLine {
         val allVoices = _voices.value.ifEmpty { defaultPresets }
@@ -573,16 +854,28 @@ object VoiceProfileRepository {
             multiSpeakerEnabled = _multiSpeakerEnabled.value
         )
 
-        _lastDetectedSpeaker.value = result.displaySpeakerName
-        _lastAssignedVoiceName.value = result.assignedVoice.name
+        // Resolve persistent CharacterVoiceAssignment for Supertonic 3 sid assignment
+        val candidateName = result.detectedSpeakerTag ?: result.displaySpeakerName.substringBefore(" •")
+        val characterAssignment = getAssignmentForCharacter(candidateName)
+        _activeCharacterAssignment.value = characterAssignment
+        _lastAssignedSpeakerId.value = characterAssignment.speakerId
+
+        _lastDetectedSpeaker.value = characterAssignment.displayName
+        _lastAssignedVoiceName.value = "Supertonic Sid #${characterAssignment.speakerId} (${characterAssignment.displayName})"
         _lastHeuristicRule.value = result.matchedRuleDescription
 
+        val effectiveVoice = result.assignedVoice.copy(
+            engineVoiceIndex = characterAssignment.speakerId,
+            pitch = characterAssignment.pitch,
+            speechRate = characterAssignment.speed
+        )
+
         val parsedLine = ParsedDialogueLine(
-            speakerName = result.detectedSpeakerTag ?: result.displaySpeakerName,
+            speakerName = characterAssignment.displayName,
             spokenDialogue = result.cleanedDialogueText,
             resolvedRole = result.matchedRole,
             detectedGender = result.detectedGender,
-            assignedVoice = result.assignedVoice,
+            assignedVoice = effectiveVoice,
             matchedHeuristicRule = result.matchedRuleDescription
         )
         _lastParsedDialogue.value = parsedLine
