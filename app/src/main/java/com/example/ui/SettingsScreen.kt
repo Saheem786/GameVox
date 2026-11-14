@@ -29,6 +29,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
@@ -118,7 +119,8 @@ fun SettingsScreen(
     onResetGlossaryDefaults: () -> Unit,
     onTestHindiTts: () -> Unit,
     onEnableAccessibility: () -> Unit,
-    onInstallVoiceData: () -> Unit
+    onInstallVoiceData: () -> Unit,
+    onOpenDiagnosis: () -> Unit
 ) {
     BackHandler {
         onNavigateBack()
@@ -678,13 +680,13 @@ fun SettingsScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Emotion Modulation (SSML)",
+                                        text = "Cloud W3C SSML (Google Cloud TTS)",
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onSurface,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                     Text(
-                                        text = "Adjust tone for '!' and '...' cues",
+                                        text = "Built-in Android TTS always receives plain text + pitch/rate/volume",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -1080,6 +1082,50 @@ fun SettingsScreen(
                             ) {
                                 Text(if (isAccessibilityEnabled) "Active" else "Enable")
                             }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onOpenDiagnosis() }
+                                .padding(vertical = 6.dp)
+                                .testTag("open_diagnosis_screen_row"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.BugReport,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        text = "Live OCR & TTS Diagnosis",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = "Inspect cropped ROI preview, extracted text, TTS callbacks & latencies",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "Open Live Diagnosis",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
 
                         if (state.ttsStatus == TtsEngineStatus.MISSING_HINDI_DATA) {

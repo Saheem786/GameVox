@@ -131,8 +131,8 @@ enum class TtsEngineStatus(val label: String) {
 enum class ModelDownloadStatus(val label: String) {
     CHECKING("Checking Offline Pack..."),
     DOWNLOADING("Downloading Offline Hindi Model (~30 MB)..."),
-    READY("On-Device + Neural Translator Ready"),
-    OFFLINE_FALLBACK("Offline Mode (Downloading Pack Required)")
+    READY("On-Device ML Kit Offline Pack Ready"),
+    OFFLINE_FALLBACK("Limited Local Phrasebook (Offline Pack Missing)")
 }
 
 enum class TranslationMode(
@@ -143,15 +143,15 @@ enum class TranslationMode(
 ) {
     ON_DEVICE_MLKIT(
         code = "on_device_mlkit",
-        displayName = "Free On-Device (ML Kit)",
-        shortBadge = "Offline • Free",
-        costAndLimitNote = "Downloads ~30 MB Hindi pack once. Zero cloud cost, private, works offline. Translates line-by-line without scene memory."
+        displayName = "On-Device Offline (ML Kit)",
+        shortBadge = "Offline • Private",
+        costAndLimitNote = "Downloads ~30 MB Hindi pack once. Zero cloud cost, never sends screen text to any server. Translates line-by-line without scene memory."
     ),
     CONTEXT_AWARE_AI(
         code = "context_aware_ai",
-        displayName = "Context-Aware AI (Gemini)",
-        shortBadge = "Online • Context AI",
-        costAndLimitNote = "Requires internet & uses cloud quota. Uses last 4 dialogue lines to preserve tone, sarcasm & character names. Sends cropped OCR text only."
+        displayName = "Context-Aware AI (Optional Cloud)",
+        shortBadge = "Online • Cloud Quota",
+        costAndLimitNote = "Optional paid/quota-limited Gemini cloud mode (requires valid Firebase config & internet). Sends cropped subtitle text + last 4 dialogue lines when consented."
     );
 
     companion object {
@@ -188,7 +188,7 @@ data class TranslatorAppState(
     val translationMode: TranslationMode = TranslationMode.ON_DEVICE_MLKIT,
     val aiPrivacyConsentAccepted: Boolean = false,
     val useHighQualityNetworkVoice: Boolean = true,
-    val ssmlEnabledOnDevice: Boolean = true,
+    val ssmlEnabledOnDevice: Boolean = false,
     val cloudTtsProvider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
     val userGoogleCloudApiKey: String = "",
     val userElevenLabsApiKey: String = "",
@@ -196,8 +196,19 @@ data class TranslatorAppState(
     val activeApiKeyStatusNote: String = "",
     val activeVoiceName: String = "Google Neural Network (hi-IN)",
     val availableVoicesCount: Int = 0,
-    val voiceDownloadMessage: String = "HD Network Synthesis Active",
+    val voiceDownloadMessage: String = "Plain Android TTS Active",
     val mlKitModelStatusText: String = "Offline Hindi pack: checking...",
+    val firebaseAiStatusText: String = "Not checked",
+    val translationSourceLabel: String = "Idle",
+    val captureLatencyMs: Long = 0L,
+    val ocrLatencyMs: Long = 0L,
+    val translationLatencyMs: Long = 0L,
+    val totalPipelineLatencyMs: Long = 0L,
+    val roiDimensionsText: String = "—",
+    val lastTtsEvent: String = "IDLE",
+    val lastTtsUtteranceId: String = "",
+    val lastTtsError: String = "",
+    val lastPipelineError: String = "",
     val lastDetectedEmotion: SpeechEmotion = SpeechEmotion.NEUTRAL,
     val lastEmotionReason: String = "Normal sentence → Neutral (18yo natural baseline)",
     val lastSsmlPreview: String = "",
@@ -205,7 +216,7 @@ data class TranslatorAppState(
     val ttsSpeechRate: Float = 1.0f,
     val ttsVolume: Float = 1.0f,
     val invertColorsEnabled: Boolean = true,
-    val captureIntervalMs: Long = 1200L,
+    val captureIntervalMs: Long = 900L,
     val lastExtractedEnglish: String = "Drag the green subtitle box to the bottom of the screen...",
     val lastTranslatedHindi: String = "सबटायटल बॉक्स को गेम टेक्स्ट पर रखें...",
     val lastSpokenText: String = "",
@@ -244,7 +255,7 @@ object TranslatorStateRepository {
     private const val KEY_VOLUME = "tts_volume_v1"
     private const val KEY_INVERT = "invert_colors_enabled"
     private const val KEY_INTERVAL = "capture_interval_ms"
-    private const val KEY_SSML_ENABLED = "ssml_enabled_on_device_v1"
+    private const val KEY_SSML_ENABLED = "ssml_enabled_cloud_or_opt_in_v2"
     private const val KEY_CLOUD_TTS_PROVIDER = "cloud_tts_provider_v1"
     private const val KEY_TRANSLATION_MODE = "translation_mode_v1"
     private const val KEY_AI_PRIVACY_CONSENT = "ai_privacy_consent_v1"
@@ -265,7 +276,7 @@ object TranslatorStateRepository {
         )
         val aiConsent = prefs.getBoolean(KEY_AI_PRIVACY_CONSENT, false)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
-        val ssmlEnabled = prefs.getBoolean(KEY_SSML_ENABLED, true)
+        val ssmlEnabled = prefs.getBoolean(KEY_SSML_ENABLED, false)
         val cloudProvider = CloudTtsProvider.fromCode(
             prefs.getString(KEY_CLOUD_TTS_PROVIDER, CloudTtsProvider.ANDROID_SSML_NETWORK.code)
         )
@@ -276,7 +287,7 @@ object TranslatorStateRepository {
         val rate = prefs.getFloat(KEY_RATE, 1.0f).coerceIn(0.4f, 1.8f)
         val volume = prefs.getFloat(KEY_VOLUME, 1.0f).coerceIn(0.1f, 1.0f)
         val invert = prefs.getBoolean(KEY_INVERT, true)
-        val interval = prefs.getLong(KEY_INTERVAL, 1200L).coerceIn(700L, 5000L)
+        val interval = prefs.getLong(KEY_INTERVAL, 900L).coerceIn(600L, 5000L)
         val glossary = PronunciationGlossary.fromJsonString(prefs.getString(KEY_GLOSSARY_JSON, null))
         _state.update {
             it.copy(
@@ -444,7 +455,7 @@ object TranslatorStateRepository {
         _state.update {
             it.copy(
                 showTargetBoxOverlay = show,
-                isCapturingOcr = if (!show) false else true
+                isCapturingOcr = if (!show) false else (it.isServiceRunning && it.hasActiveMediaProjection)
             )
         }
     }
@@ -626,6 +637,46 @@ object TranslatorStateRepository {
 
     fun setMlKitModelStatusText(text: String) {
         _state.update { it.copy(mlKitModelStatusText = text) }
+    }
+
+    fun setFirebaseAiStatusText(text: String) {
+        _state.update { it.copy(firebaseAiStatusText = text) }
+    }
+
+    fun updateTtsLifecycleEvent(
+        event: String,
+        utteranceId: String = _state.value.lastTtsUtteranceId,
+        error: String = ""
+    ) {
+        _state.update {
+            it.copy(
+                lastTtsEvent = event,
+                lastTtsUtteranceId = utteranceId,
+                lastTtsError = error
+            )
+        }
+    }
+
+    fun updateDiagnosisMetrics(
+        captureLatencyMs: Long? = null,
+        ocrLatencyMs: Long? = null,
+        translationLatencyMs: Long? = null,
+        totalPipelineLatencyMs: Long? = null,
+        roiDimensionsText: String? = null,
+        translationSourceLabel: String? = null,
+        lastPipelineError: String? = null
+    ) {
+        _state.update { current ->
+            current.copy(
+                captureLatencyMs = captureLatencyMs ?: current.captureLatencyMs,
+                ocrLatencyMs = ocrLatencyMs ?: current.ocrLatencyMs,
+                translationLatencyMs = translationLatencyMs ?: current.translationLatencyMs,
+                totalPipelineLatencyMs = totalPipelineLatencyMs ?: current.totalPipelineLatencyMs,
+                roiDimensionsText = roiDimensionsText ?: current.roiDimensionsText,
+                translationSourceLabel = translationSourceLabel ?: current.translationSourceLabel,
+                lastPipelineError = lastPipelineError ?: current.lastPipelineError
+            )
+        }
     }
 
     fun setAccessibilityConnected(connected: Boolean) {

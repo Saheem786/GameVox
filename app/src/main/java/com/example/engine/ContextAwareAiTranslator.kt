@@ -1,8 +1,11 @@
 package com.example.engine
 
+import android.content.Context
 import android.util.Log
 import com.example.data.TargetLanguage
+import com.example.data.TranslatorStateRepository
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
@@ -16,8 +19,8 @@ sealed interface ContextAiTranslationResult {
 
 /**
  * Optional Context-Aware AI Translation engine backed by Firebase AI Logic (`gemini-3.8-flash`).
- * Receives only cropped dialogue strings + the last 3-4 recent dialogue lines for scene continuity
- * and emotional accuracy (action, comedy, anger, fear, drama). Never receives raw screenshots.
+ * Receives only cropped dialogue strings + up to 4 recent dialogue lines for scene continuity
+ * and emotional accuracy. Never initializes Firebase AI when [FirebaseApp] is absent or unconfigured.
  */
 object ContextAwareAiTranslator {
 
@@ -33,6 +36,49 @@ object ContextAwareAiTranslator {
         )
     }
 
+    /**
+     * Verifies at runtime that FirebaseApp is initialized with valid user project credentials
+     * (and not a template placeholder) before claiming Gemini AI mode is available.
+     */
+    fun isFirebaseAiAvailable(context: Context? = null): Boolean {
+        return try {
+            val app = if (context != null) {
+                val existing = FirebaseApp.getApps(context)
+                if (existing.isEmpty()) {
+                    FirebaseApp.initializeApp(context) ?: run {
+                        TranslatorStateRepository.setFirebaseAiStatusText("Not configured (missing google-services.json)")
+                        return false
+                    }
+                } else {
+                    existing.first()
+                }
+            } else {
+                val existing = FirebaseApp.getApps(com.example.AppContextHolder.getOrNull() ?: return false)
+                existing.firstOrNull() ?: return false
+            }
+
+            val opts = app.options
+            val projectId = opts.projectId.orEmpty().trim()
+            val apiKey = opts.apiKey.trim()
+            val appId = opts.applicationId.trim()
+
+            val valid = projectId.isNotEmpty() &&
+                !projectId.equals("remixed-project-id", ignoreCase = true) &&
+                apiKey.isNotEmpty() &&
+                appId.isNotEmpty()
+
+            if (valid) {
+                TranslatorStateRepository.setFirebaseAiStatusText("Configured (Firebase AI • quota applies)")
+            } else {
+                TranslatorStateRepository.setFirebaseAiStatusText("Not configured (incomplete Firebase project config)")
+            }
+            valid
+        } catch (e: Exception) {
+            TranslatorStateRepository.setFirebaseAiStatusText("Unavailable (${e.javaClass.simpleName})")
+            false
+        }
+    }
+
     suspend fun translateWithContext(
         englishDialogue: String,
         targetLanguage: TargetLanguage,
@@ -42,6 +88,10 @@ object ContextAwareAiTranslator {
         val trimmed = englishDialogue.trim()
         if (trimmed.isEmpty()) {
             return ContextAiTranslationResult.Error("Empty dialogue")
+        }
+
+        if (!isFirebaseAiAvailable()) {
+            return ContextAiTranslationResult.Error("Gemini AI is not configured (FirebaseApp unavailable)")
         }
 
         val contextBlock = if (recentLines.isEmpty()) {
@@ -54,15 +104,16 @@ object ContextAwareAiTranslator {
 
         val styleRule = if (targetLanguage == TargetLanguage.HINDI) {
             """
-            Translate into natural, modern conversational Hindi as spoken in Hindi-dubbed games, movies, and everyday Indian conversations (Devanagari script, natural Hinglish words like sorry, please, wait, tension, backup when natural).
-            NEVER use stiff textbook/Sanskritized Hindi (e.g., avoid 'प्रतीक्षा करें', 'सहायता', 'अंतिम संस्कार' — prefer 'वेट करो', 'मदद', 'फ्यूनरल').
+            Translate into natural, modern conversational Hindi as spoken in Hindi-dubbed games, movies, and everyday Indian conversations (Devanagari script). Use natural Hinglish loanwords (like sorry, please, wait, tension, backup) ONLY when they sound natural and fit the scene.
+            NEVER use stiff textbook/Sanskritized Hindi (avoid 'प्रतीक्षा करें', 'सहायता', 'अंतिम संस्कार' — prefer 'वेट करो', 'मदद', 'फ्यूनरल').
+            NEVER inject unnecessary forced slang or alter the original meaning.
             Examples:
             - "Are you kidding me?" -> "मज़ाक कर रहे हो क्या?"
             - "Let's get moving!" -> "चलो, जल्दी निकलते हैं!"
             - "I won't let you down." -> "भरोसा रखो, तुम्हें निराश नहीं करूँगा।"
             """.trimIndent()
         } else {
-            "Translate into natural, conversational ${targetLanguage.displayName} suitable for live voice dubbing."
+            "Translate into natural, conversational ${targetLanguage.displayName} suitable for live voice dubbing without altering meaning."
         }
 
         val prompt = """

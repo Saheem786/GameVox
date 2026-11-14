@@ -295,6 +295,19 @@ class FloatingOverlayController(
                 }
             }
 
+            val root = rootOverlayView
+            val rootParams = overlayParams
+            if (root != null && rootParams != null) {
+                val bubbleW = root.width.coerceAtLeast(dpToPx(48))
+                val bubbleH = root.height.coerceAtLeast(dpToPx(48))
+                rootParams.x = rootParams.x.coerceIn(0, (liveW - bubbleW).coerceAtLeast(0))
+                rootParams.y = rootParams.y.coerceIn(dpToPx(16), (liveH - bubbleH - dpToPx(16)).coerceAtLeast(dpToPx(16)))
+                try {
+                    windowManager.updateViewLayout(root, rootParams)
+                } catch (_: Exception) {
+                }
+            }
+
             repositionTranslationBoxAboveRegion(
                 liveW = liveW,
                 liveH = liveH,
@@ -432,8 +445,11 @@ class FloatingOverlayController(
                         isDragging = true
                     }
                     if (isDragging && rootOverlayView != null) {
-                        params.x = initialX + dx
-                        params.y = initialY + dy
+                        val (liveW, liveH) = getLiveScreenSize()
+                        val bubbleW = bubbleFrame.width.coerceAtLeast(dpToPx(48))
+                        val bubbleH = bubbleFrame.height.coerceAtLeast(dpToPx(48))
+                        params.x = (initialX + dx).coerceIn(0, (liveW - bubbleW).coerceAtLeast(0))
+                        params.y = (initialY + dy).coerceIn(0, (liveH - bubbleH).coerceAtLeast(0))
                         try {
                             windowManager.updateViewLayout(rootOverlayView, params)
                         } catch (_: Exception) {

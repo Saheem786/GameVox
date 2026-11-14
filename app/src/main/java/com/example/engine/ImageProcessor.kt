@@ -27,7 +27,11 @@ data class OcrExtractionResult(
     val croppedOriginalBitmap: Bitmap,
     val processedBitmap: Bitmap,
     val usedColorInversion: Boolean,
-    val skippedUnchangedFrame: Boolean = false
+    val skippedUnchangedFrame: Boolean = false,
+    val ocrLatencyMs: Long = 0L,
+    val roiWidth: Int = 0,
+    val roiHeight: Int = 0,
+    val preprocessPassUsed: String = ""
 )
 
 data class DetectedOverlayBlock(
@@ -39,25 +43,49 @@ data class DetectedOverlayBlock(
 /**
  * Processes game screen bitmaps by:
  * 1. Cropping strictly to the user's Draggable & Resizable Target Bounding Box ([targetRegionScreenRect])
- *    so only text inside the square/rectangular overlay box is read.
- * 2. Applying Grayscale and Color-Inversion transformations via Android's [ColorMatrix].
- * 3. Integrating with Google ML Kit [TextRecognition] to extract text from the target region.
+ *    at high native resolution BEFORE any scaling or OCR preprocessing.
+ * 2. Upscaling small cropped subtitle strips so tiny 12–16sp game subtitles remain crisp.
+ * 3. Running multi-pass OCR preprocessing:
+ *    - Pass 1: Inverted contrast-boosted grayscale (white/light subtitles on dark backdrop).
+ *    - Pass 2: Bright White & Yellow Subtitle Isolation (cuts out moving foliage/UI backgrounds & outlines).
+ *    - Pass 3: Natural contrast-boosted grayscale (dark subtitles on light dialogue cards).
+ * 4. Guarding frame-diff skip logic with dense 32x12 luma grid + forced periodic OCR so text never gets dropped.
  */
 class ImageProcessor(
-    private val recognizer: TextRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val recognizerProvider: () -> TextRecognizer = {
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    }
 ) {
+
+    @Volatile
+    private var hasInitializedRecognizer: Boolean = false
+
+    private val recognizer: TextRecognizer by lazy {
+        hasInitializedRecognizer = true
+        recognizerProvider()
+    }
 
     @Volatile
     private var previousRegionLumaSample: IntArray? = null
 
+    @Volatile
+    private var consecutiveSkippedFrames: Int = 0
+
+    @Volatile
+    private var lastForcedOcrTimestampMs: Long = 0L
+
     fun resetFrameDiffCache() {
         previousRegionLumaSample = null
+        consecutiveSkippedFrames = 0
+        lastForcedOcrTimestampMs = 0L
     }
 
     companion object {
         private const val TAG = "ImageProcessor"
-        private const val SAMPLE_GRID_W = 16
-        private const val SAMPLE_GRID_H = 8
+        private const val SAMPLE_GRID_W = 32
+        private const val SAMPLE_GRID_H = 12
+        private const val MAX_CONSECUTIVE_SKIPS = 2
+        private const val FORCED_OCR_INTERVAL_MS = 1800L
 
         private val COLOR_INVERSION_MATRIX = floatArrayOf(
             -1f,  0f,  0f, 0f, 255f,
@@ -67,9 +95,9 @@ class ImageProcessor(
         )
 
         private val CONTRAST_BOOST_MATRIX = floatArrayOf(
-            1.25f, 0f,    0f,    0f, -20f,
-            0f,    1.25f, 0f,    0f, -20f,
-            0f,    0f,    1.25f, 0f, -20f,
+            1.35f, 0f,    0f,    0f, -24f,
+            0f,    1.35f, 0f,    0f, -24f,
+            0f,    0f,    1.35f, 0f, -24f,
             0f,    0f,    0f,    1f,   0f
         )
 
@@ -105,8 +133,8 @@ class ImageProcessor(
 
     /**
      * Crops [fullScreenBitmap] strictly to [targetScreenRect] (mapped from real device screen
-     * dimensions [rawScreenWidth] x [rawScreenHeight] to the bitmap's dimensions).
-     * Insets by 4px on each edge so the overlay box's colored border is excluded from OCR.
+     * dimensions [rawScreenWidth] x [rawScreenHeight] to the bitmap's native pixel dimensions).
+     * Insets by 6px on each edge so the overlay box's colored border is excluded from OCR.
      */
     fun cropToTargetRegion(
         fullScreenBitmap: Bitmap,
@@ -116,7 +144,11 @@ class ImageProcessor(
     ): Bitmap {
         val safeBitmap = ensureSoftwareArgbBitmap(fullScreenBitmap)
         if (targetScreenRect == null || targetScreenRect.isEmpty || rawScreenWidth <= 0 || rawScreenHeight <= 0) {
-            return safeBitmap
+            return if (safeBitmap === fullScreenBitmap) {
+                safeBitmap.copy(Bitmap.Config.ARGB_8888, false) ?: safeBitmap
+            } else {
+                safeBitmap
+            }
         }
 
         val scaleX = safeBitmap.width.toFloat() / rawScreenWidth.toFloat()
@@ -133,15 +165,74 @@ class ImageProcessor(
         val cropHeight = (bottom - top).coerceAtLeast(1)
 
         if (cropWidth < 16 || cropHeight < 16) {
-            return safeBitmap
+            return if (safeBitmap === fullScreenBitmap) {
+                safeBitmap.copy(Bitmap.Config.ARGB_8888, false) ?: safeBitmap
+            } else {
+                safeBitmap
+            }
         }
 
         return try {
-            Bitmap.createBitmap(safeBitmap, left, top, cropWidth, cropHeight)
+            val cropped = Bitmap.createBitmap(safeBitmap, left, top, cropWidth, cropHeight)
+            if (safeBitmap !== fullScreenBitmap && !safeBitmap.isRecycled) {
+                safeBitmap.recycle()
+            }
+            cropped
         } catch (e: Exception) {
             Log.w(TAG, "Fallback to full bitmap on crop bounds exception", e)
             safeBitmap
         }
+    }
+
+    /**
+     * Upscales tiny cropped subtitle regions (e.g., width < 520 or height < 180) up to 2x with
+     * bilinear filtering so small outlined game subtitles remain legible to ML Kit Text Recognition.
+     */
+    fun upscaleSmallRoiIfNeeded(regionBitmap: Bitmap): Bitmap {
+        if (regionBitmap.isRecycled || regionBitmap.width <= 0 || regionBitmap.height <= 0) {
+            return regionBitmap
+        }
+        val needUpscale = regionBitmap.width < 520 || regionBitmap.height < 180
+        if (!needUpscale) return regionBitmap
+        val scaleFactor = if (regionBitmap.height < 100) 2.0f else 1.6f
+        val targetW = (regionBitmap.width * scaleFactor).toInt().coerceIn(regionBitmap.width, 1600)
+        val targetH = (regionBitmap.height * scaleFactor).toInt().coerceIn(regionBitmap.height, 900)
+        return try {
+            Bitmap.createScaledBitmap(regionBitmap, targetW, targetH, true)
+        } catch (_: Exception) {
+            regionBitmap
+        }
+    }
+
+    /**
+     * Isolates bright white (`R,G,B > 180` with low channel spread) and golden/yellow (`R > 175, G > 145, B < 150`)
+     * subtitle text pixels against busy textured game scenes, rendering them crisp black text on pure white.
+     */
+    fun createBrightYellowWhiteIsolationBitmap(source: Bitmap): Bitmap {
+        val safeBitmap = ensureSoftwareArgbBitmap(source)
+        val w = safeBitmap.width.coerceAtLeast(1)
+        val h = safeBitmap.height.coerceAtLeast(1)
+        val pixels = IntArray(w * h)
+        safeBitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            val luma = (r * 77 + g * 150 + b * 29) shr 8
+
+            val isWhiteGlyph = luma >= 182 && kotlin.math.abs(r - g) <= 45 && kotlin.math.abs(g - b) <= 45
+            val isYellowGlyph = r >= 175 && g >= 145 && b <= 145 && (r - b) >= 45
+            pixels[i] = if (isWhiteGlyph || isYellowGlyph) Color.BLACK else Color.WHITE
+        }
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        if (safeBitmap !== source && !safeBitmap.isRecycled) {
+            safeBitmap.recycle()
+        }
+        return out
     }
 
     /**
@@ -161,6 +252,9 @@ class ImageProcessor(
             colorFilter = ColorMatrixColorFilter(grayscaleMatrix)
         }
         Canvas(output).drawBitmap(safeBitmap, 0f, 0f, paint)
+        if (safeBitmap !== source && !safeBitmap.isRecycled) {
+            safeBitmap.recycle()
+        }
         return output
     }
 
@@ -179,15 +273,15 @@ class ImageProcessor(
             colorFilter = ColorMatrixColorFilter(invertMatrix)
         }
         Canvas(output).drawBitmap(safeBitmap, 0f, 0f, paint)
+        if (safeBitmap !== source && !safeBitmap.isRecycled) {
+            safeBitmap.recycle()
+        }
         return output
     }
 
     /**
-     * Combined preprocessing pipeline that applies:
-     * 1. Grayscale conversion (`setSaturation(0f)`)
-     * 2. Color-inversion (`COLOR_INVERSION_MATRIX`)
-     * 3. Subtle contrast boost (`CONTRAST_BOOST_MATRIX`)
-     * 4. Optional exclusion masking for floating icons
+     * Combined preprocessing pipeline applying grayscale, optional color inversion,
+     * contrast boost, and optional overlay exclusion masking.
      */
     fun preprocessForOcr(
         source: Bitmap,
@@ -225,15 +319,16 @@ class ImageProcessor(
             canvas.drawRect(excludeOverlayRect, maskPaint)
         }
 
+        if (safeBitmap !== source && !safeBitmap.isRecycled) {
+            safeBitmap.recycle()
+        }
         return output
     }
 
     /**
-     * Runs the complete [ImageProcessor] + ML Kit [TextRecognizer] pipeline:
-     * 1. If [targetRegionScreenRect] is provided, crops [source] strictly to that bounding box!
-     * 2. Preprocesses the cropped region with grayscale + color-inversion.
-     * 3. Extracts text blocks using ML Kit [TextRecognizer].
-     * 4. Automatically falls back to grayscale-only OCR if no text was found with inversion.
+     * Runs the complete ROI Crop -> Small-ROI Upscale -> Multi-Pass Preprocessing -> ML Kit [TextRecognizer] pipeline.
+     * Safely recycles intermediate temporary bitmaps so only [OcrExtractionResult.croppedOriginalBitmap]
+     * and [OcrExtractionResult.processedBitmap] are returned live to the caller.
      */
     suspend fun extractTextFromOverlayBitmap(
         source: Bitmap,
@@ -244,76 +339,133 @@ class ImageProcessor(
         rawScreenHeight: Int = 0,
         skipIfRegionUnchanged: Boolean = true
     ): OcrExtractionResult = withContext(Dispatchers.Default) {
+        val ocrStartMs = System.currentTimeMillis()
         val regionBitmap = if (targetRegionScreenRect != null && !targetRegionScreenRect.isEmpty && rawScreenWidth > 0 && rawScreenHeight > 0) {
             cropToTargetRegion(source, targetRegionScreenRect, rawScreenWidth, rawScreenHeight)
         } else {
-            ensureSoftwareArgbBitmap(source)
+            val safe = ensureSoftwareArgbBitmap(source)
+            safe.copy(Bitmap.Config.ARGB_8888, false) ?: safe
         }
 
-        // Battery & CPU optimization: check a lightweight 16x8 luminance sample grid before running
-        // ColorMatrix preprocessing and ML Kit OCR so identical static subtitle frames are skipped cleanly.
+        val roiW = regionBitmap.width
+        val roiH = regionBitmap.height
+
+        // 32x12 luma check + forced periodic OCR so thin subtle subtitle swaps are never permanently skipped
         val currentSample = sampleLuminanceGrid(regionBitmap)
-        if (skipIfRegionUnchanged && !hasSignificantRegionChange(currentSample)) {
+        val timeSinceForced = ocrStartMs - lastForcedOcrTimestampMs
+        val mustForceOcr = consecutiveSkippedFrames >= MAX_CONSECUTIVE_SKIPS ||
+            timeSinceForced >= FORCED_OCR_INTERVAL_MS
+
+        if (skipIfRegionUnchanged && !mustForceOcr && !hasSignificantRegionChange(currentSample)) {
+            consecutiveSkippedFrames++
             return@withContext OcrExtractionResult(
                 extractedText = "",
                 recognizedBlocks = emptyList(),
                 croppedOriginalBitmap = regionBitmap,
                 processedBitmap = regionBitmap,
                 usedColorInversion = enableColorInversion,
-                skippedUnchangedFrame = true
+                skippedUnchangedFrame = true,
+                ocrLatencyMs = System.currentTimeMillis() - ocrStartMs,
+                roiWidth = roiW,
+                roiHeight = roiH,
+                preprocessPassUsed = "Skipped (Unchanged)"
             )
         }
+        consecutiveSkippedFrames = 0
+        lastForcedOcrTimestampMs = ocrStartMs
         previousRegionLumaSample = currentSample
 
-        // Only apply excludeOverlayRect if we didn't already crop to the target bounding box
+        val upscaledRoi = upscaleSmallRoiIfNeeded(regionBitmap)
         val maskRect = if (targetRegionScreenRect == null) excludeOverlayRect else null
 
-        val primaryProcessed = preprocessForOcr(
-            source = regionBitmap,
+        // Pass 1: Inverted contrast-boosted grayscale (or natural if inversion disabled)
+        val pass1Bitmap = preprocessForOcr(
+            source = upscaledRoi,
             enableGrayscale = true,
             enableColorInversion = enableColorInversion,
             excludeOverlayRect = maskRect
         )
+        val pass1Blocks = runMlKitRecognition(pass1Bitmap, pass1Bitmap.height)
+        val pass1Text = formatOverlayBlocks(pass1Blocks, isCroppedBox = targetRegionScreenRect != null)
 
-        val primaryBlocks = runMlKitRecognition(primaryProcessed, primaryProcessed.height)
-        val primaryText = formatOverlayBlocks(primaryBlocks, isCroppedBox = targetRegionScreenRect != null)
-
-        if (primaryText.isNotBlank() || !enableColorInversion) {
+        if (pass1Text.isNotBlank()) {
+            if (upscaledRoi !== regionBitmap && !upscaledRoi.isRecycled) upscaledRoi.recycle()
             return@withContext OcrExtractionResult(
-                extractedText = primaryText,
-                recognizedBlocks = primaryBlocks,
+                extractedText = pass1Text,
+                recognizedBlocks = pass1Blocks,
                 croppedOriginalBitmap = regionBitmap,
-                processedBitmap = primaryProcessed,
-                usedColorInversion = enableColorInversion
+                processedBitmap = pass1Bitmap,
+                usedColorInversion = enableColorInversion,
+                ocrLatencyMs = System.currentTimeMillis() - ocrStartMs,
+                roiWidth = roiW,
+                roiHeight = roiH,
+                preprocessPassUsed = if (enableColorInversion) "Pass 1 (Inverted Contrast)" else "Pass 1 (Grayscale)"
             )
         }
 
-        val grayscaleOnlyBitmap = preprocessForOcr(
-            source = regionBitmap,
-            enableGrayscale = true,
-            enableColorInversion = false,
-            excludeOverlayRect = maskRect
+        // Pass 2: Bright White & Yellow Subtitle Isolation for busy/moving game backgrounds & outlines
+        val pass2Bitmap = createBrightYellowWhiteIsolationBitmap(upscaledRoi)
+        val pass2Blocks = runMlKitRecognition(pass2Bitmap, pass2Bitmap.height)
+        val pass2Text = formatOverlayBlocks(pass2Blocks, isCroppedBox = targetRegionScreenRect != null)
+
+        if (pass2Text.isNotBlank()) {
+            if (pass1Bitmap !== pass2Bitmap && !pass1Bitmap.isRecycled) pass1Bitmap.recycle()
+            if (upscaledRoi !== regionBitmap && !upscaledRoi.isRecycled) upscaledRoi.recycle()
+            return@withContext OcrExtractionResult(
+                extractedText = pass2Text,
+                recognizedBlocks = pass2Blocks,
+                croppedOriginalBitmap = regionBitmap,
+                processedBitmap = pass2Bitmap,
+                usedColorInversion = true,
+                ocrLatencyMs = System.currentTimeMillis() - ocrStartMs,
+                roiWidth = roiW,
+                roiHeight = roiH,
+                preprocessPassUsed = "Pass 2 (White/Yellow Isolated)"
+            )
+        }
+        if (!pass2Bitmap.isRecycled) pass2Bitmap.recycle()
+
+        // Pass 3: Natural non-inverted grayscale (handles dark subtitles on light cards)
+        if (enableColorInversion) {
+            val pass3Bitmap = preprocessForOcr(
+                source = upscaledRoi,
+                enableGrayscale = true,
+                enableColorInversion = false,
+                excludeOverlayRect = maskRect
+            )
+            val pass3Blocks = runMlKitRecognition(pass3Bitmap, pass3Bitmap.height)
+            val pass3Text = formatOverlayBlocks(pass3Blocks, isCroppedBox = targetRegionScreenRect != null)
+
+            if (pass3Text.isNotBlank()) {
+                if (!pass1Bitmap.isRecycled) pass1Bitmap.recycle()
+                if (upscaledRoi !== regionBitmap && !upscaledRoi.isRecycled) upscaledRoi.recycle()
+                return@withContext OcrExtractionResult(
+                    extractedText = pass3Text,
+                    recognizedBlocks = pass3Blocks,
+                    croppedOriginalBitmap = regionBitmap,
+                    processedBitmap = pass3Bitmap,
+                    usedColorInversion = false,
+                    ocrLatencyMs = System.currentTimeMillis() - ocrStartMs,
+                    roiWidth = roiW,
+                    roiHeight = roiH,
+                    preprocessPassUsed = "Pass 3 (Natural Grayscale)"
+                )
+            }
+            if (!pass3Bitmap.isRecycled) pass3Bitmap.recycle()
+        }
+
+        if (upscaledRoi !== regionBitmap && !upscaledRoi.isRecycled) upscaledRoi.recycle()
+        OcrExtractionResult(
+            extractedText = "",
+            recognizedBlocks = emptyList(),
+            croppedOriginalBitmap = regionBitmap,
+            processedBitmap = pass1Bitmap,
+            usedColorInversion = enableColorInversion,
+            ocrLatencyMs = System.currentTimeMillis() - ocrStartMs,
+            roiWidth = roiW,
+            roiHeight = roiH,
+            preprocessPassUsed = "No Subtitle Found"
         )
-        val fallbackBlocks = runMlKitRecognition(grayscaleOnlyBitmap, grayscaleOnlyBitmap.height)
-        val fallbackText = formatOverlayBlocks(fallbackBlocks, isCroppedBox = targetRegionScreenRect != null)
-
-        if (fallbackText.isNotBlank()) {
-            OcrExtractionResult(
-                extractedText = fallbackText,
-                recognizedBlocks = fallbackBlocks,
-                croppedOriginalBitmap = regionBitmap,
-                processedBitmap = grayscaleOnlyBitmap,
-                usedColorInversion = false
-            )
-        } else {
-            OcrExtractionResult(
-                extractedText = "",
-                recognizedBlocks = emptyList(),
-                croppedOriginalBitmap = regionBitmap,
-                processedBitmap = primaryProcessed,
-                usedColorInversion = enableColorInversion
-            )
-        }
     }
 
     private suspend fun runMlKitRecognition(
@@ -324,6 +476,8 @@ class ImageProcessor(
             val inputImage = InputImage.fromBitmap(processedBitmap, 0)
             val visionText: Text = recognizer.process(inputImage).await()
             parseDetectedOverlayBlocks(visionText, frameHeight)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
         } catch (e: Exception) {
             Log.w(TAG, "ML Kit TextRecognition failed on processed bitmap", e)
             emptyList()
@@ -406,12 +560,12 @@ class ImageProcessor(
         for (i in currentSample.indices) {
             val diff = kotlin.math.abs(currentSample[i] - prev[i])
             totalDiff += diff
-            if (diff >= 14) {
+            if (diff >= 10) {
                 changedCells++
             }
         }
         val avgDiff = totalDiff.toFloat() / currentSample.size.toFloat()
-        return changedCells >= 3 || avgDiff >= 5.5f
+        return changedCells >= 2 || avgDiff >= 3.2f
     }
 
     private fun ensureSoftwareArgbBitmap(source: Bitmap): Bitmap {
@@ -423,6 +577,7 @@ class ImageProcessor(
     }
 
     fun close() {
+        if (!hasInitializedRecognizer) return
         try {
             recognizer.close()
         } catch (_: Exception) {

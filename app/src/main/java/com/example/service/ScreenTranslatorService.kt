@@ -34,6 +34,7 @@ import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
 import com.example.engine.ImageProcessor
 import com.example.engine.OcrTranslationPipeline
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,10 +47,12 @@ import kotlinx.coroutines.launch
 /**
  * Foreground Service managing real-time game screen subtitle OCR & modern Hindi dubbing:
  * 1. Compact draggable floating control + bottom-anchored resizable subtitle detection region.
- * 2. MediaProjection VirtualDisplay + ImageReader cropped strictly to the subtitle box -> ML Kit OCR v2
- *    (plus Accessibility node extraction fallback if enabled for supported UI views).
- * 3. Orientation/Landscape handling recreating VirtualDisplay & ImageReader on config changes.
- * 4. Protected screen (FLAG_SECURE) detection & revoked projection cleanup requiring fresh consent.
+ * 2. MediaProjection VirtualDisplay created AT MOST ONCE per MediaProjection instance (Android 14+ safe).
+ *    On rotation/display geometry change, calls `VirtualDisplay.resize(...)` + `setSurface(newReader.surface)`
+ *    and safely closes the previous ImageReader; falls back cleanly to requesting fresh consent if impossible.
+ * 3. Full-resolution screen capture (up to 2560px longest side) cropped cleanly to the subtitle ROI before OCR,
+ *    with single-frame-in-flight protection, adaptive polling interval, and deterministic Bitmap recycling.
+ * 4. Protected screen (`FLAG_SECURE`) detection & immediate queue/TTS flush on pause or stop.
  */
 class ScreenTranslatorService : Service() {
 
@@ -57,11 +60,13 @@ class ScreenTranslatorService : Service() {
         private const val TAG = "ScreenTranslatorService"
         private const val NOTIFICATION_ID = 4001
         private const val CHANNEL_ID = "gamevox_hindi_capture_channel"
+        private const val MAX_CAPTURE_DIMENSION_PX = 2560
 
         const val ACTION_START_WITH_PROJECTION = "com.example.action.START_WITH_PROJECTION"
         const val ACTION_TOGGLE_DUBBING = "com.example.action.TOGGLE_DUBBING"
         const val ACTION_TOGGLE_SCANNING = "com.example.action.TOGGLE_SCANNING"
         const val ACTION_TOGGLE_TARGET_BOX = "com.example.action.TOGGLE_TARGET_BOX"
+        const val ACTION_UPDATE_SUBTITLE_VISIBILITY = "com.example.action.UPDATE_SUBTITLE_VISIBILITY"
         const val ACTION_INIT_TTS = "com.example.action.INIT_TTS"
         const val ACTION_DOWNLOAD_VOICE_DATA = "com.example.action.DOWNLOAD_VOICE_DATA"
         const val ACTION_TEST_TTS = "com.example.action.TEST_TTS"
@@ -75,6 +80,7 @@ class ScreenTranslatorService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var captureLoopJob: Job? = null
+    private val isFrameInFlight = AtomicBoolean(false)
 
     private lateinit var pipeline: OcrTranslationPipeline
     private lateinit var ttsManager: ForegroundTtsManager
@@ -87,22 +93,43 @@ class ScreenTranslatorService : Service() {
     private var imageReader: ImageReader? = null
     private val imageReaderHandler = Handler(Looper.getMainLooper())
 
+    @Volatile
+    private var hasCreatedVirtualDisplayForProjection: Boolean = false
+
     private var rawScreenWidth: Int = 1080
     private var rawScreenHeight: Int = 2400
-    private var captureWidth: Int = 720
-    private var captureHeight: Int = 1280
+    private var captureWidth: Int = 1080
+    private var captureHeight: Int = 2400
+    private var lastDisplayRotation: Int = Surface.ROTATION_0
     private var screenDensityDpi: Int = DisplayMetrics.DENSITY_HIGH
     private var consecutiveProtectedBlackFrames: Int = 0
+    private var isDisplayListenerRegistered: Boolean = false
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            val prevW = rawScreenWidth
+            val prevH = rawScreenHeight
+            val prevRot = lastDisplayRotation
+            computeCaptureMetrics()
+            if (prevW != rawScreenWidth || prevH != rawScreenHeight || prevRot != lastDisplayRotation) {
+                handleDisplayGeometryChanged(alreadyComputedMetrics = true)
+            }
+        }
+    }
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.i(TAG, "MediaProjection stopped by system/user — clearing session")
             serviceScope.launch(Dispatchers.Main) {
+                hasCreatedVirtualDisplayForProjection = false
                 teardownVirtualDisplay()
                 mediaProjection = null
                 consecutiveProtectedBlackFrames = 0
                 stopCaptureLoop()
-                ttsManager.stopSpeaking()
+                pipeline.stopAndClearQueue()
                 TranslatorStateRepository.setCapturingOcr(false)
                 TranslatorStateRepository.updateCaptureTelemetry(
                     hasActiveProjection = false,
@@ -150,6 +177,7 @@ class ScreenTranslatorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        com.example.AppContextHolder.set(applicationContext)
         TranslatorStateRepository.loadPreferences(applicationContext)
         serviceScope.launch {
             TranslatorStateRepository.loadCloudTtsFromDataStore(applicationContext)
@@ -159,6 +187,12 @@ class ScreenTranslatorService : Service() {
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         computeCaptureMetrics()
+        try {
+            displayManager?.registerDisplayListener(displayListener, imageReaderHandler)
+            isDisplayListenerRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register DisplayListener", e)
+        }
 
         ttsManager = ForegroundTtsManager.getInstance(applicationContext)
         ttsManager.addVoiceDataDownloadListener(serviceVoiceDataListener)
@@ -180,7 +214,7 @@ class ScreenTranslatorService : Service() {
             },
             onVoiceMuteToggled = { muted ->
                 if (muted) {
-                    ttsManager.stopSpeaking()
+                    pipeline.stopAndClearQueue()
                 } else {
                     val latestHindi = TranslatorStateRepository.state.value.lastTranslatedHindi
                     if (latestHindi.isNotBlank() && latestHindi != "सबटायटल बॉक्स को गेम टेक्स्ट पर रखें...") {
@@ -213,12 +247,18 @@ class ScreenTranslatorService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        computeCaptureMetrics()
-        overlayController?.onScreenOrientationChanged()
-        if (mediaProjection != null) {
-            recreateVirtualDisplayOnConfigChange()
+        handleDisplayGeometryChanged(alreadyComputedMetrics = false)
+    }
+
+    private fun handleDisplayGeometryChanged(alreadyComputedMetrics: Boolean) {
+        if (!alreadyComputedMetrics) {
+            computeCaptureMetrics()
         }
+        overlayController?.onScreenOrientationChanged()
         pipeline.imageProcessor.resetFrameDiffCache()
+        if (mediaProjection != null) {
+            resizeOrRefreshVirtualDisplay()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -243,6 +283,12 @@ class ScreenTranslatorService : Service() {
             ACTION_TOGGLE_TARGET_BOX -> {
                 val showBox = TranslatorStateRepository.state.value.showTargetBoxOverlay
                 overlayController?.setScanBoxVisibility(showBox, notifyCallback = true)
+                return START_STICKY
+            }
+
+            ACTION_UPDATE_SUBTITLE_VISIBILITY -> {
+                val showCaptions = TranslatorStateRepository.state.value.isSubtitleVisible
+                overlayController?.setSubtitleCaptionsVisibility(showCaptions)
                 return START_STICKY
             }
 
@@ -323,7 +369,6 @@ class ScreenTranslatorService : Service() {
         val state = TranslatorStateRepository.state.value
         if (state.isCapturingOcr) {
             handleDubbingStateChanged(false)
-            ttsManager.stopSpeaking()
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = mediaProjection != null,
                 isProtectedScreen = false,
@@ -332,7 +377,7 @@ class ScreenTranslatorService : Service() {
             return
         }
 
-        if (mediaProjection != null) {
+        if (mediaProjection != null && virtualDisplay != null) {
             handleDubbingStateChanged(true)
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = true,
@@ -341,14 +386,22 @@ class ScreenTranslatorService : Service() {
             )
         } else {
             // Fresh per-session MediaProjection consent required before scanning
-            TranslatorStateRepository.updateCaptureTelemetry(
-                hasActiveProjection = false,
-                statusMessage = "Requesting screen capture permission..."
-            )
-            val consentIntent = Intent(applicationContext, MediaProjectionConsentActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-            }
+            requestFreshMediaProjectionConsent()
+        }
+    }
+
+    private fun requestFreshMediaProjectionConsent() {
+        TranslatorStateRepository.updateCaptureTelemetry(
+            hasActiveProjection = false,
+            statusMessage = "Requesting fresh screen capture permission..."
+        )
+        val consentIntent = Intent(applicationContext, MediaProjectionConsentActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        }
+        try {
             startActivity(consentIntent)
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to launch MediaProjectionConsentActivity", e)
         }
     }
 
@@ -363,64 +416,91 @@ class ScreenTranslatorService : Service() {
             startCaptureLoop()
         } else {
             stopCaptureLoop()
+            pipeline.stopAndClearQueue()
         }
     }
 
     private fun startCaptureLoop() {
         captureLoopJob?.cancel()
+        isFrameInFlight.set(false)
         captureLoopJob = serviceScope.launch {
             while (isActive && TranslatorStateRepository.state.value.isCapturingOcr) {
-                val intervalMs = TranslatorStateRepository.state.value.captureIntervalMs
+                val baseIntervalMs = TranslatorStateRepository.state.value.captureIntervalMs.coerceIn(700L, 5000L)
+                var nextDelayMs = baseIntervalMs
+
+                if (!isFrameInFlight.compareAndSet(false, true)) {
+                    delay(200L)
+                    continue
+                }
+
                 try {
                     val a11yService = GameVoxAccessibilityService.instance
                     val overlayRect = overlayController?.getOverlayScreenBounds()
                     val targetBoxRect = overlayController?.getTargetBoxScreenBounds()
                         ?: TranslatorStateRepository.state.value.targetBoxScreenRect
 
+                    val captureStartMs = System.currentTimeMillis()
                     val capturedBitmap = acquireLatestScreenBitmap()
                         ?: a11yService?.captureScreenBitmapViaAccessibility()
+                    val captureLatencyMs = System.currentTimeMillis() - captureStartMs
 
                     if (capturedBitmap != null) {
-                        val isAllBlackFrame = ImageProcessor.isLikelyProtectedOrBlackFrame(capturedBitmap)
-
-                        if (isAllBlackFrame) {
-                            consecutiveProtectedBlackFrames++
-                            if (consecutiveProtectedBlackFrames >= 4) {
-                                TranslatorStateRepository.updateCaptureTelemetry(
-                                    hasActiveProjection = mediaProjection != null,
-                                    isProtectedScreen = true,
-                                    statusMessage = "Protected screen blocked capture (FLAG_SECURE)"
-                                )
-                                overlayController?.updateProtectedScreenBadge(
-                                    protected = true,
-                                    message = "Protected screen (FLAG_SECURE) blocked capture"
-                                )
-                            }
-                            capturedBitmap.recycle()
-                        } else {
-                            if (consecutiveProtectedBlackFrames > 0 || TranslatorStateRepository.state.value.isProtectedScreenDetected) {
-                                consecutiveProtectedBlackFrames = 0
-                                TranslatorStateRepository.updateCaptureTelemetry(
-                                    hasActiveProjection = mediaProjection != null,
-                                    isProtectedScreen = false,
-                                    statusMessage = "Live OCR dubbing active"
-                                )
-                                overlayController?.updateProtectedScreenBadge(protected = false)
-                            }
-
-                            val (liveW, liveH) = overlayController?.getLiveScreenSize()
-                                ?: (rawScreenWidth to rawScreenHeight)
-                            pipeline.processCapturedFrame(
-                                rawBitmap = capturedBitmap,
-                                excludeOverlayRect = overlayRect,
-                                targetRegionScreenRect = targetBoxRect,
-                                rawScreenWidth = liveW,
-                                rawScreenHeight = liveH,
-                                skipIfRegionUnchanged = true,
-                                onDebugTextUpdate = { eng, hin, note ->
-                                    overlayController?.updateDebugReadout(eng, hin, note)
+                        try {
+                            val isAllBlackFrame = ImageProcessor.isLikelyProtectedOrBlackFrame(capturedBitmap)
+                            if (isAllBlackFrame) {
+                                consecutiveProtectedBlackFrames++
+                                if (consecutiveProtectedBlackFrames >= 4) {
+                                    TranslatorStateRepository.updateCaptureTelemetry(
+                                        hasActiveProjection = mediaProjection != null,
+                                        isProtectedScreen = true,
+                                        statusMessage = "Protected screen blocked capture (FLAG_SECURE)"
+                                    )
+                                    overlayController?.updateProtectedScreenBadge(
+                                        protected = true,
+                                        message = "Protected screen (FLAG_SECURE) blocked capture"
+                                    )
                                 }
-                            )
+                                nextDelayMs = (baseIntervalMs * 1.4f).toLong().coerceAtMost(2200L)
+                            } else {
+                                if (consecutiveProtectedBlackFrames > 0 || TranslatorStateRepository.state.value.isProtectedScreenDetected) {
+                                    consecutiveProtectedBlackFrames = 0
+                                    TranslatorStateRepository.updateCaptureTelemetry(
+                                        hasActiveProjection = mediaProjection != null,
+                                        isProtectedScreen = false,
+                                        statusMessage = "Live OCR dubbing active"
+                                    )
+                                    overlayController?.updateProtectedScreenBadge(protected = false)
+                                }
+
+                                val (liveW, liveH) = overlayController?.getLiveScreenSize()
+                                    ?: (rawScreenWidth to rawScreenHeight)
+
+                                val (_, translated) = pipeline.processCapturedFrame(
+                                    rawBitmap = capturedBitmap,
+                                    excludeOverlayRect = overlayRect,
+                                    targetRegionScreenRect = targetBoxRect,
+                                    rawScreenWidth = liveW,
+                                    rawScreenHeight = liveH,
+                                    skipIfRegionUnchanged = true,
+                                    captureLatencyMs = captureLatencyMs,
+                                    enforceActiveSession = true,
+                                    onDebugTextUpdate = { eng, hin, note ->
+                                        overlayController?.updateDebugReadout(eng, hin, note)
+                                    }
+                                )
+
+                                // Adaptive cadence: responsive while waiting for next subtitle, relaxed while speaking
+                                nextDelayMs = when {
+                                    pipeline.isTtsSpeakingNow() || translated.isNotBlank() ->
+                                        (baseIntervalMs + 250L).coerceAtMost(1400L)
+                                    else ->
+                                        baseIntervalMs.coerceIn(700L, 1000L)
+                                }
+                            }
+                        } finally {
+                            if (!capturedBitmap.isRecycled) {
+                                capturedBitmap.recycle()
+                            }
                         }
                     } else {
                         // Fall back to Accessibility node text ONLY for apps that expose standard UI nodes
@@ -428,12 +508,15 @@ class ScreenTranslatorService : Service() {
                         if (nodeText.isNotBlank()) {
                             pipeline.processExtractedRawText(
                                 rawEnglishText = nodeText,
+                                enforceActiveSession = true,
                                 onDebugTextUpdate = { eng, hin, note ->
                                     overlayController?.updateDebugReadout(eng, hin, note)
                                 }
                             )
                         }
                     }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
                 } catch (sec: SecurityException) {
                     Log.w(TAG, "SecurityException in screen capture loop", sec)
                     TranslatorStateRepository.updateCaptureTelemetry(
@@ -441,14 +524,23 @@ class ScreenTranslatorService : Service() {
                         isProtectedScreen = true,
                         statusMessage = "Protected screen or revoked capture permission"
                     )
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        lastPipelineError = "SecurityException: ${sec.localizedMessage ?: "revoked"}"
+                    )
                     overlayController?.updateProtectedScreenBadge(
                         protected = true,
                         message = "Protected screen or revoked permission"
                     )
                 } catch (e: Exception) {
                     Log.w(TAG, "Error in screen capture OCR loop", e)
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        lastPipelineError = "Loop error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                    )
+                } finally {
+                    isFrameInFlight.set(false)
                 }
-                delay(intervalMs)
+
+                delay(nextDelayMs)
             }
         }
     }
@@ -456,13 +548,19 @@ class ScreenTranslatorService : Service() {
     private fun stopCaptureLoop() {
         captureLoopJob?.cancel()
         captureLoopJob = null
+        isFrameInFlight.set(false)
     }
 
     private fun setupMediaProjection(resultCode: Int, resultData: Intent): Boolean {
         return try {
             teardownVirtualDisplay()
-            mediaProjection?.unregisterCallback(projectionCallback)
-            mediaProjection?.stop()
+            try {
+                mediaProjection?.unregisterCallback(projectionCallback)
+                mediaProjection?.stop()
+            } catch (_: Exception) {
+            }
+            mediaProjection = null
+            hasCreatedVirtualDisplayForProjection = false
 
             val projection = mediaProjectionManager?.getMediaProjection(resultCode, resultData)
             if (projection == null) {
@@ -476,15 +574,16 @@ class ScreenTranslatorService : Service() {
 
             projection.registerCallback(projectionCallback, imageReaderHandler)
             mediaProjection = projection
-            createVirtualDisplayAndReader(projection)
+            createVirtualDisplayOnce(projection)
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = true,
                 isProtectedScreen = false,
-                statusMessage = "Live OCR dubbing active"
+                statusMessage = "Live OCR dubbing active ($captureWidth x $captureHeight)"
             )
             true
         } catch (sec: SecurityException) {
             Log.e(TAG, "SecurityException starting MediaProjection", sec)
+            hasCreatedVirtualDisplayForProjection = false
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = false,
                 isProtectedScreen = true,
@@ -493,6 +592,7 @@ class ScreenTranslatorService : Service() {
             false
         } catch (e: Exception) {
             Log.w(TAG, "Failed to setup MediaProjection VirtualDisplay", e)
+            hasCreatedVirtualDisplayForProjection = false
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = false,
                 statusMessage = "Capture initialization error: ${e.message ?: "unknown"}"
@@ -501,31 +601,100 @@ class ScreenTranslatorService : Service() {
         }
     }
 
-    private fun recreateVirtualDisplayOnConfigChange() {
-        val projection = mediaProjection ?: return
-        teardownVirtualDisplay()
-        createVirtualDisplayAndReader(projection)
+    /**
+     * Android 14+ MediaProjection allows `createVirtualDisplay()` AT MOST ONCE per MediaProjection instance.
+     * On orientation/density changes, resize the EXISTING [VirtualDisplay] and swap a new [ImageReader.getSurface]
+     * via [VirtualDisplay.setSurface], closing the old [ImageReader] cleanly. If resizing is impossible,
+     * tear down the exhausted projection and request fresh user consent instead of calling createVirtualDisplay twice.
+     */
+    private fun resizeOrRefreshVirtualDisplay() {
+        val vd = virtualDisplay
+        val projection = mediaProjection
+        if (vd == null || projection == null) {
+            if (projection != null && hasCreatedVirtualDisplayForProjection) {
+                handleExhaustedProjectionAfterRotation()
+            }
+            return
+        }
+
+        var newReader: ImageReader? = null
+        try {
+            val w = captureWidth.coerceAtLeast(320)
+            val h = captureHeight.coerceAtLeast(320)
+            newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            vd.resize(w, h, screenDensityDpi)
+            vd.setSurface(newReader.surface)
+
+            val oldReader = imageReader
+            imageReader = newReader
+            try {
+                oldReader?.close()
+            } catch (_: Exception) {
+            }
+            Log.i(TAG, "Resized existing VirtualDisplay cleanly to ${w}x${h}")
+            TranslatorStateRepository.updateCaptureTelemetry(
+                hasActiveProjection = true,
+                isProtectedScreen = false,
+                statusMessage = "Capture resized (${w}x${h})"
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "VirtualDisplay resize/setSurface failed; tearing down and requesting fresh consent", e)
+            try {
+                newReader?.close()
+            } catch (_: Exception) {
+            }
+            TranslatorStateRepository.updateDiagnosisMetrics(
+                lastPipelineError = "Display resize requires fresh permission: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
+            handleExhaustedProjectionAfterRotation()
+        }
     }
 
-    private fun createVirtualDisplayAndReader(projection: MediaProjection) {
-        val reader = ImageReader.newInstance(
-            captureWidth.coerceAtLeast(320),
-            captureHeight.coerceAtLeast(320),
-            PixelFormat.RGBA_8888,
-            2
+    private fun handleExhaustedProjectionAfterRotation() {
+        val wasScanning = TranslatorStateRepository.state.value.isCapturingOcr
+        stopCaptureLoop()
+        pipeline.stopAndClearQueue()
+        teardownVirtualDisplay()
+        try {
+            mediaProjection?.unregisterCallback(projectionCallback)
+            mediaProjection?.stop()
+        } catch (_: Exception) {
+        }
+        mediaProjection = null
+        hasCreatedVirtualDisplayForProjection = false
+        TranslatorStateRepository.setCapturingOcr(false)
+        TranslatorStateRepository.updateCaptureTelemetry(
+            hasActiveProjection = false,
+            isProtectedScreen = false,
+            statusMessage = "Screen rotated — fresh capture permission needed"
         )
+        overlayController?.updateScanningState(false)
+        updateNotification(isScanning = false)
+        if (wasScanning) {
+            requestFreshMediaProjectionConsent()
+        }
+    }
+
+    private fun createVirtualDisplayOnce(projection: MediaProjection) {
+        check(!hasCreatedVirtualDisplayForProjection) {
+            "createVirtualDisplay() must not be called twice on the same MediaProjection instance"
+        }
+        val w = captureWidth.coerceAtLeast(320)
+        val h = captureHeight.coerceAtLeast(320)
+        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         imageReader = reader
 
         virtualDisplay = projection.createVirtualDisplay(
             "GameVoxHindiScreenCapture",
-            captureWidth.coerceAtLeast(320),
-            captureHeight.coerceAtLeast(320),
+            w,
+            h,
             screenDensityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface,
             null,
             imageReaderHandler
         )
+        hasCreatedVirtualDisplayForProjection = true
     }
 
     private fun acquireLatestScreenBitmap(): Bitmap? {
@@ -575,6 +744,7 @@ class ScreenTranslatorService : Service() {
             var w = dm.widthPixels.coerceAtLeast(360)
             var h = dm.heightPixels.coerceAtLeast(360)
             val rot = display.rotation
+            lastDisplayRotation = rot
             val isLandscape = rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270
             if (isLandscape && w < h) {
                 val tmp = w; w = h; h = tmp
@@ -596,10 +766,10 @@ class ScreenTranslatorService : Service() {
             }
         }
 
-        val maxDim = 960
-        if (rawScreenWidth > maxDim || rawScreenHeight > maxDim) {
+        // Preserve full native fidelity on phones/tablets up to 2560px so small subtitles remain sharp before ROI crop
+        if (rawScreenWidth > MAX_CAPTURE_DIMENSION_PX || rawScreenHeight > MAX_CAPTURE_DIMENSION_PX) {
             val longest = maxOf(rawScreenWidth, rawScreenHeight)
-            val scale = maxDim.toFloat() / longest.toFloat()
+            val scale = MAX_CAPTURE_DIMENSION_PX.toFloat() / longest.toFloat()
             captureWidth = (rawScreenWidth * scale).toInt().coerceAtLeast(320)
             captureHeight = (rawScreenHeight * scale).toInt().coerceAtLeast(320)
         } else {
@@ -724,9 +894,10 @@ class ScreenTranslatorService : Service() {
 
     private fun stopTranslatorServiceCleanly() {
         stopCaptureLoop()
-        ttsManager.stopSpeaking()
+        pipeline.stopAndClearQueue()
         overlayController?.destroyOverlay()
         teardownVirtualDisplay()
+        hasCreatedVirtualDisplayForProjection = false
         try {
             mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()
@@ -749,11 +920,22 @@ class ScreenTranslatorService : Service() {
 
     override fun onDestroy() {
         stopCaptureLoop()
+        if (::pipeline.isInitialized) {
+            pipeline.stopAndClearQueue()
+        }
+        if (isDisplayListenerRegistered) {
+            try {
+                displayManager?.unregisterDisplayListener(displayListener)
+            } catch (_: Exception) {
+            }
+            isDisplayListenerRegistered = false
+        }
         if (::ttsManager.isInitialized) {
             ttsManager.removeVoiceDataDownloadListener(serviceVoiceDataListener)
         }
         overlayController?.destroyOverlay()
         teardownVirtualDisplay()
+        hasCreatedVirtualDisplayForProjection = false
         try {
             mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()

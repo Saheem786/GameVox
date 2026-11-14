@@ -34,25 +34,25 @@ enum class CloudTtsProvider(
     ANDROID_SSML_NETWORK(
         code = "android_ssml",
         displayLabel = "Default Phone TTS",
-        subtitle = "Built-in hi-IN network voices + SSML prosody (No API key needed)",
+        subtitle = "Built-in Android hi-IN voices via pitch/rate/volume (No API key needed)",
         requiresApiKey = false
     ),
     GOOGLE_CLOUD_TTS(
         code = "google_cloud_tts",
-        displayLabel = "Google Cloud TTS",
-        subtitle = "AI Neural2 & WaveNet human voices with full SSML emotions",
+        displayLabel = "Google Cloud TTS (Optional)",
+        subtitle = "Optional user API key • W3C SSML Neural2/WaveNet (Cloud billing/quota)",
         requiresApiKey = true
     ),
     ELEVENLABS(
         code = "elevenlabs",
-        displayLabel = "ElevenLabs",
-        subtitle = "Ultra-realistic Multilingual v2 AI voices with emotion settings",
+        displayLabel = "ElevenLabs (Optional)",
+        subtitle = "Optional user API key • Multilingual v2 voices (Cloud billing/quota)",
         requiresApiKey = true
     ),
     OPENAI_TTS(
         code = "openai_tts",
-        displayLabel = "OpenAI TTS",
-        subtitle = "Expressive gpt-4o-mini-tts AI voices with emotion instructions",
+        displayLabel = "OpenAI TTS (Optional)",
+        subtitle = "Optional user API key • gpt-4o-mini-tts (Cloud billing/quota)",
         requiresApiKey = true
     );
 

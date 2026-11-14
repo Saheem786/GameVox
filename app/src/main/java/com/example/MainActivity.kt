@@ -42,6 +42,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Female
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Male
@@ -96,11 +97,13 @@ import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfileRepository
+import com.example.engine.ContextAwareAiTranslator
 import com.example.engine.OcrTranslationPipeline
 import com.example.firebase.configureAppCheck
 import com.example.service.ForegroundTtsManager
 import com.example.service.GameVoxAccessibilityService
 import com.example.service.ScreenTranslatorService
+import com.example.ui.DiagnosisScreen
 import com.example.ui.SettingsScreen
 import com.example.ui.VoiceManagerScreen
 import com.example.ui.theme.MyApplicationTheme
@@ -109,7 +112,8 @@ import kotlinx.coroutines.launch
 private enum class AppScreen {
     HOME,
     SETTINGS,
-    VOICE_MANAGER
+    VOICE_MANAGER,
+    DIAGNOSIS
 }
 
 class MainActivity : ComponentActivity() {
@@ -120,12 +124,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Must run immediately before enableEdgeToEdge(), ViewModels, or setContent
         configureAppCheck(this, intent)
+        AppContextHolder.set(applicationContext)
         enableEdgeToEdge()
 
         TranslatorStateRepository.loadPreferences(applicationContext)
         lifecycleScope.launch {
             TranslatorStateRepository.loadCloudTtsFromDataStore(applicationContext)
         }
+        ContextAwareAiTranslator.isFirebaseAiAvailable(applicationContext)
         VoiceProfileRepository.initialize(applicationContext)
         localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
         localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
@@ -161,6 +167,7 @@ fun GameVoxApp(
 
     var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
     var voiceManagerOrigin by remember { mutableStateOf(AppScreen.HOME) }
+    var diagnosisOrigin by remember { mutableStateOf(AppScreen.HOME) }
     var showAiConsentDialog by remember { mutableStateOf(false) }
 
     var hasOverlayPermission by remember {
@@ -377,7 +384,7 @@ fun GameVoxApp(
                     TranslatorStateRepository.setSubtitleVisible(context, showCaptions)
                     if (state.isServiceRunning) {
                         val intent = Intent(context, ScreenTranslatorService::class.java).apply {
-                            action = ScreenTranslatorService.ACTION_TOGGLE_SCANNING
+                            action = ScreenTranslatorService.ACTION_UPDATE_SUBTITLE_VISIBILITY
                         }
                         context.startService(intent)
                     }
@@ -403,6 +410,30 @@ fun GameVoxApp(
                 },
                 onInstallVoiceData = {
                     localPipeline.promptInstallHindiTtsData(context, openSystemInstaller = true)
+                },
+                onOpenDiagnosis = {
+                    diagnosisOrigin = AppScreen.SETTINGS
+                    currentScreen = AppScreen.DIAGNOSIS
+                }
+            )
+            return
+        }
+
+        AppScreen.DIAGNOSIS -> {
+            DiagnosisScreen(
+                state = state,
+                femaleVoicesCount = localPipeline.ttsManager.femaleVoices.size,
+                maleVoicesCount = localPipeline.ttsManager.maleVoices.size,
+                onNavigateBack = { currentScreen = diagnosisOrigin },
+                onTestVoice = {
+                    localPipeline.refreshTtsConfiguration()
+                    localPipeline.speakHindiNonBlocking(
+                        state.targetLanguage.sampleGreeting,
+                        forceSpeakEvenIfRepeat = true
+                    )
+                },
+                onClearQueueAndCache = {
+                    localPipeline.resetAntiRepeatMemory()
                 }
             )
             return
@@ -491,6 +522,19 @@ fun GameVoxApp(
                     )
                 },
                 actions = {
+                    IconButton(
+                        onClick = {
+                            diagnosisOrigin = AppScreen.HOME
+                            currentScreen = AppScreen.DIAGNOSIS
+                        },
+                        modifier = Modifier.testTag("open_diagnosis_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.BugReport,
+                            contentDescription = "Live Diagnosis",
+                            tint = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
                     IconButton(
                         onClick = { currentScreen = AppScreen.SETTINGS },
                         modifier = Modifier.testTag("open_settings_sheet_button")
@@ -741,10 +785,17 @@ fun GameVoxApp(
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    text = if (state.translationMode == TranslationMode.ON_DEVICE_MLKIT) {
-                                        state.mlKitModelStatusText
-                                    } else {
-                                        "Online • 4-line scene context active"
+                                    text = when {
+                                        state.translationMode == TranslationMode.ON_DEVICE_MLKIT &&
+                                            (state.translationSourceLabel == "Offline Phrasebook (Limited)" ||
+                                                state.modelStatus == com.example.data.ModelDownloadStatus.OFFLINE_FALLBACK) ->
+                                            "Limited Local Phrasebook • Download ~30 MB ML Kit pack"
+                                        state.translationMode == TranslationMode.ON_DEVICE_MLKIT ->
+                                            state.mlKitModelStatusText
+                                        state.firebaseAiStatusText.contains("Configured", ignoreCase = true) ->
+                                            "Online • 4-line scene context active"
+                                        else ->
+                                            "AI Unavailable (${state.firebaseAiStatusText}) • Using Offline"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,

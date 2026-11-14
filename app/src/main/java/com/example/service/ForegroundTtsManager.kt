@@ -154,6 +154,8 @@ class ForegroundTtsManager private constructor(context: Context) {
     private var thirtySecondRepeatDelayJob: Job? = null
     private var isReceiverRegistered: Boolean = false
 
+    private val _playbackEpoch = java.util.concurrent.atomic.AtomicLong(0L)
+
     @Volatile
     var isSpeakingUtterance: Boolean = false
         private set
@@ -379,6 +381,11 @@ class ForegroundTtsManager private constructor(context: Context) {
                 isSpeakingUtterance = true
                 activeUtteranceId = utteranceId
                 thirtySecondRepeatDelayJob?.cancel()
+                TranslatorStateRepository.updateTtsLifecycleEvent(
+                    event = "onStart",
+                    utteranceId = utteranceId,
+                    error = ""
+                )
                 _visualizerState.update { current ->
                     current.copy(
                         isSpeaking = true,
@@ -425,6 +432,11 @@ class ForegroundTtsManager private constructor(context: Context) {
                 if (activeUtteranceId == utteranceId) {
                     activeUtteranceId = null
                 }
+                TranslatorStateRepository.updateTtsLifecycleEvent(
+                    event = "onDone",
+                    utteranceId = utteranceId,
+                    error = ""
+                )
                 if (_visualizerState.value.utteranceId == utteranceId) {
                     stopVisualizerSync()
                 }
@@ -444,6 +456,11 @@ class ForegroundTtsManager private constructor(context: Context) {
                         isSpeakingUtterance = false
                         activeUtteranceId = null
                     }
+                    TranslatorStateRepository.updateTtsLifecycleEvent(
+                        event = if (interrupted) "onStop (Interrupted)" else "onStop",
+                        utteranceId = utteranceId,
+                        error = ""
+                    )
                     if (_visualizerState.value.utteranceId == utteranceId) {
                         stopVisualizerSync()
                     }
@@ -461,10 +478,29 @@ class ForegroundTtsManager private constructor(context: Context) {
         })
     }
 
-    private fun handleUtteranceFailure(utteranceId: String?, errorCode: Int) {
+    internal fun mapTtsErrorCode(errorCode: Int): String {
+        return when (errorCode) {
+            TextToSpeech.ERROR_SYNTHESIS -> "ERROR_SYNTHESIS"
+            TextToSpeech.ERROR_SERVICE -> "ERROR_SERVICE"
+            TextToSpeech.ERROR_OUTPUT -> "ERROR_OUTPUT"
+            TextToSpeech.ERROR_NETWORK -> "ERROR_NETWORK"
+            TextToSpeech.ERROR_NETWORK_TIMEOUT -> "ERROR_NETWORK_TIMEOUT"
+            TextToSpeech.ERROR_INVALID_REQUEST -> "ERROR_INVALID_REQUEST"
+            TextToSpeech.ERROR_NOT_INSTALLED_YET -> "ERROR_NOT_INSTALLED_YET"
+            else -> "ERROR_GENERIC($errorCode)"
+        }
+    }
+
+    internal fun handleUtteranceFailure(utteranceId: String?, errorCode: Int) {
         if (utteranceId == null) return
+        val errorLabel = mapTtsErrorCode(errorCode)
         val failedNetworkUtterance = activeNetworkUtterances.remove(utteranceId)
-        Log.w(TAG, "TTS utterance error ($errorCode) for $utteranceId")
+        Log.w(TAG, "TTS utterance error ($errorLabel) for $utteranceId")
+        TranslatorStateRepository.updateTtsLifecycleEvent(
+            event = "onError($errorLabel)",
+            utteranceId = utteranceId,
+            error = errorLabel
+        )
         if (activeUtteranceId == utteranceId) {
             isSpeakingUtterance = false
             activeUtteranceId = null
@@ -473,7 +509,7 @@ class ForegroundTtsManager private constructor(context: Context) {
             stopVisualizerSync()
         }
 
-        // If SSML or High-Quality Network voice failed on this device, auto-fallback cleanly to plain local/default voice
+        // If HD network synthesis failed on this device, auto-fallback cleanly to plain local voice
         if (failedNetworkUtterance != null) {
             managerScope.launch {
                 speakInternal(
@@ -1007,8 +1043,9 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
-        // Dynamically fetch the Cloud TTS API key from Jetpack DataStore when a Cloud provider is selected
+        // Dynamically fetch the Cloud TTS API key from Jetpack DataStore when an optional Cloud provider is selected
         if (state.cloudTtsProvider != CloudTtsProvider.ANDROID_SSML_NETWORK) {
+            val myEpoch = _playbackEpoch.get()
             val cloudUtteranceId = "cloud_${UUID.randomUUID()}"
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
@@ -1022,14 +1059,23 @@ class ForegroundTtsManager private constructor(context: Context) {
             activeUtteranceId = cloudUtteranceId
 
             managerScope.launch {
+                if (_playbackEpoch.get() != myEpoch) {
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == cloudUtteranceId) activeUtteranceId = null
+                    return@launch
+                }
                 val resolvedApiKey = TtsSettingsDataStore.getEffectiveApiKey(
                     context = appContext,
                     provider = state.cloudTtsProvider
                 )
+                if (_playbackEpoch.get() != myEpoch) {
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == cloudUtteranceId) activeUtteranceId = null
+                    return@launch
+                }
                 if (resolvedApiKey.isBlank()) {
-                    // No API key saved by user -> switch to Default Phone TTS engine with clear status note
                     TranslatorStateRepository.setCloudTtsStatusMessage(
-                        "No API key saved for ${state.cloudTtsProvider.displayLabel} — switched to Default Phone TTS"
+                        "No API key saved for ${state.cloudTtsProvider.displayLabel} — using built-in Phone TTS"
                     )
                     isSpeakingUtterance = false
                     if (activeUtteranceId == cloudUtteranceId) {
@@ -1051,7 +1097,16 @@ class ForegroundTtsManager private constructor(context: Context) {
                     emotionResult = emotionResult,
                     apiKeyOverride = resolvedApiKey,
                     onStarted = { cloudModelName ->
+                        if (_playbackEpoch.get() != myEpoch) {
+                            CloudTtsService.stopPlayback()
+                            return@synthesizeAndPlay
+                        }
                         TranslatorStateRepository.setActiveVoiceName(cloudModelName)
+                        TranslatorStateRepository.updateTtsLifecycleEvent(
+                            event = "Cloud:onStart",
+                            utteranceId = cloudUtteranceId,
+                            error = ""
+                        )
                         TranslatorStateRepository.setCloudTtsStatusMessage(
                             "Speaking via ${state.cloudTtsProvider.displayLabel}"
                         )
@@ -1068,45 +1123,60 @@ class ForegroundTtsManager private constructor(context: Context) {
                         if (activeUtteranceId == cloudUtteranceId) {
                             activeUtteranceId = null
                         }
+                        TranslatorStateRepository.updateTtsLifecycleEvent(
+                            event = "Cloud:onDone",
+                            utteranceId = cloudUtteranceId,
+                            error = ""
+                        )
                         if (_visualizerState.value.utteranceId == cloudUtteranceId) {
                             stopVisualizerSync()
                         }
-                        onUtteranceCompletedImmediately?.invoke(cloudUtteranceId)
-                        thirtySecondRepeatDelayJob?.cancel()
-                        thirtySecondRepeatDelayJob = managerScope.launch {
-                            delay(30000L)
-                            onThirtySecondPostSpeechDelayCompleted?.invoke(cloudUtteranceId)
+                        if (_playbackEpoch.get() == myEpoch) {
+                            onUtteranceCompletedImmediately?.invoke(cloudUtteranceId)
+                            thirtySecondRepeatDelayJob?.cancel()
+                            thirtySecondRepeatDelayJob = managerScope.launch {
+                                delay(30000L)
+                                onThirtySecondPostSpeechDelayCompleted?.invoke(cloudUtteranceId)
+                            }
                         }
                     },
                     onError = { errorMsg ->
-                        // Cloud playback failed -> fallback smoothly to Default Phone TTS engine
+                        TranslatorStateRepository.updateTtsLifecycleEvent(
+                            event = "Cloud:onError",
+                            utteranceId = cloudUtteranceId,
+                            error = errorMsg
+                        )
                         TranslatorStateRepository.setCloudTtsStatusMessage(
-                            "${state.cloudTtsProvider.displayLabel} error ($errorMsg) — switched to Default Phone TTS"
+                            "${state.cloudTtsProvider.displayLabel} error ($errorMsg) — switched to Phone TTS"
                         )
                         isSpeakingUtterance = false
                         if (activeUtteranceId == cloudUtteranceId) {
                             activeUtteranceId = null
                         }
+                        if (_playbackEpoch.get() == myEpoch) {
+                            speakOnAndroidTts(
+                                text = text,
+                                sourceEnglishText = sourceEnglishText,
+                                voiceProfile = voiceProfile
+                            )
+                        }
+                    }
+                )
+                if (!started) {
+                    TranslatorStateRepository.setCloudTtsStatusMessage(
+                        "${state.cloudTtsProvider.displayLabel} request failed — switched to Phone TTS"
+                    )
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == cloudUtteranceId) {
+                        activeUtteranceId = null
+                    }
+                    if (_playbackEpoch.get() == myEpoch) {
                         speakOnAndroidTts(
                             text = text,
                             sourceEnglishText = sourceEnglishText,
                             voiceProfile = voiceProfile
                         )
                     }
-                )
-                if (!started) {
-                    TranslatorStateRepository.setCloudTtsStatusMessage(
-                        "${state.cloudTtsProvider.displayLabel} request failed — switched to Default Phone TTS"
-                    )
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == cloudUtteranceId) {
-                        activeUtteranceId = null
-                    }
-                    speakOnAndroidTts(
-                        text = text,
-                        sourceEnglishText = sourceEnglishText,
-                        voiceProfile = voiceProfile
-                    )
                 }
             }
             return true
@@ -1133,11 +1203,12 @@ class ForegroundTtsManager private constructor(context: Context) {
             return false
         }
         val state = TranslatorStateRepository.state.value
+        // Built-in Android TextToSpeech ALWAYS receives clean plain text + pitch/rate/volume (never raw SSML XML)
         return speakInternal(
             text = text,
             sourceEnglishText = sourceEnglishText,
             allowNetworkSynthesis = state.useHighQualityNetworkVoice,
-            allowSsml = state.ssmlEnabledOnDevice,
+            allowSsml = false,
             voiceProfile = voiceProfile
         )
     }
@@ -1243,12 +1314,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             val useNetworkBundle = allowNetworkSynthesis &&
                 (appliedVoice == null || isNetworkHighQualityVoice(appliedVoice))
 
-            // Wrap spoken text in SSML (<speak><prosody ...>...</prosody></speak>) when enabled
-            val utterancePayload = if (allowSsml) {
-                emotionResult.ssmlMarkup
-            } else {
-                emotionResult.cleanSpokenText
-            }
+            // Built-in Android TextToSpeech MUST receive clean plain text (SSML <speak> XML is Cloud-only)
+            val utterancePayload = emotionResult.cleanSpokenText
 
             val params = Bundle().apply {
                 putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
@@ -1259,25 +1326,30 @@ class ForegroundTtsManager private constructor(context: Context) {
                 }
             }
 
-            if (useNetworkBundle || allowSsml) {
+            if (useNetworkBundle) {
                 activeNetworkUtterances[utteranceId] = PendingNetworkUtterance(
                     text = fullContinuousText,
                     sourceEnglishText = sourceEnglishText,
                     voiceProfile = voiceProfile,
-                    usedSsml = allowSsml
+                    usedSsml = false
                 )
             }
 
             isSpeakingUtterance = true
             activeUtteranceId = utteranceId
 
-            // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak the SSML / modulated text
+            // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak clean modulated text
             val result = engine.speak(utterancePayload, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
                 activeNetworkUtterances.remove(utteranceId)
                 isSpeakingUtterance = false
                 activeUtteranceId = null
-                if (useNetworkBundle || allowSsml) {
+                TranslatorStateRepository.updateTtsLifecycleEvent(
+                    event = "speak_failed($result)",
+                    utteranceId = utteranceId,
+                    error = "TextToSpeech.speak returned $result"
+                )
+                if (useNetworkBundle) {
                     return speakInternal(
                         text = text,
                         sourceEnglishText = sourceEnglishText,
@@ -1681,6 +1753,9 @@ class ForegroundTtsManager private constructor(context: Context) {
     }
 
     fun stopSpeaking() {
+        _playbackEpoch.incrementAndGet()
+        pendingSubtitleToSpeak = null
+        activeNetworkUtterances.clear()
         thirtySecondRepeatDelayJob?.cancel()
         thirtySecondRepeatDelayJob = null
         isSpeakingUtterance = false
@@ -1691,5 +1766,10 @@ class ForegroundTtsManager private constructor(context: Context) {
         } catch (_: Exception) {
         }
         stopVisualizerSync()
+        TranslatorStateRepository.updateTtsLifecycleEvent(
+            event = "STOPPED",
+            utteranceId = "",
+            error = ""
+        )
     }
 }

@@ -70,6 +70,9 @@ jobs:
             touch .env.example
           fi
 
+      - name: Run JVM & Robolectric Unit Tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
       - name: Build Debug APK with Gradle Wrapper
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
