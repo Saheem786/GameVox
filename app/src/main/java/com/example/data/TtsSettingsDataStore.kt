@@ -3,12 +3,13 @@ package com.example.data
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.example.BuildConfig
 import com.example.service.CloudTtsProvider
+import com.example.service.FreeVoiceBackend
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -23,25 +24,22 @@ data class CloudTtsStoredPreferences(
     val provider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
     val googleCloudApiKey: String = "",
     val elevenLabsApiKey: String = "",
-    val openAiApiKey: String = ""
+    val openAiApiKey: String = "",
+    val selectedTtsEnginePackage: String = "",
+    val freeVoiceBackend: FreeVoiceBackend = FreeVoiceBackend.ANDROID_USER_SELECTED,
+    val kokoroModelPath: String = "",
+    val kokoroUseGpu: Boolean = true
 ) {
-    fun keyFor(targetProvider: CloudTtsProvider): String {
-        return when (targetProvider) {
-            CloudTtsProvider.GOOGLE_CLOUD_TTS -> googleCloudApiKey
-            CloudTtsProvider.ELEVENLABS -> elevenLabsApiKey
-            CloudTtsProvider.OPENAI_TTS -> openAiApiKey
-            CloudTtsProvider.ANDROID_SSML_NETWORK -> ""
-        }
-    }
+    fun keyFor(targetProvider: CloudTtsProvider): String = ""
 }
 
 /**
- * Jetpack DataStore Preferences storage for user-configured Cloud TTS Provider and API keys
- * (Google Cloud TTS, ElevenLabs, OpenAI TTS).
+ * Jetpack DataStore Preferences storage for GameVox's FREE Voice Engine settings:
+ * - Selected Android TTS Engine package (`""` = Follow Android System Default, or e.g. `com.k2fsa.sherpa.onnx.tts.engine`)
+ * - Free Voice Backend (`ANDROID_USER_SELECTED` or optional `MEDIAPIPE_KOKORO`)
+ * - Optional Kokoro-82M `.litertlm` local model path & GPU delegate preference
  *
- * Keys saved here are loaded automatically when the app starts and fetched dynamically
- * before making any Cloud TTS API request, falling back to the Default Phone TTS engine
- * if no valid key is present.
+ * Paid cloud TTS API keys, billing, and subscriptions are permanently disabled.
  */
 object TtsSettingsDataStore {
 
@@ -49,6 +47,11 @@ object TtsSettingsDataStore {
     private val KEY_GOOGLE_CLOUD_API_KEY = stringPreferencesKey("google_cloud_tts_api_key")
     private val KEY_ELEVENLABS_API_KEY = stringPreferencesKey("elevenlabs_tts_api_key")
     private val KEY_OPENAI_API_KEY = stringPreferencesKey("openai_tts_api_key")
+
+    private val KEY_SELECTED_ANDROID_TTS_ENGINE = stringPreferencesKey("selected_android_tts_engine_pkg_v1")
+    private val KEY_FREE_VOICE_BACKEND = stringPreferencesKey("free_voice_backend_v1")
+    private val KEY_KOKORO_MODEL_PATH = stringPreferencesKey("kokoro_model_path_v1")
+    private val KEY_KOKORO_USE_GPU = booleanPreferencesKey("kokoro_use_gpu_v1")
 
     fun observePreferences(context: Context): Flow<CloudTtsStoredPreferences> {
         return context.applicationContext.ttsSettingsDataStore.data
@@ -61,10 +64,14 @@ object TtsSettingsDataStore {
             }
             .map { prefs ->
                 CloudTtsStoredPreferences(
-                    provider = CloudTtsProvider.fromCode(prefs[KEY_SELECTED_PROVIDER]),
-                    googleCloudApiKey = prefs[KEY_GOOGLE_CLOUD_API_KEY].orEmpty().trim(),
-                    elevenLabsApiKey = prefs[KEY_ELEVENLABS_API_KEY].orEmpty().trim(),
-                    openAiApiKey = prefs[KEY_OPENAI_API_KEY].orEmpty().trim()
+                    provider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+                    googleCloudApiKey = "",
+                    elevenLabsApiKey = "",
+                    openAiApiKey = "",
+                    selectedTtsEnginePackage = prefs[KEY_SELECTED_ANDROID_TTS_ENGINE].orEmpty().trim(),
+                    freeVoiceBackend = FreeVoiceBackend.fromCode(prefs[KEY_FREE_VOICE_BACKEND]),
+                    kokoroModelPath = prefs[KEY_KOKORO_MODEL_PATH].orEmpty().trim(),
+                    kokoroUseGpu = prefs[KEY_KOKORO_USE_GPU] ?: true
                 )
             }
     }
@@ -73,9 +80,30 @@ object TtsSettingsDataStore {
         return observePreferences(context).first()
     }
 
+    suspend fun saveSelectedAndroidTtsEngine(context: Context, enginePackage: String) {
+        val cleaned = enginePackage.trim()
+        context.applicationContext.ttsSettingsDataStore.edit { prefs ->
+            prefs[KEY_SELECTED_ANDROID_TTS_ENGINE] = cleaned
+            prefs[KEY_SELECTED_PROVIDER] = CloudTtsProvider.ANDROID_SSML_NETWORK.code
+        }
+    }
+
+    suspend fun saveFreeVoiceBackend(context: Context, backend: FreeVoiceBackend) {
+        context.applicationContext.ttsSettingsDataStore.edit { prefs ->
+            prefs[KEY_FREE_VOICE_BACKEND] = backend.code
+        }
+    }
+
+    suspend fun saveKokoroConfig(context: Context, modelPath: String, useGpu: Boolean) {
+        context.applicationContext.ttsSettingsDataStore.edit { prefs ->
+            prefs[KEY_KOKORO_MODEL_PATH] = modelPath.trim()
+            prefs[KEY_KOKORO_USE_GPU] = useGpu
+        }
+    }
+
     suspend fun saveProvider(context: Context, provider: CloudTtsProvider) {
         context.applicationContext.ttsSettingsDataStore.edit { prefs ->
-            prefs[KEY_SELECTED_PROVIDER] = provider.code
+            prefs[KEY_SELECTED_PROVIDER] = CloudTtsProvider.ANDROID_SSML_NETWORK.code
         }
     }
 
@@ -84,43 +112,20 @@ object TtsSettingsDataStore {
         provider: CloudTtsProvider,
         apiKey: String
     ) {
-        val cleanedKey = apiKey.trim()
+        // Paid cloud API keys are disabled; clear legacy keys and keep free TTS active
         context.applicationContext.ttsSettingsDataStore.edit { prefs ->
-            prefs[KEY_SELECTED_PROVIDER] = provider.code
-            when (provider) {
-                CloudTtsProvider.GOOGLE_CLOUD_TTS -> prefs[KEY_GOOGLE_CLOUD_API_KEY] = cleanedKey
-                CloudTtsProvider.ELEVENLABS -> prefs[KEY_ELEVENLABS_API_KEY] = cleanedKey
-                CloudTtsProvider.OPENAI_TTS -> prefs[KEY_OPENAI_API_KEY] = cleanedKey
-                CloudTtsProvider.ANDROID_SSML_NETWORK -> Unit
-            }
+            prefs[KEY_SELECTED_PROVIDER] = CloudTtsProvider.ANDROID_SSML_NETWORK.code
+            prefs.remove(KEY_GOOGLE_CLOUD_API_KEY)
+            prefs.remove(KEY_ELEVENLABS_API_KEY)
+            prefs.remove(KEY_OPENAI_API_KEY)
         }
     }
 
     /**
-     * Dynamically resolves the API key for [provider]:
-     * 1. Prioritizes the user-entered key stored in Jetpack DataStore Preferences.
-     * 2. Falls back to non-placeholder BuildConfig secrets if configured via AI Studio Secrets.
-     * 3. Returns empty string (`""`) if no key is configured, signaling [ForegroundTtsManager]
-     *    to use the Default Phone TTS engine.
+     * Paid voice APIs are disabled in GameVox; always returns `""`.
      */
     suspend fun getEffectiveApiKey(
         context: Context,
         provider: CloudTtsProvider
-    ): String {
-        val stored = readPreferences(context)
-        val userSavedKey = stored.keyFor(provider).trim()
-        if (userSavedKey.isNotEmpty() && !userSavedKey.startsWith("MY_")) {
-            return userSavedKey
-        }
-        val buildConfigFallback = when (provider) {
-            CloudTtsProvider.GOOGLE_CLOUD_TTS -> BuildConfig.GOOGLE_CLOUD_TTS_API_KEY.trim()
-            CloudTtsProvider.OPENAI_TTS -> BuildConfig.OPENAI_TTS_API_KEY.trim()
-            CloudTtsProvider.ELEVENLABS, CloudTtsProvider.ANDROID_SSML_NETWORK -> ""
-        }
-        return if (buildConfigFallback.isNotEmpty() && !buildConfigFallback.startsWith("MY_")) {
-            buildConfigFallback
-        } else {
-            ""
-        }
-    }
+    ): String = ""
 }

@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
@@ -117,7 +118,6 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     companion object {
         private const val TAG = "ForegroundTtsManager"
-        const val GOOGLE_TTS_PACKAGE = "com.google.android.tts"
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
         private val INDIAN_ENGLISH_LOCALE: Locale = Locale.forLanguageTag("en-IN")
 
@@ -133,6 +133,7 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     private val appContext: Context = context.applicationContext
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val kokoroEngine = KokoroMediaPipeTtsEngine.getInstance(appContext)
 
     private val downloadListeners = CopyOnWriteArraySet<VoiceDataDownloadListener>()
 
@@ -155,6 +156,18 @@ class ForegroundTtsManager private constructor(context: Context) {
     private var isReceiverRegistered: Boolean = false
 
     private val _playbackEpoch = java.util.concurrent.atomic.AtomicLong(0L)
+
+    @Volatile
+    private var activeEnginePackageName: String = ""
+
+    @Volatile
+    private var initStartedElapsedMs: Long = 0L
+
+    private val utteranceSubmitElapsedMs = ConcurrentHashMap<String, Long>()
+    private val utteranceStartElapsedMs = ConcurrentHashMap<String, Long>()
+
+    @Volatile
+    private var benchmarkUtteranceId: String? = null
 
     @Volatile
     var isSpeakingUtterance: Boolean = false
@@ -235,8 +248,11 @@ class ForegroundTtsManager private constructor(context: Context) {
         registerTtsDataBroadcastReceiver()
         managerScope.launch {
             TranslatorStateRepository.loadCloudTtsFromDataStore(appContext)
+            val discovery = kokoroEngine.discoverModelFile(TranslatorStateRepository.state.value.kokoroModelPath)
+            TranslatorStateRepository.updateKokoroStatusMessage(discovery.statusSummary)
+            refreshInstalledEnginesList()
+            initializeAsync(forceRebind = true)
         }
-        initializeAsync()
     }
 
     fun addVoiceDataDownloadListener(listener: VoiceDataDownloadListener) {
@@ -247,10 +263,6 @@ class ForegroundTtsManager private constructor(context: Context) {
         downloadListeners.remove(listener)
     }
 
-    /**
-     * Registers the [TextToSpeech.Engine.ACTION_TTS_DATA_INSTALLED] receiver with the application
-     * context so the Foreground Service detects completed asynchronous language downloads immediately.
-     */
     fun registerTtsDataBroadcastReceiver() {
         if (isReceiverRegistered) return
         try {
@@ -263,29 +275,116 @@ class ForegroundTtsManager private constructor(context: Context) {
             )
             isReceiverRegistered = true
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to register ACTION_TTS_DATA_INSTALLED receiver", e)
+            Log.w(TAG, "Unable to register ACTION_TTS_DATA_INSTALLED receiver", e)
+        }
+    }
+
+    fun unregisterTtsDataBroadcastReceiver() {
+        if (!isReceiverRegistered) return
+        try {
+            appContext.unregisterReceiver(ttsDataInstalledReceiver)
+        } catch (_: Exception) {
+        } finally {
+            isReceiverRegistered = false
         }
     }
 
     /**
-     * Dedicated [TextToSpeech.OnInitListener] that checks for high-quality network voice packs
-     * (`Voice.QUALITY_HIGH` / `QUALITY_VERY_HIGH` & `KEY_FEATURE_NETWORK_SYNTHESIS`) and invokes
-     * [VoiceDataDownloadListener] to download Hindi voice data if it is missing.
+     * Queries installed Android TTS engines (`TextToSpeech.engines` + PackageManager)
+     * and updates UI state without forcing Google TTS.
      */
-    private fun createTtsInitListener(isGoogleEngineAttempt: Boolean): TextToSpeech.OnInitListener {
+    fun refreshInstalledEnginesList(): List<InstalledTtsEngineInfo> {
+        val discovered = FreeTtsEngineCatalog.discoverInstalledEngines(appContext, tts)
+        val currentState = TranslatorStateRepository.state.value
+        val activePkg = activeEnginePackageName.ifBlank {
+            try {
+                tts?.defaultEngine.orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+        }
+        val activeInfo = discovered.firstOrNull { it.packageName == activePkg }
+        val activeLabel = activeInfo?.label
+            ?: activePkg.ifBlank { "System Default TTS" }
+        val isSupertonic = FreeTtsEngineCatalog.isSherpaOrSupertonicEngine(activePkg, activeLabel)
+        val genderReport = FreeTtsEngineCatalog.buildGenderSupportReport(
+            engineLabel = activeLabel,
+            targetLanguage = currentState.targetLanguage,
+            femaleVoicesCount = femaleVoices.size,
+            maleVoicesCount = maleVoices.size,
+            totalLanguageVoicesCount = currentState.availableVoicesCount
+        )
+        TranslatorStateRepository.updateTtsEngineCatalogAndCapability(
+            installedEngines = discovered,
+            activeEnginePackage = activePkg,
+            activeEngineLabel = activeLabel,
+            isSupertonicOrSherpaActive = isSupertonic,
+            supportsDistinctGenderVoices = genderReport.supportsDistinctGenderVoices,
+            genderVoiceCapabilityNote = genderReport.statusNote
+        )
+        return discovered
+    }
+
+    /**
+     * Switches to the user-selected Android TTS engine package (`""` = Android System Default)
+     * and rebinds [TextToSpeech] immediately.
+     */
+    fun selectAndroidTtsEngine(enginePackage: String) {
+        val cleaned = enginePackage.trim()
+        TranslatorStateRepository.updateSelectedTtsEnginePackage(appContext, cleaned)
+        stopSpeaking()
+        initializeAsync(forceRebind = true)
+    }
+
+    fun openSystemTtsSettings(context: Context = appContext) {
+        try {
+            val intent = Intent("com.android.settings.TTS_SETTINGS").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to open Android System TTS settings", e)
+        }
+    }
+
+    /**
+     * Dedicated [TextToSpeech.OnInitListener] that binds to the user-selected Android TTS engine
+     * (e.g. sherpa-onnx Supertonic 3 Hindi or Android System Default), measures real initialization
+     * latency, inspects voices & gender support honestly, and prepares Hindi synthesis.
+     */
+    private fun createTtsInitListener(
+        requestedPackage: String?,
+        allowDefaultFallback: Boolean
+    ): TextToSpeech.OnInitListener {
         return TextToSpeech.OnInitListener { status ->
             isInitializing = false
+            val elapsedInitMs = if (initStartedElapsedMs > 0L) {
+                (SystemClock.elapsedRealtime() - initStartedElapsedMs).coerceAtLeast(0L)
+            } else {
+                0L
+            }
             if (status == TextToSpeech.SUCCESS) {
                 val engine = tts ?: return@OnInitListener
+                activeEnginePackageName = requestedPackage
+                    ?: try {
+                        engine.defaultEngine.orEmpty()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                TranslatorStateRepository.updateTtsLatencyBenchmarks(initLatencyMs = elapsedInitMs)
                 attachUtteranceProgressListener(engine)
                 configureHighQualityVoice(
                     engine = engine,
                     speakSampleOnUpgrade = false,
                     notifyInstalledListeners = false
                 )
+                refreshInstalledEnginesList()
                 flushPendingSubtitleIfReady()
-            } else if (isGoogleEngineAttempt) {
-                Log.w(TAG, "Google TTS package init returned $status, falling back to system default TTS")
+            } else if (allowDefaultFallback && !requestedPackage.isNullOrBlank()) {
+                Log.w(
+                    TAG,
+                    "Selected TTS engine '$requestedPackage' init returned $status, falling back to Android system default TTS"
+                )
                 initializeSystemDefaultFallback()
             } else {
                 isTtsReady = false
@@ -295,13 +394,15 @@ class ForegroundTtsManager private constructor(context: Context) {
                     availableVoicesCount = 0,
                     voiceDownloadMessage = "TTS Engine failed to initialize (status $status)"
                 )
+                refreshInstalledEnginesList()
             }
         }
     }
 
     /**
-     * Starts asynchronous initialization of [TextToSpeech] inside the Foreground Service,
-     * preferring Google Speech Services (`com.google.android.tts`) for neural network voices.
+     * Starts asynchronous initialization of [TextToSpeech] using the user-selected Android TTS
+     * engine (e.g. sherpa-onnx Supertonic 3) or Android's active system default engine.
+     * Never forces `com.google.android.tts`.
      */
     @Synchronized
     fun initializeAsync(forceRebind: Boolean = false) {
@@ -313,28 +414,57 @@ class ForegroundTtsManager private constructor(context: Context) {
 
         isInitializing = true
         isTtsReady = false
+        initStartedElapsedMs = SystemClock.elapsedRealtime()
         TranslatorStateRepository.setTtsStatus(TtsEngineStatus.INITIALIZING)
+
+        val discovered = FreeTtsEngineCatalog.discoverInstalledEngines(appContext, tts)
+        val systemDefault = try {
+            tts?.defaultEngine
+        } catch (_: Exception) {
+            null
+        }
+        val selectedPkg = TranslatorStateRepository.state.value.selectedTtsEnginePackage
+        val targetPackage = FreeTtsEngineCatalog.resolveEnginePackageForBinding(
+            userSelectedPackage = selectedPkg,
+            installedEngines = discovered,
+            systemDefaultPackage = systemDefault,
+            preferInstalledSupertonicWhenSystemDefaultUnset = true
+        )
 
         try {
             tts?.shutdown()
-            tts = TextToSpeech(
-                appContext,
-                createTtsInitListener(isGoogleEngineAttempt = true),
-                GOOGLE_TTS_PACKAGE
-            )
+            tts = if (!targetPackage.isNullOrBlank()) {
+                TextToSpeech(
+                    appContext,
+                    createTtsInitListener(requestedPackage = targetPackage, allowDefaultFallback = true),
+                    targetPackage
+                )
+            } else {
+                TextToSpeech(
+                    appContext,
+                    createTtsInitListener(requestedPackage = null, allowDefaultFallback = false)
+                )
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Exception binding to Google TTS package, falling back to default engine", e)
-            initializeSystemDefaultFallback()
+            Log.w(TAG, "Exception binding to TTS engine '$targetPackage', falling back to system default", e)
+            if (!targetPackage.isNullOrBlank()) {
+                initializeSystemDefaultFallback()
+            } else {
+                isInitializing = false
+                isTtsReady = false
+                TranslatorStateRepository.setTtsStatus(TtsEngineStatus.ERROR)
+            }
         }
     }
 
     private fun initializeSystemDefaultFallback() {
         isInitializing = true
+        initStartedElapsedMs = SystemClock.elapsedRealtime()
         try {
             tts?.shutdown()
             tts = TextToSpeech(
                 appContext,
-                createTtsInitListener(isGoogleEngineAttempt = false)
+                createTtsInitListener(requestedPackage = null, allowDefaultFallback = false)
             )
         } catch (e: Exception) {
             isInitializing = false
@@ -354,7 +484,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         } catch (_: Exception) {
             false
         }
-        return isSpeakingUtterance || engineSpeaking || CloudTtsService.isPlaying()
+        return isSpeakingUtterance || engineSpeaking
     }
 
     /**
@@ -378,6 +508,20 @@ class ForegroundTtsManager private constructor(context: Context) {
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 if (utteranceId == null || utteranceId == "warmup_async_voice_download") return
+                val nowElapsed = SystemClock.elapsedRealtime()
+                utteranceStartElapsedMs[utteranceId] = nowElapsed
+                val submittedAt = utteranceSubmitElapsedMs.remove(utteranceId)
+                if (submittedAt != null) {
+                    val firstAudioMs = (nowElapsed - submittedAt).coerceAtLeast(0L)
+                    TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                        firstAudioLatencyMs = firstAudioMs,
+                        summary = if (benchmarkUtteranceId == utteranceId) {
+                            "First audio: ${firstAudioMs}ms — speaking..."
+                        } else {
+                            null
+                        }
+                    )
+                }
                 isSpeakingUtterance = true
                 activeUtteranceId = utteranceId
                 thirtySecondRepeatDelayJob?.cancel()
@@ -427,6 +571,30 @@ class ForegroundTtsManager private constructor(context: Context) {
                 if (utteranceId == null || utteranceId == "warmup_async_voice_download") {
                     return
                 }
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val startedAt = utteranceStartElapsedMs.remove(utteranceId)
+                utteranceSubmitElapsedMs.remove(utteranceId)
+                if (startedAt != null) {
+                    val durationMs = (nowElapsed - startedAt).coerceAtLeast(0L)
+                    val s = TranslatorStateRepository.state.value
+                    val isBenchmark = benchmarkUtteranceId == utteranceId
+                    if (isBenchmark) {
+                        benchmarkUtteranceId = null
+                    }
+                    TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                        speechDurationMs = durationMs,
+                        isRunningBenchmark = if (isBenchmark) false else null,
+                        summary = if (isBenchmark) {
+                            "Init: ${s.ttsInitLatencyMs}ms • First audio: ${s.ttsFirstAudioLatencyMs}ms • Playback: ${durationMs}ms (${s.activeTtsEngineLabel})"
+                        } else {
+                            null
+                        }
+                    )
+                } else if (benchmarkUtteranceId == utteranceId) {
+                    benchmarkUtteranceId = null
+                    TranslatorStateRepository.updateTtsLatencyBenchmarks(isRunningBenchmark = false)
+                }
+
                 activeNetworkUtterances.remove(utteranceId)
                 isSpeakingUtterance = false
                 if (activeUtteranceId == utteranceId) {
@@ -451,6 +619,15 @@ class ForegroundTtsManager private constructor(context: Context) {
 
             override fun onStop(utteranceId: String?, interrupted: Boolean) {
                 if (utteranceId != null) {
+                    utteranceSubmitElapsedMs.remove(utteranceId)
+                    utteranceStartElapsedMs.remove(utteranceId)
+                    if (benchmarkUtteranceId == utteranceId) {
+                        benchmarkUtteranceId = null
+                        TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                            isRunningBenchmark = false,
+                            summary = "Benchmark interrupted"
+                        )
+                    }
                     activeNetworkUtterances.remove(utteranceId)
                     if (activeUtteranceId == utteranceId) {
                         isSpeakingUtterance = false
@@ -627,25 +804,50 @@ class ForegroundTtsManager private constructor(context: Context) {
 
         val isHindiMissingData = hindiAvailability == TextToSpeech.LANG_MISSING_DATA ||
             hindiAvailability == TextToSpeech.LANG_NOT_SUPPORTED
+        val boundPkg = activeEnginePackageName.ifBlank {
+            try {
+                engine.defaultEngine.orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+        }
+        val discovered = FreeTtsEngineCatalog.discoverInstalledEngines(appContext, engine)
+        val boundLabel = discovered.firstOrNull { it.packageName == boundPkg }?.label
+            ?: boundPkg.ifBlank { "System TTS" }
+        val isSupertonic = FreeTtsEngineCatalog.isSherpaOrSupertonicEngine(boundPkg, boundLabel)
+        val genderReport = FreeTtsEngineCatalog.buildGenderSupportReport(
+            engineLabel = boundLabel,
+            targetLanguage = targetLang,
+            femaleVoicesCount = femaleVoices.size,
+            maleVoicesCount = maleVoices.size,
+            totalLanguageVoicesCount = voiceSelection.totalMatchingVoices
+        )
+        TranslatorStateRepository.updateTtsEngineCatalogAndCapability(
+            installedEngines = discovered,
+            activeEnginePackage = boundPkg,
+            activeEngineLabel = boundLabel,
+            isSupertonicOrSherpaActive = isSupertonic,
+            supportsDistinctGenderVoices = genderReport.supportsDistinctGenderVoices,
+            genderVoiceCapabilityNote = genderReport.statusNote
+        )
 
         when {
-            // Case 1: High-Quality Network Voice Pack (or installed voice pack) is ready
+            // Case 1: Installed local neural engine (e.g. sherpa-onnx Supertonic 3) or matching voice pack is ready
             voiceSelection.bestInstalledNetworkVoice != null || voiceSelection.bestInstalledVoice != null -> {
                 val activeVoice = voiceSelection.bestInstalledNetworkVoice
                     ?: voiceSelection.bestInstalledVoice!!
-                val isHighQualityNet = voiceSelection.bestInstalledNetworkVoice != null ||
-                    activeVoice.quality >= Voice.QUALITY_HIGH
-                val label = if (isHighQualityNet) {
-                    "HD Neural (${activeVoice.name})"
-                } else {
-                    "Installed (${activeVoice.name})"
+                val prefix = when {
+                    isSupertonic -> "Supertonic 3 / sherpa-onnx"
+                    voiceSelection.bestInstalledNetworkVoice != null || activeVoice.quality >= Voice.QUALITY_HIGH -> "HD Neural"
+                    else -> "Installed"
                 }
+                val label = "$prefix (${activeVoice.name})"
 
                 TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
                 TranslatorStateRepository.updateVoiceTelemetry(
                     activeVoiceName = label,
                     availableVoicesCount = voiceSelection.totalMatchingVoices,
-                    voiceDownloadMessage = "HD Voice Ready • ${voiceSelection.installedMatchingVoices}/${voiceSelection.totalMatchingVoices} ${targetLang.displayName} packs installed"
+                    voiceDownloadMessage = "$boundLabel Ready • ${voiceSelection.installedMatchingVoices}/${voiceSelection.totalMatchingVoices} ${targetLang.displayName} voices"
                 )
 
                 downloadListeners.forEach { listener ->
@@ -667,54 +869,18 @@ class ForegroundTtsManager private constructor(context: Context) {
                 }
             }
 
-            // Case 2: Voice packs exist in catalog with KEY_FEATURE_NOT_INSTALLED, or LANG_MISSING_DATA
-            targetAvailability == TextToSpeech.LANG_MISSING_DATA ||
-                isHindiMissingData ||
-                voiceSelection.uninstalledVoiceNames.isNotEmpty() -> {
-
-                val missingNames = voiceSelection.uninstalledVoiceNames
-                val candidateName = voiceSelection.bestDownloadableVoice?.name
-                    ?: "Google Network (${targetLang.ttsLocaleTag})"
-
-                TranslatorStateRepository.setTtsStatus(TtsEngineStatus.MISSING_HINDI_DATA)
-                TranslatorStateRepository.updateVoiceTelemetry(
-                    activeVoiceName = "Cloud Neural ($candidateName)",
-                    availableVoicesCount = voiceSelection.totalMatchingVoices,
-                    voiceDownloadMessage = "${targetLang.displayName} HD voice pack missing locally — Downloading in background..."
-                )
-
-                val reason = if (missingNames.isNotEmpty()) {
-                    "High-quality ${targetLang.displayName} network voice pack (${missingNames.first()}) is not installed yet."
-                } else {
-                    "${targetLang.displayName} (${targetLang.ttsLocaleTag}) voice data is missing on this device."
-                }
-
-                downloadListeners.forEach { listener ->
-                    listener.onVoiceDataMissing(
-                        language = targetLang,
-                        missingVoiceNames = missingNames,
-                        reason = reason
-                    )
-                    listener.onVoiceDataDownloadStarted(targetLang)
-                }
-
-                // Trigger background neural voice pack warm-up & watcher automatically
-                triggerSilentAsyncVoicePackWarmup(engine, targetLang)
-                startAsyncLanguageDataDownloadWatcher(targetLang)
-            }
-
-            // Case 3: Engine supports the locale directly even if getVoices() returned an empty catalog
+            // Case 2: Engine supports target locale directly (common for sherpa-onnx Supertonic 3 / custom Android TTS engines)
             isPrimarySupported -> {
-                val activeName = if (state.useHighQualityNetworkVoice) {
-                    "Google Network Synthesis (${targetLang.ttsLocaleTag})"
+                val activeName = if (isSupertonic) {
+                    "Supertonic 3 / sherpa-onnx (${targetLang.ttsLocaleTag})"
                 } else {
-                    "System Default (${targetLang.ttsLocaleTag})"
+                    "$boundLabel (${targetLang.ttsLocaleTag})"
                 }
                 TranslatorStateRepository.setTtsStatus(TtsEngineStatus.READY)
                 TranslatorStateRepository.updateVoiceTelemetry(
                     activeVoiceName = activeName,
-                    availableVoicesCount = 1,
-                    voiceDownloadMessage = "${targetLang.displayName} Network TTS Active"
+                    availableVoicesCount = maxOf(1, voiceSelection.totalMatchingVoices),
+                    voiceDownloadMessage = "$boundLabel Active • ${targetLang.displayName} Ready"
                 )
                 downloadListeners.forEach { listener ->
                     listener.onHighQualityNetworkVoiceAvailable(
@@ -725,22 +891,49 @@ class ForegroundTtsManager private constructor(context: Context) {
                 }
             }
 
-            // Case 4: Locale not installed at all — notify listener to download Hindi voice data
+            // Case 3: Voice packs exist in catalog with KEY_FEATURE_NOT_INSTALLED, or LANG_MISSING_DATA
+            targetAvailability == TextToSpeech.LANG_MISSING_DATA ||
+                isHindiMissingData ||
+                voiceSelection.uninstalledVoiceNames.isNotEmpty() -> {
+
+                val missingNames = voiceSelection.uninstalledVoiceNames
+                TranslatorStateRepository.setTtsStatus(TtsEngineStatus.MISSING_HINDI_DATA)
+                TranslatorStateRepository.updateVoiceTelemetry(
+                    activeVoiceName = "Missing (${targetLang.ttsLocaleTag})",
+                    availableVoicesCount = voiceSelection.totalMatchingVoices,
+                    voiceDownloadMessage = "${targetLang.displayName} voice data missing on $boundLabel — Install voice data or switch TTS engine"
+                )
+
+                val reason = if (missingNames.isNotEmpty()) {
+                    "${targetLang.displayName} voice pack (${missingNames.first()}) on $boundLabel is not installed yet."
+                } else {
+                    "${targetLang.displayName} (${targetLang.ttsLocaleTag}) voice data is missing on $boundLabel."
+                }
+
+                downloadListeners.forEach { listener ->
+                    listener.onVoiceDataMissing(
+                        language = targetLang,
+                        missingVoiceNames = missingNames,
+                        reason = reason
+                    )
+                }
+            }
+
+            // Case 4: Locale not installed at all — notify listener
             else -> {
                 TranslatorStateRepository.setTtsStatus(TtsEngineStatus.MISSING_HINDI_DATA)
                 TranslatorStateRepository.updateVoiceTelemetry(
                     activeVoiceName = "Missing (${targetLang.ttsLocaleTag})",
                     availableVoicesCount = 0,
-                    voiceDownloadMessage = "Hindi (${targetLang.ttsLocaleTag}) voice data missing — Tap to download"
+                    voiceDownloadMessage = "${targetLang.displayName} (${targetLang.ttsLocaleTag}) voice missing on $boundLabel"
                 )
                 downloadListeners.forEach { listener ->
                     listener.onVoiceDataMissing(
                         language = targetLang,
                         missingVoiceNames = emptyList(),
-                        reason = "${targetLang.displayName} (${targetLang.ttsLocaleTag}) voice data is not installed."
+                        reason = "${targetLang.displayName} (${targetLang.ttsLocaleTag}) voice data is not installed on $boundLabel."
                     )
                 }
-                triggerSilentAsyncVoicePackWarmup(engine, targetLang)
             }
         }
     }
@@ -971,10 +1164,14 @@ class ForegroundTtsManager private constructor(context: Context) {
         )
 
         if (openSystemInstaller) {
+            val activePkg = TranslatorStateRepository.state.value.activeTtsEnginePackage
+                .ifBlank { TranslatorStateRepository.state.value.selectedTtsEnginePackage }
             try {
                 val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    setPackage(GOOGLE_TTS_PACKAGE)
+                    if (activePkg.isNotBlank()) {
+                        setPackage(activePkg)
+                    }
                 }
                 context.startActivity(installIntent)
             } catch (_: ActivityNotFoundException) {
@@ -984,14 +1181,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                     }
                     context.startActivity(genericInstallIntent)
                 } catch (_: ActivityNotFoundException) {
-                    try {
-                        val settingsIntent = Intent("com.android.settings.TTS_SETTINGS").apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(settingsIntent)
-                    } catch (ex: Exception) {
-                        Log.w(TAG, "Unable to open system TTS installer", ex)
-                    }
+                    openSystemTtsSettings(context)
                 }
             }
         }
@@ -1011,15 +1201,15 @@ class ForegroundTtsManager private constructor(context: Context) {
     }
 
     /**
-     * Speaks [text] non-blockingly using:
-     * 1. [EmotionSpeechEngine] to analyze punctuation (`!`, `...`, whisper cues) & convert to SSML
-     * 2. Selected [CloudTtsProvider] (Google Cloud Neural2/WaveNet or OpenAI `gpt-4o-mini-tts` if key configured)
-     * 3. Android [TextToSpeech] with SSML `<speak><prosody ...>` + Female/Male voice switching & pitch/rate/volume.
+     * Speaks [text] non-blockingly using the FREE user-selected Android TTS engine
+     * (e.g. sherpa-onnx Supertonic 3 Hindi or system default TTS) or optional MediaPipe
+     * Kokoro-82M `.litertlm` if enabled and imported. Paid cloud voice APIs are disabled.
      */
     fun speakNonBlocking(
         text: String,
         voiceProfile: com.example.data.VoiceProfile? = null,
-        sourceEnglishText: String = ""
+        sourceEnglishText: String = "",
+        isBenchmarkRun: Boolean = false
     ): Boolean {
         if (text.isBlank()) return false
 
@@ -1043,160 +1233,144 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
-        // Dynamically fetch the Cloud TTS API key from Jetpack DataStore when an optional Cloud provider is selected
-        if (state.cloudTtsProvider != CloudTtsProvider.ANDROID_SSML_NETWORK) {
-            val myEpoch = _playbackEpoch.get()
-            val cloudUtteranceId = "cloud_${UUID.randomUUID()}"
-            thirtySecondRepeatDelayJob?.cancel()
-            thirtySecondRepeatDelayJob = null
-            // Interrupt any ongoing Android TTS utterance cleanly before Cloud audio starts
-            try {
-                tts?.stop()
-            } catch (_: Exception) {
-            }
-            CloudTtsService.stopPlayback()
-            isSpeakingUtterance = true
-            activeUtteranceId = cloudUtteranceId
-
-            managerScope.launch {
-                if (_playbackEpoch.get() != myEpoch) {
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == cloudUtteranceId) activeUtteranceId = null
-                    return@launch
-                }
-                val resolvedApiKey = TtsSettingsDataStore.getEffectiveApiKey(
-                    context = appContext,
-                    provider = state.cloudTtsProvider
-                )
-                if (_playbackEpoch.get() != myEpoch) {
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == cloudUtteranceId) activeUtteranceId = null
-                    return@launch
-                }
-                if (resolvedApiKey.isBlank()) {
-                    TranslatorStateRepository.setCloudTtsStatusMessage(
-                        "No API key saved for ${state.cloudTtsProvider.displayLabel} — using built-in Phone TTS"
-                    )
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == cloudUtteranceId) {
-                        activeUtteranceId = null
-                    }
-                    speakOnAndroidTts(
-                        text = text,
-                        sourceEnglishText = sourceEnglishText,
-                        voiceProfile = voiceProfile
-                    )
-                    return@launch
-                }
-
-                val started = CloudTtsService.synthesizeAndPlay(
-                    context = appContext,
-                    provider = state.cloudTtsProvider,
-                    targetLanguage = state.targetLanguage,
-                    gender = targetGender,
+        if (state.freeVoiceBackend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
+            val discovery = kokoroEngine.discoverModelFile(state.kokoroModelPath)
+            if (discovery.resolvedFile != null) {
+                val epoch = _playbackEpoch.incrementAndGet()
+                val utteranceId = "kokoro_${UUID.randomUUID().toString().take(8)}"
+                isSpeakingUtterance = true
+                activeUtteranceId = utteranceId
+                startRealtimeVisualizerSync(
+                    utteranceId = utteranceId,
+                    text = emotionResult.cleanSpokenText,
+                    voiceProfile = voiceProfile,
                     emotionResult = emotionResult,
-                    apiKeyOverride = resolvedApiKey,
-                    onStarted = { cloudModelName ->
-                        if (_playbackEpoch.get() != myEpoch) {
-                            CloudTtsService.stopPlayback()
-                            return@synthesizeAndPlay
-                        }
-                        TranslatorStateRepository.setActiveVoiceName(cloudModelName)
-                        TranslatorStateRepository.updateTtsLifecycleEvent(
-                            event = "Cloud:onStart",
-                            utteranceId = cloudUtteranceId,
-                            error = ""
-                        )
-                        TranslatorStateRepository.setCloudTtsStatusMessage(
-                            "Speaking via ${state.cloudTtsProvider.displayLabel}"
-                        )
-                        startRealtimeVisualizerSync(
-                            utteranceId = cloudUtteranceId,
-                            text = emotionResult.cleanSpokenText,
-                            voiceProfile = voiceProfile,
-                            emotionResult = emotionResult,
-                            overrideVoiceName = cloudModelName
-                        )
-                    },
-                    onCompleted = {
-                        isSpeakingUtterance = false
-                        if (activeUtteranceId == cloudUtteranceId) {
-                            activeUtteranceId = null
-                        }
-                        TranslatorStateRepository.updateTtsLifecycleEvent(
-                            event = "Cloud:onDone",
-                            utteranceId = cloudUtteranceId,
-                            error = ""
-                        )
-                        if (_visualizerState.value.utteranceId == cloudUtteranceId) {
+                    overrideVoiceName = "Kokoro-82M MediaPipe"
+                )
+                managerScope.launch {
+                    val outcome = kokoroEngine.synthesizeAndPlay(
+                        text = emotionResult.cleanSpokenText,
+                        targetLanguage = state.targetLanguage,
+                        gender = targetGender,
+                        speakingRate = emotionResult.effectiveSpeechRate,
+                        volume = emotionResult.effectiveVolume,
+                        configuredModelPath = state.kokoroModelPath,
+                        useGpuDelegate = state.kokoroUseGpu,
+                        isBenchmarkRun = isBenchmarkRun
+                    )
+                    if (_playbackEpoch.get() != epoch) return@launch
+                    when (outcome) {
+                        is KokoroSpeakOutcome.Success -> {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
                             stopVisualizerSync()
-                        }
-                        if (_playbackEpoch.get() == myEpoch) {
-                            onUtteranceCompletedImmediately?.invoke(cloudUtteranceId)
+                            TranslatorStateRepository.updateTtsLifecycleEvent(
+                                event = "onDone(${outcome.activeDelegate})",
+                                utteranceId = utteranceId,
+                                error = ""
+                            )
+                            onUtteranceCompletedImmediately?.invoke(utteranceId)
                             thirtySecondRepeatDelayJob?.cancel()
                             thirtySecondRepeatDelayJob = managerScope.launch {
                                 delay(30000L)
-                                onThirtySecondPostSpeechDelayCompleted?.invoke(cloudUtteranceId)
+                                onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
                             }
                         }
-                    },
-                    onError = { errorMsg ->
-                        TranslatorStateRepository.updateTtsLifecycleEvent(
-                            event = "Cloud:onError",
-                            utteranceId = cloudUtteranceId,
-                            error = errorMsg
-                        )
-                        TranslatorStateRepository.setCloudTtsStatusMessage(
-                            "${state.cloudTtsProvider.displayLabel} error ($errorMsg) — switched to Phone TTS"
-                        )
-                        isSpeakingUtterance = false
-                        if (activeUtteranceId == cloudUtteranceId) {
-                            activeUtteranceId = null
+                        is KokoroSpeakOutcome.FallbackToAndroidTts -> {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                            if (!isBenchmarkRun) {
+                                speakOnAndroidTts(
+                                    text = text,
+                                    sourceEnglishText = sourceEnglishText,
+                                    voiceProfile = voiceProfile,
+                                    isBenchmarkRun = false
+                                )
+                            }
                         }
-                        if (_playbackEpoch.get() == myEpoch) {
-                            speakOnAndroidTts(
-                                text = text,
-                                sourceEnglishText = sourceEnglishText,
-                                voiceProfile = voiceProfile
-                            )
-                        }
-                    }
-                )
-                if (!started) {
-                    TranslatorStateRepository.setCloudTtsStatusMessage(
-                        "${state.cloudTtsProvider.displayLabel} request failed — switched to Phone TTS"
-                    )
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == cloudUtteranceId) {
-                        activeUtteranceId = null
-                    }
-                    if (_playbackEpoch.get() == myEpoch) {
-                        speakOnAndroidTts(
-                            text = text,
-                            sourceEnglishText = sourceEnglishText,
-                            voiceProfile = voiceProfile
-                        )
                     }
                 }
+                return true
+            } else {
+                TranslatorStateRepository.updateKokoroStatusMessage(discovery.statusSummary)
             }
-            return true
         }
 
         return speakOnAndroidTts(
             text = text,
             sourceEnglishText = sourceEnglishText,
-            voiceProfile = voiceProfile
+            voiceProfile = voiceProfile,
+            isBenchmarkRun = isBenchmarkRun
+        )
+    }
+
+    /**
+     * Runs a real synthesis & playback latency benchmark on the currently active free voice backend
+     * (user-selected Android TTS / Supertonic 3 OR optional imported Kokoro-82M MediaPipe model).
+     * Never returns simulated or hardcoded latency numbers.
+     */
+    fun runVoiceBenchmark(sampleText: String? = null): Boolean {
+        val state = TranslatorStateRepository.state.value
+        val text = sampleText?.trim().orEmpty().ifBlank { state.targetLanguage.sampleGreeting }
+
+        if (state.freeVoiceBackend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
+            val discovery = kokoroEngine.discoverModelFile(state.kokoroModelPath)
+            if (discovery.resolvedFile == null) {
+                TranslatorStateRepository.updateKokoroStatusMessage(discovery.statusSummary)
+                TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                    isRunningBenchmark = false,
+                    summary = "Cannot benchmark Kokoro-82M: no .litertlm model file loaded."
+                )
+                return false
+            }
+            TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                isRunningBenchmark = true,
+                summary = "Running real Kokoro-82M benchmark (${discovery.resolvedFile.name})..."
+            )
+            return speakNonBlocking(
+                text = text,
+                voiceProfile = null,
+                sourceEnglishText = "",
+                isBenchmarkRun = true
+            )
+        }
+
+        val engine = tts
+        if (engine == null || !isTtsReady) {
+            TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                isRunningBenchmark = false,
+                summary = "Cannot run benchmark: Android TTS engine '${state.activeTtsEngineLabel}' is not ready yet."
+            )
+            return false
+        }
+        TranslatorStateRepository.updateTtsLatencyBenchmarks(
+            isRunningBenchmark = true,
+            summary = "Running real TTS benchmark on ${state.activeTtsEngineLabel}..."
+        )
+        return speakNonBlocking(
+            text = text,
+            voiceProfile = null,
+            sourceEnglishText = "",
+            isBenchmarkRun = true
         )
     }
 
     private fun speakOnAndroidTts(
         text: String,
         sourceEnglishText: String,
-        voiceProfile: com.example.data.VoiceProfile?
+        voiceProfile: com.example.data.VoiceProfile?,
+        isBenchmarkRun: Boolean = false
     ): Boolean {
         val engine = tts
         if (engine == null || !isTtsReady) {
             pendingSubtitleToSpeak = text
+            if (isBenchmarkRun) {
+                TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                    isRunningBenchmark = false,
+                    summary = "TTS engine unavailable for benchmark."
+                )
+            }
             if (engine == null && !isInitializing) {
                 initializeAsync()
             }
@@ -1209,7 +1383,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             sourceEnglishText = sourceEnglishText,
             allowNetworkSynthesis = state.useHighQualityNetworkVoice,
             allowSsml = false,
-            voiceProfile = voiceProfile
+            voiceProfile = voiceProfile,
+            isBenchmarkRun = isBenchmarkRun
         )
     }
 
@@ -1258,7 +1433,8 @@ class ForegroundTtsManager private constructor(context: Context) {
         sourceEnglishText: String = "",
         allowNetworkSynthesis: Boolean,
         allowSsml: Boolean = TranslatorStateRepository.state.value.ssmlEnabledOnDevice,
-        voiceProfile: com.example.data.VoiceProfile? = null
+        voiceProfile: com.example.data.VoiceProfile? = null,
+        isBenchmarkRun: Boolean = false
     ): Boolean {
         val engine = tts ?: return false
         val state = TranslatorStateRepository.state.value
@@ -1269,14 +1445,13 @@ class ForegroundTtsManager private constructor(context: Context) {
             // Cancel any pending 30-second repeat timer because a genuinely new utterance is starting now
             thirtySecondRepeatDelayJob?.cancel()
             thirtySecondRepeatDelayJob = null
-            CloudTtsService.stopPlayback()
 
             val effectiveProfile = voiceProfile
             val targetGender = effectiveProfile?.gender
                 ?: VoiceProfileRepository.lastParsedDialogue.value?.detectedGender
                 ?: SpeakerGender.MALE_18
 
-            // Analyze emotion (! -> Excited/Angry, ... -> Sad/Hesitant, whisper -> Whisper) and build SSML
+            // Analyze emotion (! -> Excited/Angry, ... -> Sad/Hesitant, whisper -> Whisper) and prosody
             val emotionResult = EmotionSpeechEngine.analyzeEmotionAndBuildSsml(
                 spokenText = fullContinuousText,
                 sourceEnglishText = sourceEnglishText,
@@ -1292,29 +1467,44 @@ class ForegroundTtsManager private constructor(context: Context) {
                 ssmlPreview = emotionResult.ssmlMarkup
             )
 
-            // Select High-Quality Female (Jenny) or Male (Anon) voice from tts.voices, or default voice if unavailable
-            val appliedVoice = selectGenderBasedTtsVoice(
-                engine = engine,
-                targetLanguage = state.targetLanguage,
-                gender = targetGender,
-                voiceIndex = effectiveProfile?.engineVoiceIndex ?: 0,
-                preferNetworkVoice = allowNetworkSynthesis
-            )
+            // Switch voice ONLY when the active installed engine exposes distinct Female & Male voices
+            val appliedVoice = if (state.supportsDistinctGenderVoices) {
+                selectGenderBasedTtsVoice(
+                    engine = engine,
+                    targetLanguage = state.targetLanguage,
+                    gender = targetGender,
+                    voiceIndex = effectiveProfile?.engineVoiceIndex ?: 0,
+                    preferNetworkVoice = allowNetworkSynthesis
+                )
+            } else {
+                defaultEngineVoice
+            }
 
             // Apply Gender + Emotion Pitch, SpeechRate, and Volume
             engine.setPitch(emotionResult.effectivePitch)
             engine.setSpeechRate(emotionResult.effectiveSpeechRate)
 
             if (appliedVoice != null) {
-                val qualityTag = if (isNetworkHighQualityVoice(appliedVoice)) "HD Network" else "Standard"
-                TranslatorStateRepository.setActiveVoiceName("$qualityTag (${appliedVoice.name})")
+                val engineTag = if (state.isSupertonicOrSherpaActive) {
+                    "Supertonic 3"
+                } else if (isNetworkHighQualityVoice(appliedVoice)) {
+                    "HD Network"
+                } else {
+                    "Installed"
+                }
+                TranslatorStateRepository.setActiveVoiceName("$engineTag (${appliedVoice.name})")
             }
 
-            val utteranceId = "gamevox_${UUID.randomUUID()}"
-            val useNetworkBundle = allowNetworkSynthesis &&
+            val utteranceId = if (isBenchmarkRun) {
+                "gamevox_bench_${UUID.randomUUID()}"
+            } else {
+                "gamevox_${UUID.randomUUID()}"
+            }
+            val useNetworkBundle = !state.isSupertonicOrSherpaActive &&
+                allowNetworkSynthesis &&
                 (appliedVoice == null || isNetworkHighQualityVoice(appliedVoice))
 
-            // Built-in Android TextToSpeech MUST receive clean plain text (SSML <speak> XML is Cloud-only)
+            // Built-in Android TextToSpeech MUST receive clean plain text (never raw SSML XML)
             val utterancePayload = emotionResult.cleanSpokenText
 
             val params = Bundle().apply {
@@ -1337,10 +1527,22 @@ class ForegroundTtsManager private constructor(context: Context) {
 
             isSpeakingUtterance = true
             activeUtteranceId = utteranceId
+            if (isBenchmarkRun) {
+                benchmarkUtteranceId = utteranceId
+            }
+            utteranceSubmitElapsedMs[utteranceId] = SystemClock.elapsedRealtime()
 
             // Queue Flush: Immediately stop any previous audio (QUEUE_FLUSH) and speak clean modulated text
             val result = engine.speak(utterancePayload, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
+                utteranceSubmitElapsedMs.remove(utteranceId)
+                if (benchmarkUtteranceId == utteranceId) {
+                    benchmarkUtteranceId = null
+                    TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                        isRunningBenchmark = false,
+                        summary = "Benchmark speak() failed with status $result"
+                    )
+                }
                 activeNetworkUtterances.remove(utteranceId)
                 isSpeakingUtterance = false
                 activeUtteranceId = null
@@ -1355,7 +1557,8 @@ class ForegroundTtsManager private constructor(context: Context) {
                         sourceEnglishText = sourceEnglishText,
                         allowNetworkSynthesis = false,
                         allowSsml = false,
-                        voiceProfile = voiceProfile
+                        voiceProfile = voiceProfile,
+                        isBenchmarkRun = isBenchmarkRun
                     )
                 }
             } else {
@@ -1578,6 +1781,8 @@ class ForegroundTtsManager private constructor(context: Context) {
         preferNetworkVoice: Boolean = TranslatorStateRepository.state.value.useHighQualityNetworkVoice
     ) {
         try {
+            femaleVoices.clear()
+            maleVoices.clear()
             val allVoices = engine.voices ?: return
             val candidateVoices = allVoices.filter { voice ->
                 val features = voice.features.orEmpty()
@@ -1756,11 +1961,21 @@ class ForegroundTtsManager private constructor(context: Context) {
         _playbackEpoch.incrementAndGet()
         pendingSubtitleToSpeak = null
         activeNetworkUtterances.clear()
+        utteranceSubmitElapsedMs.clear()
+        utteranceStartElapsedMs.clear()
+        if (benchmarkUtteranceId != null) {
+            benchmarkUtteranceId = null
+            TranslatorStateRepository.updateTtsLatencyBenchmarks(
+                isRunningBenchmark = false,
+                summary = "Benchmark stopped"
+            )
+        }
         thirtySecondRepeatDelayJob?.cancel()
         thirtySecondRepeatDelayJob = null
         isSpeakingUtterance = false
         activeUtteranceId = null
         CloudTtsService.stopPlayback()
+        kokoroEngine.stopPlayback()
         try {
             tts?.stop()
         } catch (_: Exception) {

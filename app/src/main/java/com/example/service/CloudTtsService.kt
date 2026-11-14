@@ -33,48 +33,43 @@ enum class CloudTtsProvider(
 ) {
     ANDROID_SSML_NETWORK(
         code = "android_ssml",
-        displayLabel = "Default Phone TTS",
-        subtitle = "Built-in Android hi-IN voices via pitch/rate/volume (No API key needed)",
+        displayLabel = "User-Selected Android TTS (Free)",
+        subtitle = "Supports sherpa-onnx Supertonic 3 Hindi & system TTS (No API key or billing)",
         requiresApiKey = false
     ),
     GOOGLE_CLOUD_TTS(
         code = "google_cloud_tts",
-        displayLabel = "Google Cloud TTS (Optional)",
-        subtitle = "Optional user API key • W3C SSML Neural2/WaveNet (Cloud billing/quota)",
-        requiresApiKey = true
+        displayLabel = "Google Cloud TTS (Disabled)",
+        subtitle = "Paid cloud voice APIs are disabled in GameVox",
+        requiresApiKey = false
     ),
     ELEVENLABS(
         code = "elevenlabs",
-        displayLabel = "ElevenLabs (Optional)",
-        subtitle = "Optional user API key • Multilingual v2 voices (Cloud billing/quota)",
-        requiresApiKey = true
+        displayLabel = "ElevenLabs (Disabled)",
+        subtitle = "Paid cloud voice APIs are disabled in GameVox",
+        requiresApiKey = false
     ),
     OPENAI_TTS(
         code = "openai_tts",
-        displayLabel = "OpenAI TTS (Optional)",
-        subtitle = "Optional user API key • gpt-4o-mini-tts (Cloud billing/quota)",
-        requiresApiKey = true
+        displayLabel = "OpenAI TTS (Disabled)",
+        subtitle = "Paid cloud voice APIs are disabled in GameVox",
+        requiresApiKey = false
     );
 
     companion object {
         fun fromCode(code: String?): CloudTtsProvider {
-            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) }
-                ?: ANDROID_SSML_NETWORK
+            return ANDROID_SSML_NETWORK
         }
     }
 }
 
 /**
- * AI Cloud Text-to-Speech integration client supporting:
- * - **Google Cloud Text-to-Speech REST API (`v1/text:synthesize`)** via [GoogleCloudTtsService]
- * - **ElevenLabs REST API (`v1/text-to-speech`)** via [ElevenLabsTtsService]
- * - **OpenAI Audio Speech REST API (`v1/audio/speech`)** using `gpt-4o-mini-tts`
- *
- * Prioritizes dynamically saved user API keys from Jetpack DataStore Preferences and falls back
- * to `BuildConfig` secrets when configured via the AI Studio Secrets panel.
+ * Paid cloud TTS APIs are permanently disabled in GameVox Free Neural Voice Edition.
+ * GameVox requires zero API keys, zero credits, and zero billing/subscription plans.
  */
 object CloudTtsService {
 
+    const val PAID_CLOUD_TTS_ENABLED = false
     private const val TAG = "CloudTtsService"
     private const val OPENAI_TTS_ENDPOINT =
         "https://api.openai.com/v1/audio/speech"
@@ -82,20 +77,11 @@ object CloudTtsService {
     @Volatile
     private var activeMediaPlayer: MediaPlayer? = null
 
-    fun hasGoogleCloudKey(userKey: String = ""): Boolean {
-        return GoogleCloudTtsService.hasValidApiKey(userKey) ||
-            GoogleCloudTtsService.hasValidApiKey(BuildConfig.GOOGLE_CLOUD_TTS_API_KEY)
-    }
+    fun hasGoogleCloudKey(userKey: String = ""): Boolean = false
 
-    fun hasElevenLabsKey(userKey: String = ""): Boolean {
-        return ElevenLabsTtsService.hasValidApiKey(userKey)
-    }
+    fun hasElevenLabsKey(userKey: String = ""): Boolean = false
 
-    fun hasOpenAiKey(userKey: String = ""): Boolean {
-        if (userKey.trim().isNotEmpty() && !userKey.trim().startsWith("MY_")) return true
-        val key = BuildConfig.OPENAI_TTS_API_KEY.trim()
-        return key.isNotEmpty() && !key.startsWith("MY_")
-    }
+    fun hasOpenAiKey(userKey: String = ""): Boolean = false
 
     fun stopPlayback() {
         try {
@@ -118,11 +104,7 @@ object CloudTtsService {
     }
 
     /**
-     * Synthesizes [emotionResult] using [provider] and the dynamically resolved [apiKeyOverride]
-     * (from Jetpack DataStore Preferences) and plays the resulting MP3 audio via [MediaPlayer].
-     *
-     * Returns `true` if cloud audio synthesis & playback started, or `false` if no valid key is
-     * configured or the network request failed (so the caller falls back to Default Phone TTS).
+     * Paid cloud voice APIs are disabled; always returns `false` without making any paid HTTP calls.
      */
     suspend fun synthesizeAndPlay(
         context: Context,
@@ -135,6 +117,10 @@ object CloudTtsService {
         onCompleted: () -> Unit,
         onError: (String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        if (!PAID_CLOUD_TTS_ENABLED) {
+            Log.i(TAG, "Paid voice API ($provider) is disabled — using free user-selected Android TTS")
+            return@withContext false
+        }
         val dynamicKey = apiKeyOverride.trim()
         val mp3Result: Pair<ByteArray, String>? = when (provider) {
             CloudTtsProvider.GOOGLE_CLOUD_TTS -> {

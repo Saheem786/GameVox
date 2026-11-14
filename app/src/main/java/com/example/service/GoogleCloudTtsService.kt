@@ -221,6 +221,11 @@ class GoogleCloudTtsService(
         volumeGainDb: Double = emotion.cloudVolumeGainDb,
         audioEncoding: CloudAudioEncoding = CloudAudioEncoding.MP3
     ): CloudTtsSynthesisResult = withContext(ioDispatcher) {
+        if (!CloudTtsService.PAID_CLOUD_TTS_ENABLED) {
+            return@withContext CloudTtsSynthesisResult.Failure(
+                message = "Paid Google Cloud TTS API is disabled. Use free user-selected Android TTS (Supertonic 3 / system TTS)."
+            )
+        }
         val trimmedKey = apiKey.trim()
         if (!hasValidApiKey(trimmedKey)) {
             return@withContext CloudTtsSynthesisResult.Failure(

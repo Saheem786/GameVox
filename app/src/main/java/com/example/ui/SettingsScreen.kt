@@ -33,32 +33,25 @@ import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.RecordVoiceOver
-import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Translate
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -71,7 +64,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,15 +74,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
 import com.example.data.TranslatorAppState
 import com.example.data.TtsEngineStatus
-import com.example.service.CloudTtsProvider
-import com.example.service.CloudTtsService
+import com.example.service.FreeVoiceBackend
+import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.launch
 
@@ -105,10 +95,14 @@ fun SettingsScreen(
     onTargetLanguageChange: (TargetLanguage) -> Unit,
     onTranslationModeChange: (TranslationMode, Boolean) -> Unit,
     onDownloadOfflinePack: () -> Unit,
+    onSelectAndroidTtsEngine: (String) -> Unit,
+    onRefreshTtsEngines: () -> Unit,
+    onOpenSystemTtsSettings: () -> Unit,
+    onSelectFreeVoiceBackend: (FreeVoiceBackend) -> Unit,
+    onImportKokoroModel: () -> Unit,
+    onToggleKokoroGpu: (Boolean) -> Unit,
+    onClearKokoroModel: () -> Unit,
     onHighQualityVoiceChange: (Boolean) -> Unit,
-    onSsmlEnabledChange: (Boolean) -> Unit,
-    onCloudTtsProviderChange: (CloudTtsProvider) -> Unit,
-    onSaveCloudTtsApiConfig: (CloudTtsProvider, String) -> Unit,
     onPitchChange: (Float) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onVolumeChange: (Float) -> Unit,
@@ -129,24 +123,10 @@ fun SettingsScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    var selectedProviderDraft by remember { mutableStateOf(state.cloudTtsProvider) }
-    var apiKeyInput by remember { mutableStateOf(state.savedKeyFor(state.cloudTtsProvider)) }
-    var isApiKeyVisible by remember { mutableStateOf(false) }
-    var isProviderMenuExpanded by remember { mutableStateOf(false) }
     var showAiConsentDialog by remember { mutableStateOf(false) }
 
     var glossaryTermInput by remember { mutableStateOf("") }
     var glossaryPronunciationInput by remember { mutableStateOf("") }
-
-    LaunchedEffect(
-        state.cloudTtsProvider,
-        state.userGoogleCloudApiKey,
-        state.userElevenLabsApiKey,
-        state.userOpenAiApiKey
-    ) {
-        selectedProviderDraft = state.cloudTtsProvider
-        apiKeyInput = state.savedKeyFor(state.cloudTtsProvider)
-    }
 
     val fieldShape = RoundedCornerShape(14.dp)
 
@@ -344,11 +324,11 @@ fun SettingsScreen(
                 }
 
                 // =====================================================
-                // SECTION 2: API Configuration (Optional Cloud TTS Keys)
+                // SECTION 2: Free Neural Voice Engine (No API Key / No Billing)
                 // =====================================================
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "API Configuration",
+                        text = "Free Voice Engine",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold,
@@ -364,204 +344,276 @@ fun SettingsScreen(
                         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("cloud_tts_api_settings_card")
+                            .testTag("free_tts_engine_settings_card")
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Key,
+                                    imageVector = Icons.Default.GraphicEq,
                                     contentDescription = null,
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(22.dp)
                                 )
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Cloud TTS Provider",
+                                        text = if (state.isSupertonicOrSherpaActive) {
+                                            "Active: ${state.activeTtsEngineLabel} (Supertonic / sherpa-onnx)"
+                                        } else {
+                                            "Active: ${state.activeTtsEngineLabel}"
+                                        },
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onSurface,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                     Text(
-                                        text = "Keys are saved locally via Jetpack DataStore",
+                                        text = "100% Free • Zero API keys, credits, or subscriptions required",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.secondary
+                                    )
+                                }
+                            }
+
+                            TranslationModeOptionCard(
+                                title = "Android System Default TTS Engine",
+                                badge = if (state.selectedTtsEnginePackage.isBlank()) "Selected" else "Default",
+                                description = "Automatically uses whatever engine you selected in Android System Settings (e.g. sherpa-onnx Supertonic 3 Hindi).",
+                                selected = state.selectedTtsEnginePackage.isBlank(),
+                                icon = Icons.Default.Settings,
+                                testTag = "engine_option_system_default",
+                                onClick = {
+                                    onSelectAndroidTtsEngine("")
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("Using Android System Default TTS engine")
+                                    }
+                                }
+                            )
+
+                            val hasSupertonicInstalled = state.installedTtsEngines.any { it.isSherpaOrSupertonic }
+                            state.installedTtsEngines.forEach { engineInfo ->
+                                val isSelected = state.selectedTtsEnginePackage == engineInfo.packageName
+                                val badge = when {
+                                    engineInfo.isSherpaOrSupertonic -> "Supertonic / sherpa-onnx"
+                                    engineInfo.isSystemDefault -> "System Default"
+                                    else -> "Installed"
+                                }
+                                TranslationModeOptionCard(
+                                    title = engineInfo.label,
+                                    badge = badge,
+                                    description = "${engineInfo.packageName} • Free on-device Android TTS engine",
+                                    selected = isSelected,
+                                    icon = Icons.Default.RecordVoiceOver,
+                                    testTag = "engine_option_${engineInfo.packageName}",
+                                    onClick = {
+                                        onSelectAndroidTtsEngine(engineInfo.packageName)
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Switched TTS engine to ${engineInfo.label}")
+                                        }
+                                    }
+                                )
+                            }
+
+                            if (!hasSupertonicInstalled) {
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = "Tip: Install the official sherpa-onnx Supertonic 3 Hindi TTS Engine app on your phone, then tap Refresh or set it in Android TTS Settings for free offline neural Hindi voice.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(12.dp)
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = "Character Gender Support: ${state.genderVoiceCapabilityNote}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        onRefreshTtsEngines()
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Refreshed installed TTS engines")
+                                        }
+                                    },
+                                    shape = fieldShape,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("refresh_tts_engines_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Refresh")
+                                }
+                                OutlinedButton(
+                                    onClick = onOpenSystemTtsSettings,
+                                    shape = fieldShape,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("open_system_tts_settings_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Settings,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("TTS Settings")
+                                }
+                            }
+
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                            Text(
+                                text = "Optional MediaPipe Kokoro-82M (.litertlm)",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Primary recommended engine: Supertonic 3 Hindi Android TTS above. Optionally import a ~295 MB Kokoro .litertlm bundle for on-device MediaPipe Tasks Audio synthesis (falls back automatically to your Android TTS engine if absent or unsupported).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("free_voice_backend_selector")
+                            ) {
+                                FreeVoiceBackend.entries.forEach { backend ->
+                                    val isSelected = state.freeVoiceBackend == backend
+                                    FilterChip(
+                                        selected = isSelected,
+                                        onClick = { onSelectFreeVoiceBackend(backend) },
+                                        label = {
+                                            Text(
+                                                text = if (backend == FreeVoiceBackend.ANDROID_USER_SELECTED) {
+                                                    "Android / Supertonic 3"
+                                                } else {
+                                                    "Kokoro-82M MediaPipe"
+                                                },
+                                                style = MaterialTheme.typography.labelMedium
+                                            )
+                                        },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                        ),
+                                        modifier = Modifier.testTag("backend_chip_${backend.code}")
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = state.kokoroStatusMessage,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    val fileName = state.kokoroModelPath
+                                        .takeIf { it.isNotBlank() }
+                                        ?.let { File(it).name }
+                                        ?: "No .litertlm file selected"
+                                    Text(
+                                        text = "Bundle: $fileName",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Use GPU Delegate (with CPU fallback)",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "Use OpenCL GPU for kokoro_int8_gpu_fp16.litertlm; CPU XNNPACK on emulators",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Switch(
+                                    checked = state.kokoroUseGpu,
+                                    onCheckedChange = onToggleKokoroGpu,
+                                    modifier = Modifier.testTag("kokoro_gpu_switch")
+                                )
                             }
 
-                            ExposedDropdownMenuBox(
-                                expanded = isProviderMenuExpanded,
-                                onExpandedChange = { isProviderMenuExpanded = !isProviderMenuExpanded },
-                                modifier = Modifier.fillMaxWidth()
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                OutlinedTextField(
-                                    value = selectedProviderDraft.displayLabel,
-                                    onValueChange = {},
-                                    readOnly = true,
-                                    label = { Text("TTS Provider") },
+                                OutlinedButton(
+                                    onClick = onImportKokoroModel,
                                     shape = fieldShape,
-                                    trailingIcon = {
-                                        ExposedDropdownMenuDefaults.TrailingIcon(
-                                            expanded = isProviderMenuExpanded
-                                        )
-                                    },
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                        unfocusedBorderColor = MaterialTheme.colorScheme.outline
-                                    ),
                                     modifier = Modifier
-                                        .menuAnchor(MenuAnchorType.PrimaryNotEditable)
-                                        .fillMaxWidth()
-                                        .testTag("tts_provider_dropdown_field")
-                                )
-
-                                ExposedDropdownMenu(
-                                    expanded = isProviderMenuExpanded,
-                                    onDismissRequest = { isProviderMenuExpanded = false }
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("import_kokoro_model_button")
                                 ) {
-                                    CloudTtsProvider.entries.forEach { provider ->
-                                        DropdownMenuItem(
-                                            text = {
-                                                Column {
-                                                    Text(
-                                                        text = provider.displayLabel,
-                                                        fontWeight = FontWeight.Medium
-                                                    )
-                                                    Text(
-                                                        text = provider.subtitle,
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                    )
-                                                }
-                                            },
-                                            onClick = {
-                                                selectedProviderDraft = provider
-                                                apiKeyInput = state.savedKeyFor(provider)
-                                                isProviderMenuExpanded = false
-                                                onCloudTtsProviderChange(provider)
-                                            },
-                                            modifier = Modifier.testTag("dropdown_provider_${provider.code}")
-                                        )
+                                    Icon(
+                                        imageVector = Icons.Default.CloudDownload,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Import .litertlm")
+                                }
+                                if (state.kokoroModelPath.isNotBlank()) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            onClearKokoroModel()
+                                            scope.launch {
+                                                snackbarHostState.showSnackbar("Removed Kokoro model reference")
+                                            }
+                                        },
+                                        shape = fieldShape,
+                                        modifier = Modifier
+                                            .height(48.dp)
+                                            .testTag("clear_kokoro_model_button")
+                                    ) {
+                                        Text("Clear")
                                     }
                                 }
-                            }
-
-                            OutlinedTextField(
-                                value = apiKeyInput,
-                                onValueChange = { apiKeyInput = it },
-                                label = { Text("Enter API Key") },
-                                placeholder = {
-                                    Text(
-                                        when (selectedProviderDraft) {
-                                            CloudTtsProvider.GOOGLE_CLOUD_TTS -> "AIza... (Google Cloud TTS)"
-                                            CloudTtsProvider.ELEVENLABS -> "sk_... (ElevenLabs)"
-                                            CloudTtsProvider.OPENAI_TTS -> "sk-... (OpenAI TTS)"
-                                            CloudTtsProvider.ANDROID_SSML_NETWORK -> "Not required for Default Phone TTS"
-                                        }
-                                    )
-                                },
-                                singleLine = true,
-                                shape = fieldShape,
-                                visualTransformation = if (isApiKeyVisible) {
-                                    VisualTransformation.None
-                                } else {
-                                    PasswordVisualTransformation()
-                                },
-                                trailingIcon = {
-                                    IconButton(
-                                        onClick = { isApiKeyVisible = !isApiKeyVisible },
-                                        modifier = Modifier.testTag("toggle_api_key_visibility_button")
-                                    ) {
-                                        Icon(
-                                            imageVector = if (isApiKeyVisible) {
-                                                Icons.Default.VisibilityOff
-                                            } else {
-                                                Icons.Default.Visibility
-                                            },
-                                            contentDescription = if (isApiKeyVisible) {
-                                                "Hide API Key"
-                                            } else {
-                                                "Show API Key"
-                                            },
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                },
-                                supportingText = {
-                                    val hasConfiguredKey = when (selectedProviderDraft) {
-                                        CloudTtsProvider.GOOGLE_CLOUD_TTS ->
-                                            CloudTtsService.hasGoogleCloudKey(apiKeyInput)
-                                        CloudTtsProvider.ELEVENLABS ->
-                                            CloudTtsService.hasElevenLabsKey(apiKeyInput)
-                                        CloudTtsProvider.OPENAI_TTS ->
-                                            CloudTtsService.hasOpenAiKey(apiKeyInput)
-                                        CloudTtsProvider.ANDROID_SSML_NETWORK -> true
-                                    }
-                                    val helperText = when {
-                                        !selectedProviderDraft.requiresApiKey ->
-                                            "Using built-in device neural TTS engine."
-                                        !hasConfiguredKey ->
-                                            "No key entered — falls back to Default Phone TTS."
-                                        else ->
-                                            "Ready to use ${selectedProviderDraft.displayLabel}."
-                                    }
-                                    Text(
-                                        text = helperText,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                },
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("enter_api_key_textfield")
-                            )
-
-                            Button(
-                                onClick = {
-                                    val trimmed = apiKeyInput.trim()
-                                    onSaveCloudTtsApiConfig(selectedProviderDraft, trimmed)
-                                    scope.launch {
-                                        val msg = when {
-                                            !selectedProviderDraft.requiresApiKey ->
-                                                "Saved: Default Phone TTS active"
-                                            trimmed.isNotEmpty() ->
-                                                "${selectedProviderDraft.displayLabel} API Key saved"
-                                            else ->
-                                                "Empty key — falling back to Default Phone TTS"
-                                        }
-                                        snackbarHostState.showSnackbar(msg)
-                                    }
-                                },
-                                shape = fieldShape,
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    contentColor = MaterialTheme.colorScheme.onPrimary
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(50.dp)
-                                    .testTag("save_api_key_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Save,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Save",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.SemiBold
-                                )
                             }
                         }
                     }
@@ -680,39 +732,13 @@ fun SettingsScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Cloud W3C SSML (Google Cloud TTS)",
+                                        text = "Prefer Engine High-Quality Voice",
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onSurface,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                     Text(
-                                        text = "Built-in Android TTS always receives plain text + pitch/rate/volume",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Switch(
-                                    checked = state.ssmlEnabledOnDevice,
-                                    onCheckedChange = onSsmlEnabledChange,
-                                    modifier = Modifier.testTag("ssml_emotion_switch")
-                                )
-                            }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "High-Quality Network Voice",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    Text(
-                                        text = "Prefer natural neural voices over offline robotic TTS",
+                                        text = "Pick highest quality free voice available on your selected engine",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )

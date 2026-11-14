@@ -380,8 +380,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     processingTimeMs = elapsedMs,
                     timestamp = timestamp
                 )
-                withContext(Dispatchers.Main) {
-                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, "Duplicate skipped")
+                onDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(dialogueToTranslate, translatedText, "Duplicate skipped")
+                    }
                 }
             }
 
@@ -395,8 +397,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     processingTimeMs = elapsedMs,
                     timestamp = timestamp
                 )
-                withContext(Dispatchers.Main) {
-                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, "Queued (${outcome.queueSize})")
+                onDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(dialogueToTranslate, translatedText, "Queued (${outcome.queueSize})")
+                    }
                 }
             }
 
@@ -413,12 +417,14 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     processingTimeMs = elapsedMs,
                     timestamp = timestamp
                 )
-                withContext(Dispatchers.Main) {
-                    onDebugTextUpdate?.invoke(
-                        dialogueToTranslate,
-                        translatedText,
-                        "Skipped old rapid line • Queued (${outcome.queueSize})"
-                    )
+                onDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(
+                            dialogueToTranslate,
+                            translatedText,
+                            "Skipped old rapid line • Queued (${outcome.queueSize})"
+                        )
+                    }
                 }
             }
 
@@ -433,18 +439,12 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 val spokenSuccess = if (isVoiceMuted) {
                     false
                 } else {
-                    withContext(Dispatchers.Main) {
-                        if (sessionEpoch.get() != entryEpoch || (enforceActiveSession && !TranslatorStateRepository.state.value.isCapturingOcr)) {
-                            false
-                        } else {
-                            speakHindiNonBlocking(
-                                hindiText = translatedText,
-                                forceSpeakEvenIfRepeat = false,
-                                voiceProfile = assignedVoice,
-                                sourceEnglishText = dialogueToTranslate
-                            )
-                        }
-                    }
+                    speakHindiNonBlocking(
+                        hindiText = translatedText,
+                        forceSpeakEvenIfRepeat = false,
+                        voiceProfile = assignedVoice,
+                        sourceEnglishText = dialogueToTranslate
+                    )
                 }
                 val genderBadge = parsedDialogue.detectedGender.displayLabel
                 val note = when {
@@ -462,8 +462,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     timestamp = timestamp
                 )
 
-                withContext(Dispatchers.Main) {
-                    onDebugTextUpdate?.invoke(dialogueToTranslate, translatedText, note)
+                onDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(dialogueToTranslate, translatedText, note)
+                    }
                 }
             }
         }

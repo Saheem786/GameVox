@@ -12,7 +12,10 @@ object SubtitleTextFilter {
     private val STAT_RATIO_REGEX = Regex("^(?:HP|MP|SP|XP|AP|EP|GP|LV|LVL|LEVEL|SCORE|COIN|COINS|GOLD|AMMO|MAG|SHIELD|ARMOR|WAVE|ROUND|STAGE|FLOOR|KILL|KILLS|PING|FPS|MS)\\s*[:=\\-/]?\\s*[\\d.,/+%]+.*$", RegexOption.IGNORE_CASE)
     private val FPS_OR_PING_REGEX = Regex("^\\d{1,4}\\s*(?:FPS|HZ|MS|PING|KB/S|MB/S|%)$", RegexOption.IGNORE_CASE)
     private val BUTTON_PROMPT_REGEX = Regex("^(?:\\[?[A-Z0-9]{1,2}\\]?|LMB|RMB|SPACE|ESC|ENTER|SHIFT|CTRL|ALT|TAB)\\s*[:\\-]?\\s*(?:INTERACT|TALK|OPEN|USE|SKIP|CONTINUE|NEXT|CLOSE|ATTACK|DODGE|JUMP|RUN|PICK UP|RELOAD|PAUSE)?$", RegexOption.IGNORE_CASE)
-    private val PRESS_PROMPT_REGEX = Regex("^(?:PRESS|HOLD|TAP|CLICK)\\s+(?:ANY\\s+KEY|\\[?[A-Z0-9]{1,6}\\]?|TO\\s+(?:SKIP|CONTINUE|START|PLAY|RESUME)).*$", RegexOption.IGNORE_CASE)
+    private val PRESS_PROMPT_REGEX = Regex(
+        "^(?:PRESS|HOLD|TAP|CLICK)\\s+(?:ANY\\s+KEY(?:\\s+TO\\s+.*)?|SCREEN|HERE|TO\\s+(?:SKIP|CONTINUE|START|PLAY|RESUME|INTERACT|TALK|OPEN)|\\[?[A-Z0-9]{1,2}\\]?(?:\\s+TO\\s+.*|\\s*))$",
+        RegexOption.IGNORE_CASE
+    )
 
     private val UI_CONTROL_WORDS = setOf(
         "skip", "auto", "log", "history", "menu", "save", "load", "q.save", "q.load",

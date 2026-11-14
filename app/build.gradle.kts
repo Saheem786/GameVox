@@ -124,6 +124,7 @@ dependencies {
   implementation(libs.kotlinx.coroutines.play.services)
   implementation(libs.mlkit.text.recognition)
   implementation(libs.mlkit.translate)
+  implementation(libs.mediapipe.tasks.audio)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

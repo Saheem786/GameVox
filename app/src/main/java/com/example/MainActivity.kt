@@ -101,7 +101,9 @@ import com.example.engine.ContextAwareAiTranslator
 import com.example.engine.OcrTranslationPipeline
 import com.example.firebase.configureAppCheck
 import com.example.service.ForegroundTtsManager
+import com.example.service.FreeVoiceBackend
 import com.example.service.GameVoxAccessibilityService
+import com.example.service.KokoroMediaPipeTtsEngine
 import com.example.service.ScreenTranslatorService
 import com.example.ui.DiagnosisScreen
 import com.example.ui.SettingsScreen
@@ -243,6 +245,21 @@ fun GameVoxApp(
         }
     }
 
+    val kokoroModelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                val res = KokoroMediaPipeTtsEngine.getInstance(context).importModelFromUri(uri)
+                val msg = res.fold(
+                    onSuccess = { file -> "Imported ${file.name} for MediaPipe Kokoro-82M" },
+                    onFailure = { err -> err.localizedMessage ?: "Failed to import .litertlm file" }
+                )
+                snackbarHostState.showSnackbar(msg)
+            }
+        }
+    }
+
     DisposableEffect(localPipeline) {
         val voiceListener = object : ForegroundTtsManager.VoiceDataDownloadListener {
             override fun onHighQualityNetworkVoiceAvailable(
@@ -265,12 +282,16 @@ fun GameVoxApp(
                     )
                     if (result == SnackbarResult.ActionPerformed) {
                         try {
+                            val targetPkg = state.activeTtsEnginePackage
+                                .ifBlank { state.selectedTtsEnginePackage }
                             val checkIntent = Intent(TextToSpeech.Engine.ACTION_CHECK_TTS_DATA).apply {
-                                setPackage(ForegroundTtsManager.GOOGLE_TTS_PACKAGE)
+                                if (targetPkg.isNotBlank()) {
+                                    setPackage(targetPkg)
+                                }
                             }
                             checkTtsDataLauncher.launch(checkIntent)
                         } catch (_: Exception) {
-                            localPipeline.promptInstallHindiTtsData(context, openSystemInstaller = true)
+                            localPipeline.ttsManager.openSystemTtsSettings(context)
                         }
                     }
                 }
@@ -345,20 +366,41 @@ fun GameVoxApp(
                 onDownloadOfflinePack = {
                     localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
                 },
+                onSelectAndroidTtsEngine = { enginePkg ->
+                    localPipeline.ttsManager.selectAndroidTtsEngine(enginePkg)
+                },
+                onRefreshTtsEngines = {
+                    localPipeline.ttsManager.refreshInstalledEnginesList()
+                },
+                onOpenSystemTtsSettings = {
+                    localPipeline.ttsManager.openSystemTtsSettings(context)
+                },
+                onSelectFreeVoiceBackend = { backend ->
+                    TranslatorStateRepository.updateFreeVoiceBackend(context, backend)
+                    if (backend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
+                        val discovery = KokoroMediaPipeTtsEngine.getInstance(context)
+                            .discoverModelFile(state.kokoroModelPath)
+                        TranslatorStateRepository.updateKokoroStatusMessage(discovery.statusSummary)
+                    }
+                },
+                onImportKokoroModel = {
+                    kokoroModelPickerLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+                },
+                onToggleKokoroGpu = { useGpu ->
+                    TranslatorStateRepository.updateKokoroConfig(
+                        context = context,
+                        modelPath = state.kokoroModelPath,
+                        useGpu = useGpu
+                    )
+                },
+                onClearKokoroModel = {
+                    coroutineScope.launch {
+                        KokoroMediaPipeTtsEngine.getInstance(context).clearImportedModel()
+                    }
+                },
                 onHighQualityVoiceChange = { enabled ->
                     TranslatorStateRepository.updateUseHighQualityNetworkVoice(context, enabled)
                     localPipeline.refreshTtsConfiguration()
-                },
-                onSsmlEnabledChange = { enabled ->
-                    TranslatorStateRepository.updateSsmlEnabledOnDevice(context, enabled)
-                },
-                onCloudTtsProviderChange = { provider ->
-                    TranslatorStateRepository.updateCloudTtsProvider(context, provider)
-                    localPipeline.ttsManager.stopSpeaking()
-                },
-                onSaveCloudTtsApiConfig = { provider, apiKey ->
-                    TranslatorStateRepository.saveCloudTtsConfig(context, provider, apiKey)
-                    localPipeline.ttsManager.stopSpeaking()
                 },
                 onPitchChange = { newPitch ->
                     TranslatorStateRepository.updateTtsPitch(context, newPitch)
@@ -431,6 +473,9 @@ fun GameVoxApp(
                         state.targetLanguage.sampleGreeting,
                         forceSpeakEvenIfRepeat = true
                     )
+                },
+                onRunVoiceBenchmark = {
+                    localPipeline.ttsManager.runVoiceBenchmark()
                 },
                 onClearQueueAndCache = {
                     localPipeline.resetAntiRepeatMemory()
@@ -882,7 +927,7 @@ fun GameVoxApp(
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    text = "${state.targetLanguage.displayName} • Speed ${String.format(java.util.Locale.US, "%.1fx", state.ttsSpeechRate)} • Vol ${(state.ttsVolume * 100).toInt()}%",
+                                    text = "${state.activeTtsEngineLabel} • ${state.targetLanguage.displayName} • ${String.format(java.util.Locale.US, "%.1fx", state.ttsSpeechRate)}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,

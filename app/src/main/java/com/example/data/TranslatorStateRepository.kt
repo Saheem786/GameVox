@@ -6,6 +6,8 @@ import android.graphics.Rect
 import com.example.engine.PronunciationGlossary
 import com.example.engine.SpeechEmotion
 import com.example.service.CloudTtsProvider
+import com.example.service.FreeVoiceBackend
+import com.example.service.InstalledTtsEngineInfo
 import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -187,16 +189,27 @@ data class TranslatorAppState(
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val translationMode: TranslationMode = TranslationMode.ON_DEVICE_MLKIT,
     val aiPrivacyConsentAccepted: Boolean = false,
-    val useHighQualityNetworkVoice: Boolean = true,
+    val useHighQualityNetworkVoice: Boolean = false,
     val ssmlEnabledOnDevice: Boolean = false,
     val cloudTtsProvider: CloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+    val freeVoiceBackend: FreeVoiceBackend = FreeVoiceBackend.ANDROID_USER_SELECTED,
+    val selectedTtsEnginePackage: String = "",
+    val activeTtsEnginePackage: String = "",
+    val activeTtsEngineLabel: String = "System Default TTS",
+    val isSupertonicOrSherpaActive: Boolean = false,
+    val installedTtsEngines: List<InstalledTtsEngineInfo> = emptyList(),
+    val supportsDistinctGenderVoices: Boolean = false,
+    val genderVoiceCapabilityNote: String = "Checking installed TTS engine voices...",
+    val kokoroModelPath: String = "",
+    val kokoroUseGpu: Boolean = true,
+    val kokoroStatusMessage: String = "Optional Kokoro-82M (.litertlm) not configured",
     val userGoogleCloudApiKey: String = "",
     val userElevenLabsApiKey: String = "",
     val userOpenAiApiKey: String = "",
-    val activeApiKeyStatusNote: String = "",
-    val activeVoiceName: String = "Google Neural Network (hi-IN)",
+    val activeApiKeyStatusNote: String = "100% Free Neural / On-Device TTS (No API key or billing)",
+    val activeVoiceName: String = "User-Selected Android TTS (hi-IN)",
     val availableVoicesCount: Int = 0,
-    val voiceDownloadMessage: String = "Plain Android TTS Active",
+    val voiceDownloadMessage: String = "Checking user-selected Android TTS engine...",
     val mlKitModelStatusText: String = "Offline Hindi pack: checking...",
     val firebaseAiStatusText: String = "Not checked",
     val translationSourceLabel: String = "Idle",
@@ -204,6 +217,11 @@ data class TranslatorAppState(
     val ocrLatencyMs: Long = 0L,
     val translationLatencyMs: Long = 0L,
     val totalPipelineLatencyMs: Long = 0L,
+    val ttsInitLatencyMs: Long = 0L,
+    val ttsFirstAudioLatencyMs: Long = 0L,
+    val ttsSpeechDurationMs: Long = 0L,
+    val isRunningTtsBenchmark: Boolean = false,
+    val ttsBenchmarkSummary: String = "Not run yet — tap Run TTS Benchmark on an Android device",
     val roiDimensionsText: String = "—",
     val lastTtsEvent: String = "IDLE",
     val lastTtsUtteranceId: String = "",
@@ -232,14 +250,7 @@ data class TranslatorAppState(
     val invertedFramePreview: Bitmap? = null,
     val history: List<SubtitleTranslationEntry> = emptyList()
 ) {
-    fun savedKeyFor(provider: CloudTtsProvider): String {
-        return when (provider) {
-            CloudTtsProvider.GOOGLE_CLOUD_TTS -> userGoogleCloudApiKey
-            CloudTtsProvider.ELEVENLABS -> userElevenLabsApiKey
-            CloudTtsProvider.OPENAI_TTS -> userOpenAiApiKey
-            CloudTtsProvider.ANDROID_SSML_NETWORK -> ""
-        }
-    }
+    fun savedKeyFor(provider: CloudTtsProvider): String = ""
 }
 
 object TranslatorStateRepository {
@@ -257,6 +268,10 @@ object TranslatorStateRepository {
     private const val KEY_INTERVAL = "capture_interval_ms"
     private const val KEY_SSML_ENABLED = "ssml_enabled_cloud_or_opt_in_v2"
     private const val KEY_CLOUD_TTS_PROVIDER = "cloud_tts_provider_v1"
+    private const val KEY_SELECTED_ANDROID_TTS_ENGINE = "selected_android_tts_engine_v1"
+    private const val KEY_FREE_VOICE_BACKEND = "free_voice_backend_v1"
+    private const val KEY_KOKORO_MODEL_PATH = "kokoro_model_path_v1"
+    private const val KEY_KOKORO_USE_GPU = "kokoro_use_gpu_v1"
     private const val KEY_TRANSLATION_MODE = "translation_mode_v1"
     private const val KEY_AI_PRIVACY_CONSENT = "ai_privacy_consent_v1"
     private const val KEY_GLOSSARY_JSON = "pronunciation_glossary_v1"
@@ -275,11 +290,15 @@ object TranslatorStateRepository {
             prefs.getString(KEY_TRANSLATION_MODE, TranslationMode.ON_DEVICE_MLKIT.code)
         )
         val aiConsent = prefs.getBoolean(KEY_AI_PRIVACY_CONSENT, false)
-        val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, true)
+        val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, false)
         val ssmlEnabled = prefs.getBoolean(KEY_SSML_ENABLED, false)
-        val cloudProvider = CloudTtsProvider.fromCode(
-            prefs.getString(KEY_CLOUD_TTS_PROVIDER, CloudTtsProvider.ANDROID_SSML_NETWORK.code)
+        val cloudProvider = CloudTtsProvider.ANDROID_SSML_NETWORK
+        val selectedAndroidEnginePkg = prefs.getString(KEY_SELECTED_ANDROID_TTS_ENGINE, "").orEmpty().trim()
+        val freeVoiceBackend = FreeVoiceBackend.fromCode(
+            prefs.getString(KEY_FREE_VOICE_BACKEND, FreeVoiceBackend.ANDROID_USER_SELECTED.code)
         )
+        val kokoroModelPath = prefs.getString(KEY_KOKORO_MODEL_PATH, "").orEmpty().trim()
+        val kokoroUseGpu = prefs.getBoolean(KEY_KOKORO_USE_GPU, true)
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
         val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
         val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
@@ -297,6 +316,10 @@ object TranslatorStateRepository {
                 useHighQualityNetworkVoice = useHqVoice,
                 ssmlEnabledOnDevice = ssmlEnabled,
                 cloudTtsProvider = cloudProvider,
+                selectedTtsEnginePackage = selectedAndroidEnginePkg,
+                freeVoiceBackend = freeVoiceBackend,
+                kokoroModelPath = kokoroModelPath,
+                kokoroUseGpu = kokoroUseGpu,
                 showTargetBoxOverlay = showScanBox,
                 isSubtitleVisible = showSubtitleBox,
                 isVoiceMuted = voiceMuted,
@@ -342,22 +365,120 @@ object TranslatorStateRepository {
     fun updateCloudTtsProvider(context: Context, provider: CloudTtsProvider) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_CLOUD_TTS_PROVIDER, provider.code)
+            .putString(KEY_CLOUD_TTS_PROVIDER, CloudTtsProvider.ANDROID_SSML_NETWORK.code)
             .apply()
-        _state.update { it.copy(cloudTtsProvider = provider, activeApiKeyStatusNote = "") }
+        _state.update {
+            it.copy(
+                cloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+                activeApiKeyStatusNote = "100% Free Neural / On-Device TTS (No API key or billing)"
+            )
+        }
         dataStoreScope.launch {
-            TtsSettingsDataStore.saveProvider(context, provider)
+            TtsSettingsDataStore.saveProvider(context, CloudTtsProvider.ANDROID_SSML_NETWORK)
         }
     }
 
     suspend fun loadCloudTtsFromDataStore(context: Context) {
         val stored = TtsSettingsDataStore.readPreferences(context)
+        _state.update { current ->
+            current.copy(
+                cloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+                selectedTtsEnginePackage = stored.selectedTtsEnginePackage.ifBlank { current.selectedTtsEnginePackage },
+                freeVoiceBackend = stored.freeVoiceBackend,
+                kokoroModelPath = stored.kokoroModelPath.ifBlank { current.kokoroModelPath },
+                kokoroUseGpu = stored.kokoroUseGpu,
+                userGoogleCloudApiKey = "",
+                userElevenLabsApiKey = "",
+                userOpenAiApiKey = ""
+            )
+        }
+    }
+
+    fun updateSelectedTtsEnginePackage(context: Context, enginePackage: String) {
+        val cleaned = enginePackage.trim()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_SELECTED_ANDROID_TTS_ENGINE, cleaned)
+            .apply()
+        _state.update { it.copy(selectedTtsEnginePackage = cleaned) }
+        dataStoreScope.launch {
+            TtsSettingsDataStore.saveSelectedAndroidTtsEngine(context, cleaned)
+        }
+    }
+
+    fun updateFreeVoiceBackend(context: Context, backend: FreeVoiceBackend) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_FREE_VOICE_BACKEND, backend.code)
+            .apply()
+        _state.update { it.copy(freeVoiceBackend = backend) }
+        dataStoreScope.launch {
+            TtsSettingsDataStore.saveFreeVoiceBackend(context, backend)
+        }
+    }
+
+    fun updateKokoroConfig(
+        context: Context,
+        modelPath: String,
+        useGpu: Boolean = _state.value.kokoroUseGpu,
+        statusMessage: String? = null
+    ) {
+        val cleaned = modelPath.trim()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_KOKORO_MODEL_PATH, cleaned)
+            .putBoolean(KEY_KOKORO_USE_GPU, useGpu)
+            .apply()
         _state.update {
             it.copy(
-                cloudTtsProvider = stored.provider,
-                userGoogleCloudApiKey = stored.googleCloudApiKey,
-                userElevenLabsApiKey = stored.elevenLabsApiKey,
-                userOpenAiApiKey = stored.openAiApiKey
+                kokoroModelPath = cleaned,
+                kokoroUseGpu = useGpu,
+                kokoroStatusMessage = statusMessage ?: it.kokoroStatusMessage
+            )
+        }
+        dataStoreScope.launch {
+            TtsSettingsDataStore.saveKokoroConfig(context, cleaned, useGpu)
+        }
+    }
+
+    fun updateKokoroStatusMessage(message: String) {
+        _state.update { it.copy(kokoroStatusMessage = message) }
+    }
+
+    fun updateTtsEngineCatalogAndCapability(
+        installedEngines: List<InstalledTtsEngineInfo>,
+        activeEnginePackage: String,
+        activeEngineLabel: String,
+        isSupertonicOrSherpaActive: Boolean,
+        supportsDistinctGenderVoices: Boolean,
+        genderVoiceCapabilityNote: String
+    ) {
+        _state.update {
+            it.copy(
+                installedTtsEngines = installedEngines,
+                activeTtsEnginePackage = activeEnginePackage,
+                activeTtsEngineLabel = activeEngineLabel,
+                isSupertonicOrSherpaActive = isSupertonicOrSherpaActive,
+                supportsDistinctGenderVoices = supportsDistinctGenderVoices,
+                genderVoiceCapabilityNote = genderVoiceCapabilityNote
+            )
+        }
+    }
+
+    fun updateTtsLatencyBenchmarks(
+        initLatencyMs: Long? = null,
+        firstAudioLatencyMs: Long? = null,
+        speechDurationMs: Long? = null,
+        isRunningBenchmark: Boolean? = null,
+        summary: String? = null
+    ) {
+        _state.update { current ->
+            current.copy(
+                ttsInitLatencyMs = initLatencyMs ?: current.ttsInitLatencyMs,
+                ttsFirstAudioLatencyMs = firstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs,
+                ttsSpeechDurationMs = speechDurationMs ?: current.ttsSpeechDurationMs,
+                isRunningTtsBenchmark = isRunningBenchmark ?: current.isRunningTtsBenchmark,
+                ttsBenchmarkSummary = summary ?: current.ttsBenchmarkSummary
             )
         }
     }
@@ -367,31 +488,26 @@ object TranslatorStateRepository {
         provider: CloudTtsProvider,
         apiKey: String
     ) {
-        val trimmedKey = apiKey.trim()
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_CLOUD_TTS_PROVIDER, provider.code)
+            .putString(KEY_CLOUD_TTS_PROVIDER, CloudTtsProvider.ANDROID_SSML_NETWORK.code)
             .apply()
 
         _state.update { current ->
             current.copy(
-                cloudTtsProvider = provider,
-                userGoogleCloudApiKey = if (provider == CloudTtsProvider.GOOGLE_CLOUD_TTS) trimmedKey else current.userGoogleCloudApiKey,
-                userElevenLabsApiKey = if (provider == CloudTtsProvider.ELEVENLABS) trimmedKey else current.userElevenLabsApiKey,
-                userOpenAiApiKey = if (provider == CloudTtsProvider.OPENAI_TTS) trimmedKey else current.userOpenAiApiKey,
-                activeApiKeyStatusNote = when {
-                    !provider.requiresApiKey -> "Default Phone TTS active (No API key needed)."
-                    trimmedKey.isNotEmpty() -> "${provider.displayLabel} API Key saved to DataStore."
-                    else -> "API key cleared — will fallback to Default Phone TTS."
-                }
+                cloudTtsProvider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+                userGoogleCloudApiKey = "",
+                userElevenLabsApiKey = "",
+                userOpenAiApiKey = "",
+                activeApiKeyStatusNote = "Paid cloud TTS APIs are disabled — Free Android TTS active."
             )
         }
 
         dataStoreScope.launch {
             TtsSettingsDataStore.saveProviderAndApiKey(
                 context = context,
-                provider = provider,
-                apiKey = trimmedKey
+                provider = CloudTtsProvider.ANDROID_SSML_NETWORK,
+                apiKey = ""
             )
         }
     }

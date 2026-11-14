@@ -20,6 +20,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import org.json.JSONArray
 
@@ -49,6 +51,7 @@ object HindiTranslationEngine {
     private val translationCache = LruCache<String, String>(300)
     private val mlKitTranslators = ConcurrentHashMap<String, Translator>()
     private val downloadedLanguagePacks = ConcurrentHashMap<String, Boolean>()
+    private val modelDownloadMutexes = ConcurrentHashMap<String, Mutex>()
     private val recentDialogueContext = ArrayDeque<Pair<String, String>>(6)
 
     @Volatile
@@ -57,6 +60,9 @@ object HindiTranslationEngine {
 
     @Volatile
     internal var mlKitTranslatorOverride: (suspend (String, TargetLanguage) -> String?)? = null
+
+    @Volatile
+    internal var mlKitPreDownloadOverride: (suspend (TargetLanguage, Boolean) -> Boolean)? = null
 
     private val MULTI_LANG_DIALOGUE_MAP: Map<TargetLanguage, Map<String, String>> = mapOf(
         TargetLanguage.HINDI to mapOf(
@@ -414,60 +420,136 @@ object HindiTranslationEngine {
     }
 
     /**
-     * Checks whether the free on-device ML Kit translation pack (~30 MB) for [targetLanguage]
-     * is downloaded and triggers background download if requested.
+     * Convenience entry point to pre-download the English -> Hindi on-device ML Kit model
+     * at app startup or from Settings so OCR subtitles translate cleanly offline.
+     */
+    suspend fun preDownloadHindiOfflineModel(requireWifi: Boolean = false): Boolean {
+        return ensureOfflineModelDownloaded(
+            targetLanguage = TargetLanguage.HINDI,
+            downloadIfMissing = true,
+            requireWifi = requireWifi
+        )
+    }
+
+    /**
+     * Checks without starting any download whether the English -> [targetLanguage] ML Kit model pack
+     * is already cached on device for offline use.
+     */
+    suspend fun isOfflineModelReady(targetLanguage: TargetLanguage = TargetLanguage.HINDI): Boolean {
+        val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return false
+        if (downloadedLanguagePacks[mlKitCode] == true) return true
+        return ensureOfflineModelDownloaded(
+            targetLanguage = targetLanguage,
+            downloadIfMissing = false
+        )
+    }
+
+    /**
+     * Checks whether the free on-device ML Kit translation pack (~30 MB) for English -> [targetLanguage]
+     * is downloaded and triggers background pre-download if requested.
+     * Uses a per-language [Mutex] so concurrent pre-download calls (startup, Settings, first OCR frame)
+     * coalesce cleanly without overlapping downloads or status flicker.
      */
     suspend fun ensureOfflineModelDownloaded(
         targetLanguage: TargetLanguage = TargetLanguage.HINDI,
-        downloadIfMissing: Boolean = true
+        downloadIfMissing: Boolean = true,
+        requireWifi: Boolean = false
     ): Boolean {
         val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return false
-        return try {
-            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.CHECKING)
-            val model = TranslateRemoteModel.Builder(mlKitCode).build()
-            val alreadyDownloaded = RemoteModelManager.getInstance()
-                .isModelDownloaded(model)
-                .await()
+        if (downloadedLanguagePacks[mlKitCode] == true) {
+            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+            TranslatorStateRepository.setMlKitModelStatusText(
+                "Offline ${targetLanguage.displayName} pack ready (no cloud uploads)"
+            )
+            return true
+        }
 
-            if (alreadyDownloaded) {
-                downloadedLanguagePacks[mlKitCode] = true
+        val mutex = modelDownloadMutexes.getOrPut(mlKitCode) { Mutex() }
+        return mutex.withLock {
+            if (downloadedLanguagePacks[mlKitCode] == true) {
                 TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
                 TranslatorStateRepository.setMlKitModelStatusText(
                     "Offline ${targetLanguage.displayName} pack ready (no cloud uploads)"
                 )
-                return true
+                return@withLock true
             }
 
-            if (!downloadIfMissing) {
+            mlKitPreDownloadOverride?.let { override ->
+                val ready = try {
+                    override(targetLanguage, downloadIfMissing)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    false
+                }
+                if (ready) {
+                    downloadedLanguagePacks[mlKitCode] = true
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Offline ${targetLanguage.displayName} pack pre-downloaded & ready"
+                    )
+                } else {
+                    downloadedLanguagePacks.remove(mlKitCode)
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Offline ${targetLanguage.displayName} pack unavailable (~30 MB download needed once)"
+                    )
+                }
+                return@withLock ready
+            }
+
+            try {
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.CHECKING)
+                val modelManager = RemoteModelManager.getInstance()
+                val englishModel = TranslateRemoteModel.Builder(TranslateLanguage.ENGLISH).build()
+                val targetModel = TranslateRemoteModel.Builder(mlKitCode).build()
+                val targetDownloaded = modelManager.isModelDownloaded(targetModel).await()
+                val englishDownloaded = modelManager.isModelDownloaded(englishModel).await()
+
+                if (targetDownloaded && englishDownloaded) {
+                    downloadedLanguagePacks[mlKitCode] = true
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Offline ${targetLanguage.displayName} pack ready (no cloud uploads)"
+                    )
+                    return@withLock true
+                }
+
+                if (!downloadIfMissing) {
+                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
+                    TranslatorStateRepository.setMlKitModelStatusText(
+                        "Offline ${targetLanguage.displayName} pack not downloaded yet (~30 MB)"
+                    )
+                    return@withLock false
+                }
+
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.DOWNLOADING)
+                TranslatorStateRepository.setMlKitModelStatusText(
+                    "Pre-downloading offline ${targetLanguage.displayName} model (~30 MB)..."
+                )
+                val translator = getOrCreateMlKitTranslator(mlKitCode)
+                val conditionsBuilder = DownloadConditions.Builder()
+                if (requireWifi) {
+                    conditionsBuilder.requireWifi()
+                }
+                translator.downloadModelIfNeeded(conditionsBuilder.build()).await()
+                downloadedLanguagePacks[mlKitCode] = true
+                TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
+                TranslatorStateRepository.setMlKitModelStatusText(
+                    "Offline ${targetLanguage.displayName} pack pre-downloaded & ready"
+                )
+                true
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.w(TAG, "ML Kit offline model check/download failed for ${targetLanguage.displayName}", e)
+                downloadedLanguagePacks.remove(mlKitCode)
                 TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
                 TranslatorStateRepository.setMlKitModelStatusText(
-                    "Offline ${targetLanguage.displayName} pack not downloaded yet (~30 MB)"
+                    "Offline ${targetLanguage.displayName} pack unavailable: ${e.localizedMessage ?: "download needed once"}"
                 )
-                return false
+                false
             }
-
-            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.DOWNLOADING)
-            TranslatorStateRepository.setMlKitModelStatusText(
-                "Downloading offline ${targetLanguage.displayName} pack (~30 MB)..."
-            )
-            val translator = getOrCreateMlKitTranslator(mlKitCode)
-            val conditions = DownloadConditions.Builder().build()
-            translator.downloadModelIfNeeded(conditions).await()
-            downloadedLanguagePacks[mlKitCode] = true
-            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
-            TranslatorStateRepository.setMlKitModelStatusText(
-                "Offline ${targetLanguage.displayName} pack downloaded & ready"
-            )
-            true
-        } catch (ce: kotlinx.coroutines.CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Log.w(TAG, "ML Kit offline model check/download failed for ${targetLanguage.displayName}", e)
-            TranslatorStateRepository.setModelStatus(ModelDownloadStatus.OFFLINE_FALLBACK)
-            TranslatorStateRepository.setMlKitModelStatusText(
-                "Offline ${targetLanguage.displayName} pack unavailable: ${e.localizedMessage ?: "download needed once"}"
-            )
-            false
         }
     }
 
@@ -654,23 +736,14 @@ object HindiTranslationEngine {
         }
         val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return null
         return try {
-            val translator = getOrCreateMlKitTranslator(mlKitCode)
-            if (downloadedLanguagePacks[mlKitCode] != true) {
-                val model = TranslateRemoteModel.Builder(mlKitCode).build()
-                val isDownloaded = RemoteModelManager.getInstance().isModelDownloaded(model).await()
-                downloadedLanguagePacks[mlKitCode] = isDownloaded
-                if (!isDownloaded) {
-                    TranslatorStateRepository.setModelStatus(ModelDownloadStatus.DOWNLOADING)
-                    TranslatorStateRepository.setMlKitModelStatusText(
-                        "Downloading offline ${targetLanguage.displayName} pack (~30 MB)..."
-                    )
-                    translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
-                    downloadedLanguagePacks[mlKitCode] = true
-                    TranslatorStateRepository.setMlKitModelStatusText(
-                        "Offline ${targetLanguage.displayName} pack ready (no cloud uploads)"
-                    )
-                }
+            val isReady = ensureOfflineModelDownloaded(
+                targetLanguage = targetLanguage,
+                downloadIfMissing = true
+            )
+            if (!isReady) {
+                return null
             }
+            val translator = getOrCreateMlKitTranslator(mlKitCode)
             val translated = translator.translate(text).await().trim()
             if (translated.isNotEmpty()) {
                 TranslatorStateRepository.setModelStatus(ModelDownloadStatus.READY)
@@ -704,6 +777,7 @@ object HindiTranslationEngine {
 
     internal fun clearCacheForTesting() {
         translationCache.evictAll()
+        downloadedLanguagePacks.clear()
         clearSceneContext()
     }
 

@@ -2,16 +2,12 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
-import com.example.data.SpeakerGender
 import com.example.data.TtsSettingsDataStore
-import com.example.engine.EmotionSpeechEngine
 import com.example.service.CloudTtsProvider
-import com.example.service.CloudTtsSynthesisResult
-import com.example.service.ElevenLabsTtsService
+import com.example.service.FreeVoiceBackend
 import kotlinx.coroutines.test.runTest
-import org.json.JSONObject
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,7 +17,7 @@ import org.robolectric.RobolectricTestRunner
 class TtsSettingsDataStoreTest {
 
     @Test
-    fun saveAndLoadCloudTtsProviderAndKeysInDataStore() = runTest {
+    fun paidApiKeysAreIgnoredAndNeverStoredInDataStore() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
 
         TtsSettingsDataStore.saveProviderAndApiKey(
@@ -36,73 +32,61 @@ class TtsSettingsDataStoreTest {
         )
 
         val stored = TtsSettingsDataStore.readPreferences(context)
-        assertEquals(CloudTtsProvider.ELEVENLABS, stored.provider)
-        assertEquals("AIzaTestGoogleKey123", stored.googleCloudApiKey)
-        assertEquals("sk_test_elevenlabs_456", stored.elevenLabsApiKey)
+        assertEquals(CloudTtsProvider.ANDROID_SSML_NETWORK, stored.provider)
+        assertEquals("", stored.googleCloudApiKey)
+        assertEquals("", stored.elevenLabsApiKey)
+        assertEquals("", stored.openAiApiKey)
 
         assertEquals(
-            "AIzaTestGoogleKey123",
+            "",
             TtsSettingsDataStore.getEffectiveApiKey(context, CloudTtsProvider.GOOGLE_CLOUD_TTS)
         )
         assertEquals(
-            "sk_test_elevenlabs_456",
+            "",
             TtsSettingsDataStore.getEffectiveApiKey(context, CloudTtsProvider.ELEVENLABS)
         )
+        assertEquals(
+            "",
+            TtsSettingsDataStore.getEffectiveApiKey(context, CloudTtsProvider.OPENAI_TTS)
+        )
     }
 
     @Test
-    fun emptyKeyInDataStoreReturnsBlankForPhoneTtsFallback() = runTest {
+    fun saveAndLoadSelectedAndroidTtsEngineAndBackendInDataStore() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        TtsSettingsDataStore.saveProviderAndApiKey(
+
+        TtsSettingsDataStore.saveSelectedAndroidTtsEngine(
             context = context,
-            provider = CloudTtsProvider.ELEVENLABS,
-            apiKey = ""
+            enginePackage = "com.k2fsa.sherpa.onnx.tts.engine"
+        )
+        TtsSettingsDataStore.saveFreeVoiceBackend(
+            context = context,
+            backend = FreeVoiceBackend.ANDROID_USER_SELECTED
         )
 
-        val key = TtsSettingsDataStore.getEffectiveApiKey(context, CloudTtsProvider.ELEVENLABS)
-        assertEquals("", key)
-    }
+        val storedSupertonic = TtsSettingsDataStore.readPreferences(context)
+        assertEquals("com.k2fsa.sherpa.onnx.tts.engine", storedSupertonic.selectedTtsEnginePackage)
+        assertEquals(FreeVoiceBackend.ANDROID_USER_SELECTED, storedSupertonic.freeVoiceBackend)
 
-    @Test
-    fun elevenLabsTtsServiceSendsDynamicApiKeyAndReturnsAudioBytes() = runTest {
-        val fakeAudio = byteArrayOf(10, 20, 30, 40)
-        var capturedKey = ""
-        var capturedBody = ""
-
-        val fakeTransport = object : ElevenLabsTtsService.HttpTransport {
-            override fun postJsonForBytes(
-                url: String,
-                apiKey: String,
-                jsonBody: String
-            ): ElevenLabsTtsService.BinaryResponse {
-                capturedKey = apiKey
-                capturedBody = jsonBody
-                return ElevenLabsTtsService.BinaryResponse(statusCode = 200, bytes = fakeAudio)
-            }
-        }
-
-        val emotionResult = EmotionSpeechEngine.analyzeEmotionAndBuildSsml(
-            spokenText = "अरे रुको! मेरा वेट करो!",
-            sourceEnglishText = "Hold on! Wait for me!",
-            gender = SpeakerGender.FEMALE_18
+        // Switching back to System Default ("")
+        TtsSettingsDataStore.saveSelectedAndroidTtsEngine(
+            context = context,
+            enginePackage = ""
         )
-        val service = ElevenLabsTtsService(
-            apiKey = "sk_dynamic_datastore_key",
-            transport = fakeTransport
+        TtsSettingsDataStore.saveFreeVoiceBackend(
+            context = context,
+            backend = FreeVoiceBackend.MEDIAPIPE_KOKORO
+        )
+        TtsSettingsDataStore.saveKokoroConfig(
+            context = context,
+            modelPath = "/data/user/0/com.example/files/kokoro_models/kokoro_int8_gpu_fp16.litertlm",
+            useGpu = false
         )
 
-        val result = service.synthesizeEmotionAwareSpeech(
-            gender = SpeakerGender.FEMALE_18,
-            emotionResult = emotionResult
-        )
-
-        assertTrue(result is CloudTtsSynthesisResult.Success)
-        val success = result as CloudTtsSynthesisResult.Success
-        assertArrayEquals(fakeAudio, success.audioBytes)
-        assertEquals("sk_dynamic_datastore_key", capturedKey)
-
-        val payload = JSONObject(capturedBody)
-        assertEquals("eleven_multilingual_v2", payload.getString("model_id"))
-        assertTrue(payload.getString("text").contains("अरे रुको"))
+        val storedKokoro = TtsSettingsDataStore.readPreferences(context)
+        assertEquals("", storedKokoro.selectedTtsEnginePackage)
+        assertEquals(FreeVoiceBackend.MEDIAPIPE_KOKORO, storedKokoro.freeVoiceBackend)
+        assertTrue(storedKokoro.kokoroModelPath.endsWith("kokoro_int8_gpu_fp16.litertlm"))
+        assertFalse(storedKokoro.kokoroUseGpu)
     }
 }

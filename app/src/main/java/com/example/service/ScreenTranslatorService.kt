@@ -200,6 +200,7 @@ class ScreenTranslatorService : Service() {
         ttsManager.initializeAsync()
 
         pipeline = OcrTranslationPipeline.getInstance(applicationContext)
+        pipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
 
         overlayController = FloatingOverlayController(
             context = applicationContext,

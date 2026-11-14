@@ -65,6 +65,7 @@ fun DiagnosisScreen(
     maleVoicesCount: Int,
     onNavigateBack: () -> Unit,
     onTestVoice: () -> Unit,
+    onRunVoiceBenchmark: () -> Unit,
     onClearQueueAndCache: () -> Unit
 ) {
     BackHandler {
@@ -408,11 +409,39 @@ fun DiagnosisScreen(
                             )
                         }
 
+                        DiagnosisField(
+                            label = "Bound Android TTS Engine",
+                            value = buildString {
+                                append(state.activeTtsEngineLabel)
+                                if (state.activeTtsEnginePackage.isNotBlank()) {
+                                    append(" (${state.activeTtsEnginePackage})")
+                                }
+                                if (state.isSupertonicOrSherpaActive) {
+                                    append(" • Supertonic / sherpa-onnx Active")
+                                }
+                            }
+                        )
+                        DiagnosisField(
+                            label = "Voice Backend Mode",
+                            value = state.freeVoiceBackend.displayLabel
+                        )
+                        DiagnosisField(
+                            label = "Kokoro-82M (MediaPipe Optional)",
+                            value = state.kokoroStatusMessage
+                        )
                         DiagnosisField(label = "TTS Engine Status", value = state.ttsStatus.label)
                         DiagnosisField(label = "Active Voice", value = state.activeVoiceName)
                         DiagnosisField(
                             label = "Installed Voice Catalog",
                             value = "Female: $femaleVoicesCount • Male: $maleVoicesCount • Total matching: ${state.availableVoicesCount}"
+                        )
+                        DiagnosisField(
+                            label = "Gender Voice Switching",
+                            value = if (state.supportsDistinctGenderVoices) {
+                                "Supported (${state.genderVoiceCapabilityNote})"
+                            } else {
+                                "Fallback Only (${state.genderVoiceCapabilityNote})"
+                            }
                         )
                         DiagnosisField(
                             label = "Last Callback Event",
@@ -428,7 +457,85 @@ fun DiagnosisScreen(
                     }
                 }
 
-                // 5. Measured Pipeline Latencies
+                // 5. Real Voice Latency Benchmarks (Measured on Android TTS Engine)
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("diagnosis_tts_benchmark_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Speed,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "TTS Engine Latency Benchmarks",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            LatencyBadge("TTS Init", "${state.ttsInitLatencyMs}ms", Modifier.weight(1f))
+                            LatencyBadge("First Audio", "${state.ttsFirstAudioLatencyMs}ms", Modifier.weight(1f))
+                            LatencyBadge("Playback", "${state.ttsSpeechDurationMs}ms", Modifier.weight(1f))
+                        }
+
+                        Text(
+                            text = state.ttsBenchmarkSummary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+
+                        Button(
+                            onClick = onRunVoiceBenchmark,
+                            enabled = !state.isRunningTtsBenchmark,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("diagnosis_run_tts_benchmark_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Speed,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                if (state.isRunningTtsBenchmark) {
+                                    "Benchmarking Active TTS Engine..."
+                                } else {
+                                    "Run TTS Latency Benchmark"
+                                }
+                            )
+                        }
+
+                        Text(
+                            text = "Note: Metrics measure actual Android TTS callbacks on this device. Acoustic quality and live game FPS require verification on a physical Android phone.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // 6. Measured Pipeline Latencies
                 Card(
                     shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -452,7 +559,7 @@ fun DiagnosisScreen(
                                 modifier = Modifier.size(20.dp)
                             )
                             Text(
-                                text = "Measured Latencies & Queue",
+                                text = "Measured OCR & Translation Latencies",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.onSurface
