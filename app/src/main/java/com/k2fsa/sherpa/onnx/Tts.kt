@@ -164,7 +164,7 @@ class OfflineTts(
     init {
         ensureNativeLibraryLoaded()
         check(isNativeLibraryLoaded) {
-            "Sherpa-ONNX native JNI library (libsherpa-onnx-jni.so) is not loaded: ${jniLoadError ?: "unknown error"}"
+            "OfflineTts Sherpa-ONNX native JNI library (libsherpa-onnx-jni.so) is not loaded: ${jniLoadError ?: "unknown error"}"
         }
         ptr = if (assetManager != null) {
             newFromAsset(assetManager, config)

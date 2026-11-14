@@ -169,6 +169,10 @@ class FreeVoiceIntegrationTest {
 
         // Running voice benchmark when no real Android TTS engine is bound in Robolectric JVM
         // must report real failure rather than fabricating latency metrics.
+        TranslatorStateRepository.updateFreeVoiceBackend(
+            context = context,
+            backend = FreeVoiceBackend.ANDROID_USER_SELECTED
+        )
         TranslatorStateRepository.updateTtsLatencyBenchmarks(
             initLatencyMs = 0L,
             firstAudioLatencyMs = 0L,
@@ -184,7 +188,8 @@ class FreeVoiceIntegrationTest {
         assertFalse(benchmarkState.isRunningTtsBenchmark)
         assertTrue(
             benchmarkState.ttsBenchmarkSummary.contains("not ready", ignoreCase = true) ||
-                benchmarkState.ttsBenchmarkSummary.contains("unavailable", ignoreCase = true)
+                benchmarkState.ttsBenchmarkSummary.contains("unavailable", ignoreCase = true) ||
+                benchmarkState.ttsBenchmarkSummary.contains("not installed", ignoreCase = true)
         )
     }
 

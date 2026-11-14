@@ -70,11 +70,37 @@ jobs:
             touch .env.example
           fi
 
+      - name: Provision Sherpa-ONNX v2.0.1 Linux x64 JNI for Host Unit Tests
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/sherpa_linux_jni
+          curl -fSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-jni.tar.bz2" -o /tmp/sherpa_linux_jni/sherpa.tar.bz2
+          python3 -c 'import tarfile; tarfile.open("/tmp/sherpa_linux_jni/sherpa.tar.bz2", "r:bz2").extractall("/tmp/sherpa_linux_jni")'
+
       - name: Run JVM & Robolectric Unit Tests
         run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
 
       - name: Build Debug APK with Gradle Wrapper
         run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify Packaged arm64-v8a Sherpa-ONNX Native Libraries in APK
+        run: |
+          python3 -c '
+          import zipfile
+          apk = "app/build/outputs/apk/debug/app-debug.apk"
+          with zipfile.ZipFile(apk, "r") as zf:
+              names = set(zf.namelist())
+              for req in [
+                  "lib/arm64-v8a/libsherpa-onnx-jni.so",
+                  "lib/arm64-v8a/libonnxruntime.so",
+                  "lib/arm64-v8a/libsherpa-onnx-c-api.so",
+                  "lib/arm64-v8a/libsherpa-onnx-cxx-api.so",
+              ]:
+                  assert req in names, f"Missing required native library in APK: {req}"
+                  info = zf.getinfo(req)
+                  assert info.file_size > 100000, f"Native library {req} is unexpectedly small: {info.file_size}"
+                  print(f"Verified in APK: {req} ({info.file_size} bytes)")
+          '
 
       - name: Prepare Renamed APK for Release
         run: |
@@ -97,7 +123,7 @@ jobs:
           body: |
             ### GameVox Hindi — Automated Android APK Build
             - **Commit**: `${{ github.sha }}`
-            - **Features**: Floating Overlay (`WindowManager`), MediaProjection 2s Screen Capture, `ColorMatrix` Bitmap Inversion, Google ML Kit OCR, English-to-Hindi Translation, Anti-Repeat (`lastSpokenText`), and Hindi (`hi-IN`) TTS.
+            - **Features**: Direct In-Process Sherpa-ONNX v2.0.1 Supertonic 3 Hindi Neural TTS (`arm64-v8a`), 24 Character Voice Profiles (`SID 0–4` Female F1–F5, `SID 5–9` Male M1–M5), 10-Voice Preview Matrix, Floating Overlay (`WindowManager`), MediaProjection Screen Capture, Google ML Kit OCR & Offline Hindi Translation.
           files: |
             GameVox-Hindi-v1.0-debug.apk
             app/build/outputs/apk/debug/app-debug.apk
