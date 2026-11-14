@@ -1238,10 +1238,48 @@ class ForegroundTtsManager private constructor(context: Context) {
         if (state.freeVoiceBackend == FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT || SupertonicModelManager.isModelReady(appContext)) {
             val epoch = _playbackEpoch.incrementAndGet()
             val activeAssignment = VoiceProfileRepository.activeCharacterAssignment.value
-            val sid = activeAssignment?.speakerId ?: (voiceProfile?.engineVoiceIndex ?: 0)
+            val sid = activeAssignment?.speakerId ?: (voiceProfile?.engineVoiceIndex ?: 5)
             val speed = activeAssignment?.speed ?: (voiceProfile?.speechRate ?: 1.0f)
             val pitch = activeAssignment?.pitch ?: (voiceProfile?.pitch ?: 1.0f)
             val utteranceId = "sherpa_${UUID.randomUUID().toString().take(8)}"
+            val fallbackDispatched = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            val triggerSingleSystemFallback: (String) -> Unit = { err ->
+                if (fallbackDispatched.compareAndSet(false, true)) {
+                    Log.w(TAG, "Sherpa Supertonic single fallback for $utteranceId: $err")
+                    TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                        backendType = "SYSTEM_FALLBACK",
+                        modelLoaded = false,
+                        modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
+                        speakerCount = sherpaEngine.numSpeakers,
+                        selectedSid = sid,
+                        modelVersion = SupertonicModelManager.modelInfo.version,
+                        jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        configuredSteps = sherpaEngine.configuredNumSteps,
+                        lastError = err
+                    )
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($err)"
+                    )
+                    if (_playbackEpoch.get() == epoch) {
+                        isSpeakingUtterance = false
+                        if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                        stopVisualizerSync()
+                        if (!isBenchmarkRun) {
+                            managerScope.launch(Dispatchers.Main) {
+                                if (_playbackEpoch.get() == epoch) {
+                                    speakOnAndroidTts(
+                                        text = text,
+                                        sourceEnglishText = sourceEnglishText,
+                                        voiceProfile = voiceProfile,
+                                        isBenchmarkRun = false
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             isSpeakingUtterance = true
             activeUtteranceId = utteranceId
@@ -1289,46 +1327,12 @@ class ForegroundTtsManager private constructor(context: Context) {
                         }
                     },
                     onError = { err ->
-                        Log.w(TAG, "Sherpa Supertonic fallback: $err")
-                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                            backendType = "SYSTEM_FALLBACK",
-                            modelLoaded = false,
-                            modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
-                            speakerCount = sherpaEngine.numSpeakers,
-                            selectedSid = sid,
-                            modelVersion = SupertonicModelManager.modelInfo.version,
-                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                            configuredSteps = sherpaEngine.configuredNumSteps,
-                            lastError = err
-                        )
-                        TranslatorStateRepository.updateDiagnosisMetrics(
-                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($err)"
-                        )
-                        if (_playbackEpoch.get() == epoch) {
-                            isSpeakingUtterance = false
-                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
-                            stopVisualizerSync()
-                            if (!isBenchmarkRun) {
-                                speakOnAndroidTts(
-                                    text = text,
-                                    sourceEnglishText = sourceEnglishText,
-                                    voiceProfile = voiceProfile,
-                                    isBenchmarkRun = false
-                                )
-                            }
-                        }
+                        triggerSingleSystemFallback(err)
                     }
                 )
 
-                if (!success && _playbackEpoch.get() == epoch && !isBenchmarkRun) {
-                    managerScope.launch(Dispatchers.Main) {
-                        speakOnAndroidTts(
-                            text = text,
-                            sourceEnglishText = sourceEnglishText,
-                            voiceProfile = voiceProfile,
-                            isBenchmarkRun = false
-                        )
-                    }
+                if (!success && _playbackEpoch.get() == epoch) {
+                    triggerSingleSystemFallback("Sherpa synthesis returned false")
                 }
             }
             return true
@@ -1421,22 +1425,22 @@ class ForegroundTtsManager private constructor(context: Context) {
             if (!sherpaEngine.isReady && !sherpaEngine.initialize()) {
                 TranslatorStateRepository.updateTtsLatencyBenchmarks(
                     isRunningBenchmark = false,
-                    summary = "Cannot benchmark Sherpa-ONNX: Supertonic model not installed in filesDir. Download model first."
+                    summary = "Cannot benchmark Sherpa-ONNX: Supertonic model not installed or native init failed (SYSTEM_FALLBACK active)."
                 )
                 return false
             }
             TranslatorStateRepository.updateTtsLatencyBenchmarks(
                 isRunningBenchmark = true,
-                summary = "Benchmarking Sherpa-ONNX Supertonic 3 (5 vs 8 steps on CPU)..."
+                summary = "Benchmarking Sherpa-ONNX Supertonic 3 (5 vs 8 ODE steps on CPU)..."
             )
             managerScope.launch(Dispatchers.Default) {
                 val results = sherpaEngine.benchmarkSteps(text, listOf(5, 8))
                 val summaryText = if (results.isNotEmpty()) {
                     results.joinToString(" • ") { res ->
-                        "${res.numSteps} steps: ${res.generationTimeMs}ms (RTF: ${String.format(Locale.US, "%.2fx", res.realTimeFactor)})"
+                        "${res.numSteps} steps: 1stChunk=${res.firstChunkLatencyMs}ms, total=${res.generationTimeMs}ms, RMS=${String.format(Locale.US, "%.4f", res.waveformRms)} (RTF: ${String.format(Locale.US, "%.2fx", res.realTimeFactor)})"
                     }
                 } else {
-                    "Sherpa benchmark completed with no audio samples"
+                    "Sherpa benchmark failed: native model produced no valid non-silent audio samples"
                 }
                 TranslatorStateRepository.updateTtsLatencyBenchmarks(
                     isRunningBenchmark = false,
@@ -1445,7 +1449,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                 val firstResult = results.firstOrNull()
                 if (firstResult != null) {
                     TranslatorStateRepository.updateDiagnosisMetrics(
-                        ttsFirstAudioLatencyMs = firstResult.generationTimeMs,
+                        ttsFirstAudioLatencyMs = firstResult.firstChunkLatencyMs,
                         ttsSynthesisRtf = firstResult.realTimeFactor
                     )
                 }

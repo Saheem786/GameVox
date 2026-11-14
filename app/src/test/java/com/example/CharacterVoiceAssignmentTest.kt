@@ -42,6 +42,25 @@ class CharacterVoiceAssignmentTest {
     }
 
     @Test
+    fun testSupertonicVoicePresetsFollowAuditedSid0To4FemaleAndSid5To9Male() {
+        for (preset in CharacterVoiceAssignment.DEFAULT_PRESETS) {
+            val note = preset.characterRoleNote
+            if (note.contains("• F1") || note.contains("• F2") || note.contains("• F3") || note.contains("• F4") || note.contains("• F5")) {
+                assertTrue(
+                    "Female character '${preset.displayName}' must use SID 0..4, got ${preset.speakerId}",
+                    preset.speakerId in 0..4
+                )
+            }
+            if (note.contains("• M1") || note.contains("• M2") || note.contains("• M3") || note.contains("• M4") || note.contains("• M5")) {
+                assertTrue(
+                    "Male character '${preset.displayName}' must use SID 5..9, got ${preset.speakerId}",
+                    preset.speakerId in 5..9
+                )
+            }
+        }
+    }
+
+    @Test
     fun testNormalizedCharacterNames() {
         assertEquals("anon", CharacterVoiceAssignment.normalizeName("ANON"))
         assertEquals("anon", CharacterVoiceAssignment.normalizeName("  Anon  "))
@@ -52,12 +71,16 @@ class CharacterVoiceAssignmentTest {
     }
 
     @Test
-    fun testAnonAndJennyInvokeDifferentSids() {
+    fun testAnonMaleAndJennyFemaleInvokeAuditedGenderedSids() {
         val anon = CharacterVoiceAssignment.DEFAULT_PRESETS.first { it.characterName == "anon" }
         val jenny = CharacterVoiceAssignment.DEFAULT_PRESETS.first { it.characterName == "jenny" }
 
-        assertEquals(0, anon.speakerId)
-        assertEquals(1, jenny.speakerId)
+        assertEquals("Anon must use Male M1 (SID 5)", 5, anon.speakerId)
+        assertTrue("Anon speakerId must be in male range 5..9", anon.speakerId in 5..9)
+
+        assertEquals("Jenny must use Female F2 (SID 1)", 1, jenny.speakerId)
+        assertTrue("Jenny speakerId must be in female range 0..4", jenny.speakerId in 0..4)
+
         assertTrue(
             "Anon (sid: ${anon.speakerId}) and Jenny (sid: ${jenny.speakerId}) must invoke different speaker IDs",
             anon.speakerId != jenny.speakerId
@@ -65,12 +88,16 @@ class CharacterVoiceAssignmentTest {
     }
 
     @Test
-    fun testKaalAndIraInvokeDifferentSids() {
+    fun testKaalMaleAndIraFemaleInvokeAuditedGenderedSids() {
         val kaal = CharacterVoiceAssignment.DEFAULT_PRESETS.first { it.characterName == "kaal" }
         val ira = CharacterVoiceAssignment.DEFAULT_PRESETS.first { it.characterName == "ira" }
 
-        assertEquals(6, kaal.speakerId)
-        assertEquals(3, ira.speakerId)
+        assertEquals(7, kaal.speakerId)
+        assertTrue("Kaal speakerId must be in male range 5..9", kaal.speakerId in 5..9)
+
+        assertEquals(2, ira.speakerId)
+        assertTrue("Ira speakerId must be in female range 0..4", ira.speakerId in 0..4)
+
         assertTrue(kaal.speakerId != ira.speakerId)
     }
 
@@ -98,9 +125,6 @@ class CharacterVoiceAssignmentTest {
 
     @Test
     fun testFloorModSafetyWithNegativeAndMinValueHashes() {
-        // Critical audio engineering test:
-        // Math.abs(Int.MIN_VALUE) remains negative (-2147483648), causing Math.abs(x) % 10 to yield -8 (CRASH).
-        // Math.floorMod safely returns positive 2.
         val speakerCount = 10
         val safeSid = Math.floorMod(Int.MIN_VALUE, speakerCount)
         assertTrue("floorMod with Int.MIN_VALUE must be >= 0, got: $safeSid", safeSid in 0..9)
@@ -128,16 +152,16 @@ class CharacterVoiceAssignmentTest {
     @Test
     fun testUserOverrideTakesPriority() {
         val defaultAnon = CharacterVoiceAssignment.DEFAULT_PRESETS.first { it.characterName == "anon" }
-        assertEquals(0, defaultAnon.speakerId)
+        assertEquals(5, defaultAnon.speakerId)
         assertFalse(defaultAnon.isUserOverride)
 
-        // Simulate user overriding Anon to Sid 4
+        // Simulate user overriding Anon to Sid 8 (M4)
         val overriddenAnon = defaultAnon.copy(
-            speakerId = 4,
+            speakerId = 8,
             isUserOverride = true
         )
         assertTrue(overriddenAnon.isUserOverride)
-        assertEquals(4, overriddenAnon.speakerId)
+        assertEquals(8, overriddenAnon.speakerId)
     }
 
     @Test

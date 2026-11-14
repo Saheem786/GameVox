@@ -423,24 +423,28 @@ fun DiagnosisScreen(
                         )
                         val context = androidx.compose.ui.platform.LocalContext.current
                         val activeChar = com.example.data.VoiceProfileRepository.activeCharacterAssignment.value
-                        val isSherpaReady = com.example.service.SupertonicModelManager.isModelReady(context)
+                        val isModelVerifiedOnDisk = com.example.service.SupertonicModelManager.isModelReady(context)
+                        val sherpaEngine = com.example.service.ForegroundTtsManager.getInstance(context).sherpaEngine
+                        val isSherpaRuntimeReady = isModelVerifiedOnDisk &&
+                            com.k2fsa.sherpa.onnx.OfflineTts.isNativeLibraryLoaded &&
+                            sherpaEngine.isModelRuntimeInitialized
                         val speakerCount = com.example.data.VoiceProfileRepository.getAvailableSpeakerCount()
 
                         // Voice Engine Audit Panel
                         DiagnosisField(
                             label = "Speech Engine Mode",
-                            value = if (isSherpaReady && state.freeVoiceBackend == com.example.service.FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT) {
-                                "SHERPA_DIRECT (In-Process Neural • OpenRAIL-M)"
+                            value = if (isSherpaRuntimeReady && state.freeVoiceBackend == com.example.service.FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT) {
+                                "SHERPA_DIRECT (Native JNI + ONNX Runtime Initialized • OpenRAIL-M)"
                             } else {
-                                "SYSTEM_FALLBACK (${state.activeTtsEngineLabel} • Supertonic not ready)"
+                                "SYSTEM_FALLBACK (${state.activeTtsEngineLabel} • ${sherpaEngine.initializationError ?: "Supertonic runtime not initialized"})"
                             }
                         )
                         DiagnosisField(
-                            label = "Model Loaded",
-                            value = if (isSherpaReady) {
-                                "true (${com.example.service.SupertonicModelManager.getModelDirectory(context).absolutePath})"
-                            } else {
-                                "false (Not installed in private app storage)"
+                            label = "Model Loaded & Verified",
+                            value = when {
+                                isSherpaRuntimeReady -> "true (Native handle valid • ${com.example.service.SupertonicModelManager.getModelDirectory(context).absolutePath})"
+                                isModelVerifiedOnDisk -> "Files verified on disk; native handle not initialized yet"
+                                else -> "false (Not installed or SHA-256 unverified in private app storage)"
                             }
                         )
                         DiagnosisField(
