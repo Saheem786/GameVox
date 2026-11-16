@@ -239,6 +239,8 @@ data class TranslatorAppState(
     val ttsSpeechDurationMs: Long = 0L,
     val lastSynthesizedVoiceSha256: String = "",
     val lastSynthesizedRms: Float = 0.0f,
+    val lastSynthesizedRmsDisplay: String = "UNKNOWN",
+    val lastRoutingDebugSummary: String = "No OCR subtitle routed yet",
     val chatterboxServerUrl: String = "http://192.168.1.100:8765",
     val chatterboxAuthToken: String = "gamevox-local-secret-2026",
     val chatterboxServerReachable: Boolean = false,
@@ -924,10 +926,25 @@ object TranslatorStateRepository {
                 endToEndSubtitleToAudioLatencyMs = computedEndToEnd,
                 ttsSynthesisRtf = ttsSynthesisRtf ?: current.ttsSynthesisRtf,
                 lastSynthesizedVoiceSha256 = lastSynthesizedVoiceSha256 ?: current.lastSynthesizedVoiceSha256,
-                lastSynthesizedRms = lastSynthesizedRms ?: current.lastSynthesizedRms,
+                lastSynthesizedRms = if (lastSynthesizedRms != null && !lastSynthesizedRms.isNaN() && lastSynthesizedRms >= 0f) {
+                    lastSynthesizedRms
+                } else if (lastSynthesizedRms != null) {
+                    0f
+                } else {
+                    current.lastSynthesizedRms
+                },
+                lastSynthesizedRmsDisplay = when {
+                    lastSynthesizedRms == null -> current.lastSynthesizedRmsDisplay
+                    lastSynthesizedRms.isNaN() || lastSynthesizedRms < 0f -> "UNKNOWN"
+                    else -> String.format(Locale.US, "%.4f", lastSynthesizedRms)
+                },
                 activeVoiceName = activeVoiceName ?: current.activeVoiceName
             )
         }
+    }
+
+    fun updateRoutingDebugSummary(summary: String) {
+        _state.update { it.copy(lastRoutingDebugSummary = summary) }
     }
 
     fun updateVoiceEngineDiagnostics(

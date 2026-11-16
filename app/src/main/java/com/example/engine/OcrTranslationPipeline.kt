@@ -79,6 +79,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 if (dubbingQueue.size() == 0) {
                     lastSpokenText = ""
                     lastExtractedNormalized = ""
+                    lastExtractedSpeakerContextKey = ""
                 }
             }
         }
@@ -90,6 +91,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
     @Volatile
     private var lastExtractedNormalized: String = ""
+
+    @Volatile
+    private var lastExtractedSpeakerContextKey: String = ""
 
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.US)
 
@@ -248,7 +252,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
             )
         }
 
-        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(extractionResult.extractedText)
+        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(
+            rawSubtitleText = extractionResult.extractedText,
+            isFromMediaProjectionOcr = true
+        )
         val dialogueToTranslate = parsedDialogue.spokenDialogue.trim().ifBlank { extractedEnglish }
         val detailedTranslation = translateEnglishToHindiDetailed(
             englishText = dialogueToTranslate,
@@ -407,6 +414,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 captureLatencyMs = captureLatencyMs,
                 ocrLatencyMs = extractionResult.ocrLatencyMs,
                 roiDimensionsText = roiDimensions,
+                isFromMediaProjectionOcr = true,
                 onDebugTextUpdate = onDebugTextUpdate
             )
         }
@@ -450,6 +458,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
         captureLatencyMs: Long,
         ocrLatencyMs: Long,
         roiDimensionsText: String,
+        isFromMediaProjectionOcr: Boolean = false,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?
     ): Pair<String, String> {
         if (sessionEpoch.get() != entryEpoch || (enforceActiveSession && !TranslatorStateRepository.state.value.isCapturingOcr)) {
@@ -459,16 +468,29 @@ class OcrTranslationPipeline private constructor(context: Context) {
         val state = TranslatorStateRepository.state.value
         val targetLang = state.targetLanguage
 
-        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(rawScanText)
+        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(
+            rawSubtitleText = rawScanText,
+            isFromMediaProjectionOcr = isFromMediaProjectionOcr
+        )
         val assignedVoice = parsedDialogue.assignedVoice
         val dialogueToTranslate = parsedDialogue.spokenDialogue.trim()
         if (dialogueToTranslate.isBlank()) {
             return "" to ""
         }
 
-        // Skip re-translating if extracted dialogue matches the active or most recently queued line
+        val candidateSpeakerContextKey = buildSpeakerContextAntiRepeatKey(
+            routeDecision = parsedDialogue.routeDecision,
+            characterAssignment = parsedDialogue.characterAssignment,
+            speakerName = parsedDialogue.speakerName,
+            epoch = entryEpoch
+        )
+
+        // Skip re-translating ONLY if extracted dialogue AND speaker/profile/game context match the active or most recently queued line
         val candidateNorm = SubtitleDubbingQueue.normalize(dialogueToTranslate)
-        if (SubtitleDubbingQueue.areSimilar(candidateNorm, lastExtractedNormalized) && !isTtsSpeakingNow()) {
+        if (candidateSpeakerContextKey == lastExtractedSpeakerContextKey &&
+            SubtitleDubbingQueue.areSimilar(candidateNorm, lastExtractedNormalized) &&
+            !isTtsSpeakingNow()
+        ) {
             TranslatorStateRepository.updateDiagnosisMetrics(
                 captureLatencyMs = captureLatencyMs,
                 ocrLatencyMs = ocrLatencyMs,
@@ -533,8 +555,12 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 assignment = parsedDialogue.characterAssignment
                     ?: parsedDialogue.routeDecision.characterAssignment
             ),
-            sessionEpoch = entryEpoch
+            sessionEpoch = entryEpoch,
+            isFromRealMediaProjectionOcr = isFromMediaProjectionOcr
         )
+        if (isFromMediaProjectionOcr && finalRouteDecision != null) {
+            CharacterVoiceRouter.recordCapturedLiveOcrRoute(finalRouteDecision)
+        }
         val queueItem = PendingDubbingItem(
             sourceEnglish = dialogueToTranslate,
             spokenDialogue = dialogueToTranslate,
@@ -549,7 +575,8 @@ class OcrTranslationPipeline private constructor(context: Context) {
             item = queueItem,
             isCurrentlySpeaking = isTtsSpeakingNow(),
             activeSpokenEnglishNormalized = lastExtractedNormalized,
-            activeSpokenTranslated = lastSpokenText
+            activeSpokenTranslated = lastSpokenText,
+            activeSpokenSpeakerContextKey = lastExtractedSpeakerContextKey
         )
 
         val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
@@ -618,6 +645,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 }
                 lastSpokenText = translatedText.trim()
                 lastExtractedNormalized = SubtitleDubbingQueue.normalize(dialogueToTranslate)
+                lastExtractedSpeakerContextKey = queueItem.buildSpeakerContextKey()
 
                 val spokenSuccess = if (isVoiceMuted) {
                     false
@@ -675,6 +703,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
             lastSpokenText = next.translatedText.trim()
             lastExtractedNormalized = SubtitleDubbingQueue.normalize(next.spokenDialogue)
+            lastExtractedSpeakerContextKey = next.buildSpeakerContextKey()
 
             val spokenSuccess = speakHindiNonBlocking(
                 hindiText = next.translatedText,
@@ -767,7 +796,22 @@ class OcrTranslationPipeline private constructor(context: Context) {
         HindiTranslationEngine.clearSceneContext()
         lastSpokenText = ""
         lastExtractedNormalized = ""
+        lastExtractedSpeakerContextKey = ""
         TranslatorStateRepository.clearLastSpokenMemory()
+    }
+
+    private fun buildSpeakerContextAntiRepeatKey(
+        routeDecision: VoiceRouteDecision?,
+        characterAssignment: com.example.data.CharacterVoiceAssignment?,
+        speakerName: String?,
+        epoch: Long
+    ): String {
+        val ns = (routeDecision?.gameNamespace
+            ?: characterAssignment?.gameNamespace
+            ?: VoiceProfileRepository.getActiveGameNamespace()).lowercase(Locale.ROOT)
+        val speakerIdentity = routeDecision?.antiRepeatSpeakerIdentity
+            ?: "$ns:${characterAssignment?.characterName ?: com.example.data.CharacterVoiceAssignment.normalizeName(speakerName ?: "unknown")}"
+        return "$speakerIdentity:ep$epoch"
     }
 
     fun promptInstallHindiTtsData(context: Context, openSystemInstaller: Boolean = true) {

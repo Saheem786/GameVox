@@ -1324,8 +1324,14 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
+        val canonicalSelection = com.example.engine.CharacterVoiceRouter.selectCanonicalVoiceBackend(
+            context = appContext,
+            assignment = activeAssignment,
+            state = state
+        )
+
         // 0. User-Visible Mode: Pause Dubbing (subtitles remain active, audio playback paused)
-        if (state.freeVoiceBackend == FreeVoiceBackend.PAUSE_DUBBING) {
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.PAUSE_DUBBING) {
             TranslatorStateRepository.updateVoiceEngineDiagnostics(
                 backendType = "PAUSE_DUBBING",
                 modelLoaded = false,
@@ -1343,8 +1349,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             return false
         }
 
-        // 0b. User-Visible Mode: Human Voice — Local Neural Server (ResembleAI Chatterbox Multilingual V3 Hindi)
-        if (state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER) {
+        // 0b. Canonical Backend: Local Neural Server (ResembleAI Chatterbox Multilingual V3 Hindi)
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.CHATTERBOX_LOCAL_SERVER) {
             val epoch = currentEpoch
             val utteranceId = effectiveRoute.utteranceId
             val fallbackDispatched = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1388,7 +1394,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                 text = spokenWithOverrides,
                 voiceProfile = effectiveVoiceProfile,
                 emotionResult = emotionResult,
-                overrideVoiceName = "Chatterbox V3 (${activeAssignment.displayName} • ${activeAssignment.referenceVoiceId})"
+                overrideVoiceName = "Synthesizing (${activeAssignment.displayName})..."
             )
 
             managerScope.launch(Dispatchers.Default) {
@@ -1514,19 +1520,21 @@ class ForegroundTtsManager private constructor(context: Context) {
                                                     onUtteranceCompletedImmediately?.invoke(utteranceId)
                                                 },
                                                 onError = { sherpaErr ->
+                                                    val sysBackend = resolveSystemFallbackBackendCode(state)
                                                     com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                                                         routeDecision = effectiveRoute,
                                                         actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-                                                        actualBackend = "SYSTEM_FALLBACK",
+                                                        actualBackend = sysBackend,
                                                         jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                                                         modelLoaded = false,
                                                         fallbackReason = "$err; $sherpaErr",
                                                         audioDurationMs = 0L,
-                                                        outputPcmRms = 0f
+                                                        outputPcmRms = null
                                                     )
                                                     managerScope.launch(Dispatchers.Main) {
                                                         TranslatorStateRepository.updateDiagnosisMetrics(
-                                                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($sherpaErr)"
+                                                            lastSynthesizedRms = Float.NaN,
+                                                            activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} ($sherpaErr)"
                                                         )
                                                         speakOnAndroidTts(text, sourceEnglishText, effectiveVoiceProfile, false)
                                                     }
@@ -1534,18 +1542,19 @@ class ForegroundTtsManager private constructor(context: Context) {
                                             )
                                         }
                                     } else {
+                                        val sysBackend = resolveSystemFallbackBackendCode(state)
                                         com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                                             routeDecision = effectiveRoute,
                                             actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-                                            actualBackend = "SYSTEM_FALLBACK",
+                                            actualBackend = sysBackend,
                                             jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                                             modelLoaded = false,
                                             fallbackReason = "Chatterbox server offline: $err",
                                             audioDurationMs = 0L,
-                                            outputPcmRms = 0f
+                                            outputPcmRms = null
                                         )
                                         TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                                            backendType = "SYSTEM_FALLBACK (Server Offline)",
+                                            backendType = "$sysBackend (Server Offline)",
                                             modelLoaded = false,
                                             modelPath = state.chatterboxServerUrl,
                                             speakerCount = sherpaEngine.numSpeakers,
@@ -1556,7 +1565,8 @@ class ForegroundTtsManager private constructor(context: Context) {
                                             lastError = "Chatterbox server offline: $err"
                                         )
                                         TranslatorStateRepository.updateDiagnosisMetrics(
-                                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} (Chatterbox Offline)"
+                                            lastSynthesizedRms = Float.NaN,
+                                            activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} (Chatterbox Offline)"
                                         )
                                         managerScope.launch(Dispatchers.Main) {
                                             if (_playbackEpoch.get() == epoch) {
@@ -1578,8 +1588,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             return true
         }
 
-        // 1. Direct in-process Sherpa-ONNX Supertonic 3 Neural TTS Path
-        if (state.freeVoiceBackend == FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT || SupertonicModelManager.isModelReady(appContext)) {
+        // 1. Canonical Backend: Direct in-process Sherpa-ONNX Supertonic 3 Neural TTS Path
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.SHERPA_DIRECT) {
             val epoch = currentEpoch
             val sid = effectiveRoute.selectedSpeakerId
             val speed = activeAssignment.speed
@@ -1589,19 +1599,20 @@ class ForegroundTtsManager private constructor(context: Context) {
 
             val triggerSingleSystemFallback: (String) -> Unit = { err ->
                 if (fallbackDispatched.compareAndSet(false, true)) {
+                    val sysBackend = resolveSystemFallbackBackendCode(state)
                     Log.w(TAG, "Sherpa Supertonic single fallback for $utteranceId: $err")
                     com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                         routeDecision = effectiveRoute,
                         actualSidPassedToNative = sid,
-                        actualBackend = "SYSTEM_FALLBACK",
+                        actualBackend = sysBackend,
                         jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                         modelLoaded = false,
                         fallbackReason = err,
                         audioDurationMs = 0L,
-                        outputPcmRms = 0f
+                        outputPcmRms = null
                     )
                     TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                        backendType = "SYSTEM_FALLBACK",
+                        backendType = sysBackend,
                         modelLoaded = false,
                         modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
                         speakerCount = sherpaEngine.numSpeakers,
@@ -1612,7 +1623,8 @@ class ForegroundTtsManager private constructor(context: Context) {
                         lastError = err
                     )
                     TranslatorStateRepository.updateDiagnosisMetrics(
-                        activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($err)"
+                        lastSynthesizedRms = Float.NaN,
+                        activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} ($err)"
                     )
                     if (_playbackEpoch.get() == epoch) {
                         isSpeakingUtterance = false
@@ -1701,8 +1713,8 @@ class ForegroundTtsManager private constructor(context: Context) {
             return true
         }
 
-        // 2. Optional Google MediaPipe Kokoro-82M on-device model path
-        if (state.freeVoiceBackend == FreeVoiceBackend.MEDIAPIPE_KOKORO) {
+        // 2. Canonical Backend: Optional Google MediaPipe Kokoro-82M on-device model path
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.MEDIAPIPE_KOKORO) {
             val discovery = kokoroEngine.discoverModelFile(state.kokoroModelPath)
             if (discovery.resolvedFile != null) {
                 val epoch = currentEpoch
@@ -1767,15 +1779,16 @@ class ForegroundTtsManager private constructor(context: Context) {
         }
 
         // 3. Android System / Preferred Engine Fallback
+        val sysBackend = resolveSystemFallbackBackendCode(state)
         com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
             routeDecision = effectiveRoute,
             actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-            actualBackend = "SYSTEM_FALLBACK",
+            actualBackend = sysBackend,
             jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
             modelLoaded = false,
-            fallbackReason = "Supertonic model not installed; using Android System TTS",
+            fallbackReason = canonicalSelection.selectionReason,
             audioDurationMs = 0L,
-            outputPcmRms = 0f
+            outputPcmRms = null
         )
         return speakOnAndroidTts(
             text = text,
@@ -1783,6 +1796,16 @@ class ForegroundTtsManager private constructor(context: Context) {
             voiceProfile = effectiveVoiceProfile,
             isBenchmarkRun = isBenchmarkRun
         )
+    }
+
+    fun resolveSystemFallbackBackendCode(
+        state: com.example.data.TranslatorAppState = TranslatorStateRepository.state.value
+    ): String {
+        return if (state.supportsDistinctGenderVoices && femaleVoices.isNotEmpty() && maleVoices.isNotEmpty()) {
+            "SYSTEM_FALLBACK"
+        } else {
+            "SYSTEM_FALLBACK_SINGLE_VOICE"
+        }
     }
 
     /**
@@ -2000,15 +2023,38 @@ class ForegroundTtsManager private constructor(context: Context) {
             engine.setPitch(emotionResult.effectivePitch)
             engine.setSpeechRate(emotionResult.effectiveSpeechRate)
 
-            if (appliedVoice != null) {
+            val hasDistinctGenderVoices = state.supportsDistinctGenderVoices &&
+                femaleVoices.isNotEmpty() &&
+                maleVoices.isNotEmpty()
+            if (!hasDistinctGenderVoices) {
+                val singleVoiceName = appliedVoice?.name ?: state.activeTtsEngineLabel
+                val singleLabel = "SYSTEM_FALLBACK_SINGLE_VOICE ($singleVoiceName • pitch/rate only)"
+                TranslatorStateRepository.setActiveVoiceName(singleLabel)
+                TranslatorStateRepository.updateDiagnosisMetrics(
+                    lastSynthesizedRms = Float.NaN,
+                    activeVoiceName = singleLabel
+                )
+            } else if (appliedVoice != null) {
                 val engineTag = if (state.isSupertonicOrSherpaActive) {
                     "Supertonic 3"
                 } else if (isNetworkHighQualityVoice(appliedVoice)) {
-                    "HD Network"
+                    "SYSTEM_FALLBACK (HD Network)"
                 } else {
-                    "Installed"
+                    "SYSTEM_FALLBACK (Installed)"
                 }
-                TranslatorStateRepository.setActiveVoiceName("$engineTag (${appliedVoice.name})")
+                val label = "$engineTag (${appliedVoice.name})"
+                TranslatorStateRepository.setActiveVoiceName(label)
+                TranslatorStateRepository.updateDiagnosisMetrics(
+                    lastSynthesizedRms = Float.NaN,
+                    activeVoiceName = label
+                )
+            } else {
+                val singleLabel = "SYSTEM_FALLBACK_SINGLE_VOICE (${state.activeTtsEngineLabel})"
+                TranslatorStateRepository.setActiveVoiceName(singleLabel)
+                TranslatorStateRepository.updateDiagnosisMetrics(
+                    lastSynthesizedRms = Float.NaN,
+                    activeVoiceName = singleLabel
+                )
             }
 
             val utteranceId = if (isBenchmarkRun) {
@@ -2549,9 +2595,20 @@ class ForegroundTtsManager private constructor(context: Context) {
         val effectiveCfg = explicitEmotion?.chatterboxCfgWeight ?: resolvedAssignment.cfgWeight
         val spokenWithOverrides = routeDecision.hindiDialogue
 
-        if (state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER || resolvedAssignment.voiceEngine == "chatterbox_local_server") {
+        val canonicalSelection = com.example.engine.CharacterVoiceRouter.selectCanonicalVoiceBackend(
+            context = appContext,
+            assignment = resolvedAssignment,
+            state = state
+        )
+
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.PAUSE_DUBBING) {
+            onResult(false, "PAUSE_DUBBING (Audio Paused)", Float.NaN)
+            return
+        }
+
+        if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.CHATTERBOX_LOCAL_SERVER) {
             managerScope.launch(Dispatchers.Default) {
-                var reportedRms = 0f
+                var reportedRms = Float.NaN
                 var reportedSummary = ""
                 val ok = neuralVoiceClient.synthesizeAndPlay(
                     rawBaseUrl = state.chatterboxServerUrl,
@@ -2570,7 +2627,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                     exportWavFile = exportWavFile,
                     onSynthesisTelemetry = { outcome ->
                         reportedRms = outcome.parsedWav.waveformRms
-                        reportedSummary = "Chatterbox V3 (${outcome.voiceId}.wav • SHA ${outcome.voiceSha256.take(8)} • ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", reportedRms)})"
+                        reportedSummary = "CHATTERBOX_LOCAL_SERVER (${outcome.voiceId}.wav • SHA ${outcome.voiceSha256.take(8)} • ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", reportedRms)})"
                         com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                             routeDecision = routeDecision,
                             actualSidPassedToNative = routeDecision.selectedSpeakerId,
@@ -2596,7 +2653,7 @@ class ForegroundTtsManager private constructor(context: Context) {
                         reportedSummary = "Local Server Unavailable ($err)"
                     }
                 )
-                if (ok) {
+                if (ok && !reportedRms.isNaN()) {
                     withContext(Dispatchers.Main) {
                         onResult(true, reportedSummary, reportedRms)
                     }
@@ -2638,22 +2695,23 @@ class ForegroundTtsManager private constructor(context: Context) {
                         )
                     }
                 } else {
+                    val sysBackend = resolveSystemFallbackBackendCode(state)
                     com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                         routeDecision = routeDecision,
                         actualSidPassedToNative = routeDecision.selectedSpeakerId,
-                        actualBackend = "SYSTEM_FALLBACK",
+                        actualBackend = sysBackend,
                         jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                         modelLoaded = false,
                         fallbackReason = "Local Chatterbox server offline & Supertonic model not installed",
                         audioDurationMs = 0L,
-                        outputPcmRms = 0.05f
+                        outputPcmRms = null
                     )
                     withContext(Dispatchers.Main) {
                         val fallbackOk = speakOnAndroidTts(spokenWithOverrides, cleanText, routeDecision.voiceProfile, false)
                         onResult(
                             fallbackOk,
-                            "SYSTEM_FALLBACK (${state.activeTtsEngineLabel} — Local Chatterbox server offline)",
-                            0.05f
+                            "$sysBackend (${state.activeTtsEngineLabel} — Local Chatterbox server offline • RMS UNKNOWN)",
+                            Float.NaN
                         )
                     }
                 }
@@ -2661,9 +2719,12 @@ class ForegroundTtsManager private constructor(context: Context) {
             return
         }
 
-        // Direct Supertonic path
+        // Canonical Direct Supertonic or System Fallback path
         managerScope.launch(Dispatchers.Default) {
-            if (SupertonicModelManager.isModelReady(appContext) && (sherpaEngine.isReady || sherpaEngine.initialize())) {
+            if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.SHERPA_DIRECT &&
+                SupertonicModelManager.isModelReady(appContext) &&
+                (sherpaEngine.isReady || sherpaEngine.initialize())
+            ) {
                 val wavTarget = exportWavFile ?: File(appContext.cacheDir, "ab_preview_${resolvedAssignment.characterName}_sid${routeDecision.selectedSpeakerId}.wav")
                 val valResult = sherpaEngine.synthesizeAndValidateToWav(
                     text = spokenWithOverrides,
@@ -2692,27 +2753,28 @@ class ForegroundTtsManager private constructor(context: Context) {
                 withContext(Dispatchers.Main) {
                     onResult(
                         valResult.waveformRms > 0.001f,
-                        "Supertonic 3 Direct (Sid #${valResult.sid} • ${valResult.totalSynthesisTimeMs}ms • RMS ${String.format(Locale.US, "%.4f", valResult.waveformRms)})",
+                        "SHERPA_DIRECT (Sid #${valResult.sid} • ${valResult.totalSynthesisTimeMs}ms • RMS ${String.format(Locale.US, "%.4f", valResult.waveformRms)})",
                         valResult.waveformRms
                     )
                 }
             } else {
+                val sysBackend = resolveSystemFallbackBackendCode(state)
                 com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                     routeDecision = routeDecision,
                     actualSidPassedToNative = routeDecision.selectedSpeakerId,
-                    actualBackend = "SYSTEM_FALLBACK",
+                    actualBackend = sysBackend,
                     jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                     modelLoaded = false,
-                    fallbackReason = "Supertonic model not installed",
+                    fallbackReason = canonicalSelection.selectionReason,
                     audioDurationMs = 0L,
-                    outputPcmRms = 0.05f
+                    outputPcmRms = null
                 )
                 withContext(Dispatchers.Main) {
                     val fallbackOk = speakOnAndroidTts(spokenWithOverrides, cleanText, routeDecision.voiceProfile, false)
                     onResult(
                         fallbackOk,
-                        "SYSTEM_FALLBACK (${state.activeTtsEngineLabel})",
-                        0.05f
+                        "$sysBackend (${state.activeTtsEngineLabel} • RMS UNKNOWN)",
+                        Float.NaN
                     )
                 }
             }

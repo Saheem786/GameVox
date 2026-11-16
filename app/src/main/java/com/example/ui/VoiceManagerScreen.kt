@@ -1,6 +1,8 @@
 package com.example.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -46,6 +48,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
@@ -145,6 +148,7 @@ fun VoiceManagerScreen(
 
     val characterAssignments by VoiceProfileRepository.characterAssignments.collectAsStateWithLifecycle()
     val activeCharacterAssignment by VoiceProfileRepository.activeCharacterAssignment.collectAsStateWithLifecycle()
+    val unlabeledOverrideChar by VoiceProfileRepository.unlabeledOverrideCharName.collectAsStateWithLifecycle()
     val voices by VoiceProfileRepository.voices.collectAsStateWithLifecycle()
     val selectedVoiceId by VoiceProfileRepository.selectedVoiceId.collectAsStateWithLifecycle()
 
@@ -314,6 +318,68 @@ fun VoiceManagerScreen(
                 if (selectedTabIndex == 0) {
                     // Character Voice Manager Tab
                     Column(modifier = Modifier.fillMaxSize()) {
+                        val uniqueSummary = remember(characterAssignments) {
+                            VoiceProfileRepository.getUniqueReferenceVoiceSummary()
+                        }
+                        Card(
+                            shape = RoundedCornerShape(14.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
+                                .testTag("voice_library_honest_disclosure_card")
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = "${uniqueSummary.second} Saved Character Profiles • ${uniqueSummary.first} Unique Acoustic Reference WAV Identities",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "Bundled reference audio includes 2 distinct WAVs (anon_male_ref.wav & jenny_female_ref.wav). Profiles sharing a reference WAV share its base vocal timbre unless you import a consented/licensed .wav sample in Configure Voice.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = "Unlabeled Subtitle Handling (No Speaker Tag in OCR):",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    FilterChip(
+                                        selected = unlabeledOverrideChar == null,
+                                        onClick = {
+                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, null)
+                                        },
+                                        label = { Text("Unknown Speaker (Neutral SID #2)", style = MaterialTheme.typography.labelSmall) },
+                                        modifier = Modifier.testTag("unlabeled_mode_unknown")
+                                    )
+                                    FilterChip(
+                                        selected = unlabeledOverrideChar == "anon",
+                                        onClick = {
+                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "anon")
+                                        },
+                                        label = { Text("Override: Anon", style = MaterialTheme.typography.labelSmall) },
+                                        modifier = Modifier.testTag("unlabeled_mode_anon")
+                                    )
+                                    FilterChip(
+                                        selected = unlabeledOverrideChar == "jenny",
+                                        onClick = {
+                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "jenny")
+                                        },
+                                        label = { Text("Override: Jenny", style = MaterialTheme.typography.labelSmall) },
+                                        modifier = Modifier.testTag("unlabeled_mode_jenny")
+                                    )
+                                }
+                            }
+                        }
+
                         // Search bar
                         OutlinedTextField(
                             value = searchQuery,
@@ -333,7 +399,7 @@ fun VoiceManagerScreen(
                             shape = RoundedCornerShape(16.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 10.dp)
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
                                 .testTag("character_search_input")
                         )
 
@@ -611,6 +677,30 @@ fun VoiceManagerScreen(
         var selectedRefId by remember { mutableStateOf(charItem.referenceVoiceId) }
         var selectedPresentation by remember { mutableStateOf(charItem.voicePresentation) }
         var selectedEmotion by remember { mutableStateOf(charItem.defaultEmotion) }
+        var speakerConsentConfirmed by remember { mutableStateOf(false) }
+
+        val customWavPickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri != null) {
+                coroutineScope.launch {
+                    val importResult = VoiceProfileRepository.importConsentedReferenceVoiceUri(
+                        context = context,
+                        characterName = charItem.characterName,
+                        uri = uri,
+                        speakerConsentConfirmed = speakerConsentConfirmed
+                    )
+                    importResult.onSuccess { updated ->
+                        selectedRefId = updated.referenceVoiceId
+                        snackbarHostState.showSnackbar(
+                            "Imported unique reference WAV: ${updated.referenceVoiceId} (SHA-256: ${updated.referenceAudioSha256.take(12)}…)"
+                        )
+                    }.onFailure { err ->
+                        snackbarHostState.showSnackbar("Import failed: ${err.localizedMessage}")
+                    }
+                }
+            }
+        }
 
         AlertDialog(
             onDismissRequest = { characterToChangeSid = null },
@@ -647,6 +737,30 @@ fun VoiceManagerScreen(
                             },
                             label = { Text("jenny_female_ref.wav") }
                         )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { speakerConsentConfirmed = !speakerConsentConfirmed }
+                    ) {
+                        Checkbox(
+                            checked = speakerConsentConfirmed,
+                            onCheckedChange = { speakerConsentConfirmed = it }
+                        )
+                        Text(
+                            text = "I confirm speaker consent / license for custom reference WAV",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            customWavPickerLauncher.launch(arrayOf("audio/wav", "audio/x-wav", "audio/*"))
+                        },
+                        enabled = speakerConsentConfirmed,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Import Consented .WAV Reference Sample")
                     }
 
                     Text(

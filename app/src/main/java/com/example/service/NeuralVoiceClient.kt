@@ -466,6 +466,37 @@ class NeuralVoiceClient {
         }
     }
 
+    /**
+     * Synthesizes Hindi speech via the local Chatterbox FastAPI server and writes the resulting
+     * verified non-silent WAV bytes directly to [outputWavFile]. Never generates synthetic sine waves.
+     */
+    suspend fun synthesizeToWavFile(
+        rawBaseUrl: String,
+        authToken: String,
+        request: NeuralSynthesizeRequest,
+        outputWavFile: File,
+        onSuccess: (NeuralSynthesisOutcome.Success) -> Unit = {},
+        onError: (String) -> Unit = {}
+    ): Boolean = withContext(Dispatchers.IO) {
+        when (val outcome = synthesizeHindiWav(rawBaseUrl, authToken, request)) {
+            is NeuralSynthesisOutcome.Error -> {
+                onError(outcome.reason)
+                false
+            }
+            is NeuralSynthesisOutcome.Success -> {
+                try {
+                    outputWavFile.parentFile?.mkdirs()
+                    FileOutputStream(outputWavFile).use { it.write(outcome.rawWavBytes) }
+                    onSuccess(outcome)
+                    outputWavFile.exists() && outputWavFile.length() > 100L
+                } catch (e: Exception) {
+                    onError("Failed to write synthesized WAV: ${e.localizedMessage}")
+                    false
+                }
+            }
+        }
+    }
+
     @Volatile
     private var attachedExoPlayerManager: HindiExoPlayerManager? = null
 

@@ -142,6 +142,74 @@ fun DubbingModeSwitchCard(
                     testTag = "mode_chip_pause"
                 )
             }
+
+            // Explicit First-Run Engine Readiness & Honest Active Backend Disclosure (Audit Item 9)
+            val chatterboxReady = state.chatterboxServerReachable && state.chatterboxModelLoaded
+            val supertonicReady = state.sherpaModelLoaded || com.example.service.SupertonicModelManager.isModelReady(context)
+            val systemTtsStatus = if (state.supportsDistinctGenderVoices) {
+                "READY (Distinct M/F Voices)"
+            } else {
+                "SINGLE VOICE (Pitch/Rate Only)"
+            }
+
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("first_run_engine_readiness_card")
+            ) {
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Engine Readiness • 100% Free (Zero Paid APIs)",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = "• PC Chatterbox Server: " + if (chatterboxReady) {
+                            "CONNECTED (${state.chatterboxDevice.uppercase()} • ${state.chatterboxUniqueVoicesSha256Count} unique ref WAVs)"
+                        } else {
+                            "OFFLINE / UNTESTED (${state.chatterboxServerUrl})"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (chatterboxReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "• Supertonic 3 Offline Model: " + if (supertonicReady) {
+                            "INSTALLED (10 Neural Speakers)"
+                        } else {
+                            "NOT INSTALLED (Download in Voice Manager)"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (supertonicReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "• Android System TTS (${state.activeTtsEngineLabel}): $systemTtsStatus",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (currentBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER && !chatterboxReady) {
+                        val actualActiveFallback = if (supertonicReady) {
+                            "SHERPA_DIRECT (Supertonic 3 Offline)"
+                        } else if (state.supportsDistinctGenderVoices) {
+                            "SYSTEM_FALLBACK (${state.activeTtsEngineLabel})"
+                        } else {
+                            "SYSTEM_FALLBACK_SINGLE_VOICE (${state.activeTtsEngineLabel})"
+                        }
+                        Text(
+                            text = "Honest Backend Notice: PC Chatterbox server is not connected right now. Actual audio uses $actualActiveFallback until the PC server is reachable.",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
         }
     }
 }

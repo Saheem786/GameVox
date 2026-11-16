@@ -32,7 +32,7 @@ data class CharacterVoiceAssignment(
     val referenceAudioSha256: String = if (referenceVoiceId == DEFAULT_FEMALE_REF_ID) JENNY_FEMALE_REF_SHA256 else ANON_MALE_REF_SHA256,
     val voicePresentation: String = if (speakerId in 0..4) "female" else "male",
     val vocalStyleDescription: String = characterRoleNote,
-    val voiceEngine: String = "chatterbox_local_server",
+    val voiceEngine: String = "follow_global",
     val pronunciationOverrides: Map<String, String> = emptyMap(),
     val defaultEmotion: String = "neutral",
     val exaggeration: Float = 0.50f,
@@ -51,10 +51,35 @@ data class CharacterVoiceAssignment(
 
     companion object {
         const val DEFAULT_GAME_NAMESPACE = "default_game"
+        const val UNKNOWN_SPEAKER_NAME = "unknown"
         const val DEFAULT_MALE_REF_ID = "anon_male_ref"
         const val DEFAULT_FEMALE_REF_ID = "jenny_female_ref"
         const val ANON_MALE_REF_SHA256 = "67f576d05c67766b20a52acf2f33c729e34a43747862d4f1a45903f2bae7836f"
         const val JENNY_FEMALE_REF_SHA256 = "59a1ebb53f0641f6ddf39637922abc7a27975635a56321ef28a6fb3941204982"
+
+        /**
+         * Explicit Unknown/Unlabeled speaker profile used when OCR text has no speaker label
+         * or low label confidence and the user has not configured a manual unlabeled override.
+         * Prevents silently attributing unlabeled alternating lines to Anon (Male Lead).
+         */
+        val UNKNOWN_SPEAKER_PRESET = CharacterVoiceAssignment(
+            characterName = UNKNOWN_SPEAKER_NAME,
+            displayName = "Unknown Speaker (Unlabeled)",
+            gameNamespace = DEFAULT_GAME_NAMESPACE,
+            speakerId = 2,
+            speed = 1.00f,
+            pitch = 1.00f,
+            isUserOverride = false,
+            characterRoleNote = "Unlabeled Subtitle Fallback • Neutral Narrator (sid: 2)",
+            referenceVoiceId = DEFAULT_FEMALE_REF_ID,
+            referenceAudioSha256 = JENNY_FEMALE_REF_SHA256,
+            voicePresentation = "neutral",
+            vocalStyleDescription = "Neutral Unlabeled Line Fallback (Manual override available)",
+            voiceEngine = "follow_global",
+            defaultEmotion = "neutral",
+            exaggeration = 0.40f,
+            cfgWeight = 0.50f
+        )
 
         fun normalizeName(raw: String): String {
             return raw
@@ -91,10 +116,11 @@ data class CharacterVoiceAssignment(
                 it.referenceAudioSha256.equals(profile.referenceAudioSha256, ignoreCase = true) &&
                     profile.referenceAudioSha256.isNotBlank()
             }.coerceAtLeast(1)
+            val uniqueTotal = countUniqueReferenceVoices(allProfiles)
             return if (matchingCount > 1) {
-                "Shared Reference Voice (${profile.referenceVoiceId}.wav • shared by $matchingCount profiles; import a consenting .wav clip for a dedicated voice)"
+                "Shared Acoustic Reference (${profile.referenceVoiceId}.wav • shared by $matchingCount/${allProfiles.size} profiles; $uniqueTotal unique reference WAVs total)"
             } else {
-                "Dedicated Unique Reference Voice (${profile.referenceVoiceId}.wav • SHA-256 ${profile.referenceAudioSha256.take(8)}…)"
+                "Dedicated Unique Reference WAV (${profile.referenceVoiceId}.wav • SHA-256 ${profile.referenceAudioSha256.take(8)}…)"
             }
         }
 
@@ -549,7 +575,7 @@ data class CharacterVoiceAssignment(
                             referenceAudioSha256 = obj.optString("referenceAudioSha256", defaultSha).ifBlank { defaultSha },
                             voicePresentation = obj.optString("voicePresentation", defaultPres).ifBlank { defaultPres },
                             vocalStyleDescription = obj.optString("vocalStyleDescription", roleNote).ifBlank { roleNote },
-                            voiceEngine = obj.optString("voiceEngine", "chatterbox_local_server").ifBlank { "chatterbox_local_server" },
+                            voiceEngine = obj.optString("voiceEngine", "follow_global").ifBlank { "follow_global" },
                             pronunciationOverrides = overridesMap,
                             defaultEmotion = obj.optString("defaultEmotion", "neutral").ifBlank { "neutral" },
                             exaggeration = obj.optDouble("exaggeration", 0.50).toFloat().coerceIn(0.1f, 2.0f),

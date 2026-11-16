@@ -12,7 +12,16 @@ data class PendingDubbingItem(
     val speakerLabel: String,
     val characterAssignment: CharacterVoiceAssignment? = null,
     val routeDecision: VoiceRouteDecision? = null
-)
+) {
+    fun buildSpeakerContextKey(): String {
+        val ns = (routeDecision?.gameNamespace ?: characterAssignment?.gameNamespace ?: "default_game")
+            .lowercase(Locale.ROOT)
+        val speakerIdentity = routeDecision?.antiRepeatSpeakerIdentity
+            ?: "$ns:${characterAssignment?.characterName ?: CharacterVoiceAssignment.normalizeName(speakerLabel)}"
+        val epoch = routeDecision?.sessionEpoch ?: 0L
+        return "$speakerIdentity:ep$epoch"
+    }
+}
 
 sealed interface DubbingEnqueueOutcome {
     data class SpeakImmediately(val item: PendingDubbingItem) : DubbingEnqueueOutcome
@@ -26,7 +35,7 @@ sealed interface DubbingEnqueueOutcome {
 
 /**
  * Short bounded queue (max 2 upcoming lines) for live subtitle dubbing:
- * - Prevents duplicate queuing of near-identical lines.
+ * - Prevents duplicate queuing of near-identical lines by the SAME speaker in the same scene/session.
  * - Allows up to [maxCapacity] upcoming subtitles to wait for the current sentence to finish.
  * - Intelligently skips stale older queued subtitles whenever fast scene transitions arrive
  *   more quickly than TTS can finish speaking.
@@ -41,9 +50,10 @@ class SubtitleDubbingQueue(
         item: PendingDubbingItem,
         isCurrentlySpeaking: Boolean,
         activeSpokenEnglishNormalized: String,
-        activeSpokenTranslated: String
+        activeSpokenTranslated: String,
+        activeSpokenSpeakerContextKey: String = ""
     ): DubbingEnqueueOutcome = synchronized(lock) {
-        if (isDuplicate(item, activeSpokenEnglishNormalized, activeSpokenTranslated)) {
+        if (isDuplicate(item, activeSpokenEnglishNormalized, activeSpokenTranslated, activeSpokenSpeakerContextKey)) {
             return DubbingEnqueueOutcome.SkippedDuplicate
         }
 
@@ -77,18 +87,25 @@ class SubtitleDubbingQueue(
     private fun isDuplicate(
         candidate: PendingDubbingItem,
         activeEnglishNorm: String,
-        activeTranslated: String
+        activeTranslated: String,
+        activeSpokenSpeakerContextKey: String
     ): Boolean {
         val candEng = normalize(candidate.spokenDialogue)
         val candTgt = normalize(candidate.translatedText)
+        val candSpeakerKey = candidate.buildSpeakerContextKey()
 
         if (candEng.isEmpty() || candTgt.isEmpty()) return true
-        if (areSimilar(candEng, activeEnglishNorm) || areSimilar(candTgt, normalize(activeTranslated))) {
+        val sameAsActiveSpeaker = activeSpokenSpeakerContextKey.isBlank() ||
+            candSpeakerKey == activeSpokenSpeakerContextKey
+        if (sameAsActiveSpeaker &&
+            (areSimilar(candEng, activeEnglishNorm) || areSimilar(candTgt, normalize(activeTranslated)))
+        ) {
             return true
         }
         return pending.any { existing ->
-            areSimilar(candEng, normalize(existing.spokenDialogue)) ||
-                areSimilar(candTgt, normalize(existing.translatedText))
+            existing.buildSpeakerContextKey() == candSpeakerKey &&
+                (areSimilar(candEng, normalize(existing.spokenDialogue)) ||
+                    areSimilar(candTgt, normalize(existing.translatedText)))
         }
     }
 

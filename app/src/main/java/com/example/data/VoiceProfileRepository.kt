@@ -126,6 +126,7 @@ object VoiceProfileRepository {
     private const val KEY_ROLE_ASSIGNMENTS_JSON = "role_voice_assignments_json_v1"
     private const val KEY_CUSTOM_TAG_BINDINGS_JSON = "custom_tag_voice_bindings_json_v1"
     private const val KEY_CHARACTER_ASSIGNMENTS_JSON = "character_voice_assignments_json_v2"
+    private const val KEY_UNLABELED_OVERRIDE_CHAR = "unlabeled_subtitle_override_char_v1"
 
     private val defaultPresets = listOf(
         VoiceProfile(
@@ -217,6 +218,11 @@ object VoiceProfileRepository {
     )
     val activeCharacterAssignment: StateFlow<CharacterVoiceAssignment?> = _activeCharacterAssignment.asStateFlow()
 
+    private val _unlabeledOverrideCharName = MutableStateFlow<String?>(null)
+    val unlabeledOverrideCharName: StateFlow<String?> = _unlabeledOverrideCharName.asStateFlow()
+
+    private val unlabeledOverridesByGame = ConcurrentHashMap<String, String>()
+
     private var activeMediaPlayer: MediaPlayer? = null
     private var appContext: Context? = null
 
@@ -225,6 +231,8 @@ object VoiceProfileRepository {
 
     @Volatile
     private var activeGameNamespace: String = "default_game"
+
+    fun getActiveGameNamespace(): String = activeGameNamespace
 
     fun updateAvailableSpeakerCount(count: Int) {
         if (count > 0) {
@@ -257,6 +265,12 @@ object VoiceProfileRepository {
                     _characterAssignments.value = merged.values.toList()
                 }
             }
+            val savedOverride = prefs.getString("${KEY_UNLABELED_OVERRIDE_CHAR}_$clean", null)
+                ?.trim()?.takeIf { it.isNotEmpty() }
+            if (savedOverride != null) {
+                unlabeledOverridesByGame[clean] = savedOverride
+            }
+            _unlabeledOverrideCharName.value = unlabeledOverridesByGame[clean]
         }
     }
 
@@ -326,6 +340,13 @@ object VoiceProfileRepository {
             _characterAssignments.value = CharacterVoiceAssignment.DEFAULT_PRESETS
             saveCharacterAssignmentsToDisk(context, CharacterVoiceAssignment.DEFAULT_PRESETS)
         }
+
+        val savedUnlabeledOverride = prefs.getString("${KEY_UNLABELED_OVERRIDE_CHAR}_$activeGameNamespace", null)
+            ?.trim()?.takeIf { it.isNotEmpty() }
+        if (savedUnlabeledOverride != null) {
+            unlabeledOverridesByGame[activeGameNamespace] = savedUnlabeledOverride
+        }
+        _unlabeledOverrideCharName.value = savedUnlabeledOverride
     }
 
     fun selectVoice(context: Context, voice: VoiceProfile) {
@@ -680,6 +701,54 @@ object VoiceProfileRepository {
         return null
     }
 
+    fun getUnknownSpeakerAssignment(
+        gameNamespace: String = activeGameNamespace
+    ): CharacterVoiceAssignment {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        val userConfiguredUnknown = _characterAssignments.value.find {
+            it.characterName == CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME &&
+                (it.gameNamespace == cleanNs || it.gameNamespace == "default_game")
+        }
+        return userConfiguredUnknown ?: CharacterVoiceAssignment.UNKNOWN_SPEAKER_PRESET.copy(
+            gameNamespace = cleanNs
+        )
+    }
+
+    fun setUnlabeledSubtitleManualOverride(
+        context: Context?,
+        characterName: String?,
+        gameNamespace: String = activeGameNamespace
+    ) {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        val normChar = characterName?.let { CharacterVoiceAssignment.normalizeName(it) }?.takeIf {
+            it.isNotBlank() && it != CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME
+        }
+        if (normChar == null) {
+            unlabeledOverridesByGame.remove(cleanNs)
+        } else {
+            unlabeledOverridesByGame[cleanNs] = normChar
+        }
+        if (cleanNs == activeGameNamespace) {
+            _unlabeledOverrideCharName.value = normChar
+        }
+        val targetCtx = context ?: appContext
+        if (targetCtx != null) {
+            targetCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString("${KEY_UNLABELED_OVERRIDE_CHAR}_$cleanNs", normChar ?: "")
+                .apply()
+        }
+    }
+
+    fun getUnlabeledSubtitleManualOverride(
+        gameNamespace: String = activeGameNamespace
+    ): CharacterVoiceAssignment? {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        val overrideChar = unlabeledOverridesByGame[cleanNs]?.takeIf { it.isNotBlank() } ?: return null
+        return findExistingAssignment(overrideChar, cleanNs)
+            ?: getOrCreateAssignmentForCharacter(overrideChar, overrideChar, cleanNs, appContext)
+    }
+
     fun getOrCreateAssignmentForCharacter(
         rawName: String,
         normalizedKey: String = CharacterVoiceAssignment.normalizeName(rawName),
@@ -687,9 +756,8 @@ object VoiceProfileRepository {
         context: Context? = null
     ): CharacterVoiceAssignment {
         val norm = normalizedKey.ifBlank { CharacterVoiceAssignment.normalizeName(rawName) }
-        if (norm.isBlank()) {
-            return _characterAssignments.value.firstOrNull { it.characterName == "anon" }
-                ?: CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+        if (norm.isBlank() || norm == CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME) {
+            return getUnknownSpeakerAssignment(gameNamespace)
         }
 
         val existing = findExistingAssignment(norm, gameNamespace)
@@ -843,7 +911,7 @@ object VoiceProfileRepository {
                 referenceAudioSha256 = resolvedSha,
                 voicePresentation = pres,
                 vocalStyleDescription = vocalStyleDescription?.trim()?.ifBlank { null } ?: "User Override ($pres • sid: $clampedSid)",
-                voiceEngine = voiceEngine?.trim()?.ifBlank { null } ?: "chatterbox_local_server",
+                voiceEngine = voiceEngine?.trim()?.ifBlank { null } ?: "follow_global",
                 defaultEmotion = defaultEmotion?.trim()?.ifBlank { null } ?: "neutral",
                 exaggeration = (exaggeration ?: 0.50f).coerceIn(0.1f, 2.0f),
                 cfgWeight = (cfgWeight ?: 0.40f).coerceIn(0.1f, 1.5f),
@@ -928,14 +996,90 @@ object VoiceProfileRepository {
     /**
      * Returns an honest summary of how many acoustically distinct reference voice clips (by SHA-256)
      * are currently assigned across all character profiles.
+     * Explicitly distinguishes the 24 saved character profiles from the 2 bundled acoustic reference WAVs.
      */
     fun getUniqueReferenceVoiceSummary(): Triple<Int, Int, String> {
         val list = _characterAssignments.value
         val uniqueCount = CharacterVoiceAssignment.countUniqueReferenceVoices(list)
         val totalCount = list.size
-        val summary = "$uniqueCount unique reference voice clips across $totalCount character profiles " +
-            "(import consenting .wav clips to give additional characters dedicated voices)"
+        val summary = "$totalCount saved character profiles • $uniqueCount unique reference voice clips " +
+            "(2 bundled acoustic WAV identities: anon_male_ref.wav & jenny_female_ref.wav; import consented/licensed .wav samples for additional distinct voices)"
         return Triple(uniqueCount, totalCount, summary)
+    }
+
+    /**
+     * Imports a user-provided consented or licensed `.wav` reference voice file for a specific
+     * character, verifies non-empty audio content, computes its genuine SHA-256 digest, and updates
+     * the character's acoustic identity so it no longer shares one of the 2 default reference WAVs.
+     */
+    fun importConsentedReferenceVoiceFile(
+        context: Context,
+        characterName: String,
+        sourceWavFile: File,
+        speakerConsentConfirmed: Boolean
+    ): Result<CharacterVoiceAssignment> {
+        if (!speakerConsentConfirmed) {
+            return Result.failure(IllegalArgumentException("Speaker consent or license confirmation is required before importing a reference voice."))
+        }
+        if (!sourceWavFile.exists() || sourceWavFile.length() <= 100L) {
+            return Result.failure(IllegalArgumentException("Reference WAV file is missing or too small (${sourceWavFile.length()} bytes)."))
+        }
+        val norm = CharacterVoiceAssignment.normalizeName(characterName)
+        if (norm.isBlank()) {
+            return Result.failure(IllegalArgumentException("Invalid character name."))
+        }
+        val customDir = File(context.filesDir, "custom_voices").apply { mkdirs() }
+        val customVoiceId = "consented_${norm}_${System.currentTimeMillis()}"
+        val destFile = File(customDir, "$customVoiceId.wav")
+        return try {
+            sourceWavFile.inputStream().use { input ->
+                FileOutputStream(destFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            val sha256 = com.example.engine.CharacterVoiceRouter.computeFileSha256(destFile)
+            if (sha256.isBlank()) {
+                return Result.failure(IllegalStateException("Could not compute SHA-256 for imported WAV."))
+            }
+            val existing = findExistingAssignment(norm, activeGameNamespace)
+                ?: getOrCreateAssignmentForCharacter(characterName, norm, activeGameNamespace, context)
+            val updated = existing.copy(
+                referenceVoiceId = "$customVoiceId.wav",
+                referenceAudioSha256 = sha256,
+                isUserOverride = true,
+                lastDetectedTimestamp = System.currentTimeMillis()
+            )
+            Result.success(updateCharacterVoiceProfile(context, updated))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun importConsentedReferenceVoiceUri(
+        context: Context,
+        characterName: String,
+        uri: Uri,
+        speakerConsentConfirmed: Boolean
+    ): Result<CharacterVoiceAssignment> = withContext(Dispatchers.IO) {
+        if (!speakerConsentConfirmed) {
+            return@withContext Result.failure(IllegalArgumentException("Speaker consent or license confirmation is required."))
+        }
+        val tempFile = File(context.cacheDir, "import_ref_${System.currentTimeMillis()}.wav")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            importConsentedReferenceVoiceFile(context, characterName, tempFile, speakerConsentConfirmed = true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            try {
+                tempFile.delete()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     fun renameCharacter(
@@ -1019,12 +1163,16 @@ object VoiceProfileRepository {
      * [CharacterVoiceAssignment] (or continuation context when unlabeled), and returns [ParsedDialogueLine]
      * carrying the immutable [com.example.engine.VoiceRouteDecision].
      */
-    fun resolveSpeakerAndVoiceForSubtitle(rawSubtitleText: String): ParsedDialogueLine {
+    fun resolveSpeakerAndVoiceForSubtitle(
+        rawSubtitleText: String,
+        isFromMediaProjectionOcr: Boolean = false
+    ): ParsedDialogueLine {
         val decision = com.example.engine.CharacterVoiceRouter.routeLiveSubtitle(
             context = appContext,
             rawOcrSubtitle = rawSubtitleText,
             translatedHindi = "",
-            gameNamespace = activeGameNamespace
+            gameNamespace = activeGameNamespace,
+            isFromRealMediaProjectionOcr = isFromMediaProjectionOcr
         )
         val characterAssignment = decision.characterAssignment
         val effectiveVoice = decision.voiceProfile

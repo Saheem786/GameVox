@@ -255,9 +255,10 @@ class FloatingOverlayController(
             val params = targetBoxParams ?: return@post
             val (liveW, liveH) = getLiveScreenSize()
             val desiredW = (liveW * 0.86f).toInt().coerceIn(dpToPx(240), dpToPx(640))
-            val desiredH = dpToPx(130).coerceAtMost((liveH * 0.34f).toInt())
+            // Tall enough to capture both the character name header and multi-line subtitle body
+            val desiredH = dpToPx(162).coerceAtMost((liveH * 0.38f).toInt())
             params.width = desiredW
-            params.height = desiredH.coerceAtLeast(dpToPx(72))
+            params.height = desiredH.coerceAtLeast(dpToPx(96))
             params.x = (liveW - params.width) / 2
             params.y = (liveH - params.height - dpToPx(64)).coerceAtLeast(dpToPx(24))
             try {
@@ -500,7 +501,8 @@ class FloatingOverlayController(
 
             val savedRect = TranslatorStateRepository.state.value.targetBoxScreenRect
             val defaultBoxWidth = (screenW * 0.86f).toInt().coerceIn(dpToPx(240), dpToPx(640))
-            val defaultBoxHeight = dpToPx(130).coerceAtMost((screenH * 0.34f).toInt().coerceAtLeast(dpToPx(90)))
+            // Default ROI height includes the speaker name/header line above the dialogue text
+            val defaultBoxHeight = dpToPx(162).coerceAtMost((screenH * 0.38f).toInt().coerceAtLeast(dpToPx(110)))
 
             val useSaved = savedRect != null &&
                 savedRect.width() >= dpToPx(110) &&
@@ -999,9 +1001,17 @@ class FloatingOverlayController(
                     else Color.parseColor("#94A3B8")
                 )
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                setPadding(0, dpToPx(2), 0, dpToPx(8))
+                setPadding(0, dpToPx(2), 0, dpToPx(4))
             }
             sheetCard.addView(statusTv)
+
+            val routingDebugTv = TextView(context).apply {
+                text = "Live Route: ${currentState.lastRoutingDebugSummary}"
+                setTextColor(Color.parseColor("#A7F3D0"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(0, 0, 0, dpToPx(8))
+            }
+            sheetCard.addView(routingDebugTv)
 
             // P0: Change Current Character Voice Quick Panel
             val activeCharAssignment = VoiceProfileRepository.activeCharacterAssignment.value

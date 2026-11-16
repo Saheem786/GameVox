@@ -502,8 +502,10 @@ fun DiagnosisScreen(
                                     "SHERPA_DIRECT (Native JNI + ONNX Runtime Initialized • OpenRAIL-M)"
                                 isSherpaRuntimeReady && state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER ->
                                     "SHERPA_FALLBACK (Local server unreachable; Supertonic 3 active)"
-                                else ->
+                                state.supportsDistinctGenderVoices ->
                                     "SYSTEM_FALLBACK (${state.activeTtsEngineLabel} • ${sherpaEngine.initializationError ?: "Supertonic runtime not initialized"})"
+                                else ->
+                                    "SYSTEM_FALLBACK_SINGLE_VOICE (${state.activeTtsEngineLabel} • Single voice only; pitch/rate changes are not distinct voice identities)"
                             }
                         )
                         DiagnosisField(
@@ -568,7 +570,11 @@ fun DiagnosisScreen(
                         )
                         DiagnosisField(
                             label = "Utterance Duration & RMS",
-                            value = if (state.ttsSpeechDurationMs > 0L) "${state.ttsSpeechDurationMs} ms • RMS=${String.format(Locale.US, "%.4f", state.lastSynthesizedRms)} • RefSHA=${state.lastSynthesizedVoiceSha256.take(12).ifBlank { "n/a" }}" else "—"
+                            value = if (state.ttsSpeechDurationMs > 0L || state.lastSynthesizedRmsDisplay != "UNKNOWN") {
+                                "${state.ttsSpeechDurationMs} ms • RMS=${state.lastSynthesizedRmsDisplay} • RefSHA=${state.lastSynthesizedVoiceSha256.take(12).ifBlank { "n/a" }}"
+                            } else {
+                                "— (RMS=UNKNOWN)"
+                            }
                         )
                         DiagnosisField(
                             label = "Synthesis Real-Time Factor (RTF)",
@@ -1081,7 +1087,9 @@ private fun PreviewVsLiveVoiceComparisonCard() {
     val scope = rememberCoroutineScope()
     val comparisonReport by CharacterVoiceRouter.lastComparisonReport.collectAsStateWithLifecycle()
     val auditLogs by CharacterVoiceRouter.auditLogs.collectAsStateWithLifecycle()
+    val liveRoutingLogs by CharacterVoiceRouter.liveRoutingDebugLogs.collectAsStateWithLifecycle()
     var isRunningComparison by remember { mutableStateOf(false) }
+    var selectedGameNamespace by remember { mutableStateOf(VoiceProfileRepository.getActiveGameNamespace()) }
 
     Card(
         shape = RoundedCornerShape(18.dp),
@@ -1096,23 +1104,50 @@ private fun PreviewVsLiveVoiceComparisonCard() {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(
-                text = "Preview vs Live Voice Comparison (Anon & Jenny)",
+                text = "Preview vs Live OCR Voice Verification (Anon & Jenny)",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "Synthesizes the same Hindi sentence through both the Voice Manager Preview route and the Live Game Dubbing route for Anon (Male Lead, SID #5) and Jenny (Female Companion, SID #1), exports paired WAV files, and verifies SID/engine parity.",
+                text = "Selects game namespace, routes Anon (Male Lead, SID #5) and Jenny (Female Companion, SID #1) through Voice Manager Preview and Live OCR Dubbing (using captured MediaProjection OCR frames when available), passes routeDecision unchanged to neural generation, and verifies SID, engine, and reference WAV SHA-256. Never generates dummy sine-wave WAVs (reports NOT_TESTED_NO_MODEL when neural model/server is absent).",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                listOf("default_game", "genshin_hi", "valorant_hi").forEach { ns ->
+                    OutlinedButton(
+                        onClick = {
+                            selectedGameNamespace = ns
+                            VoiceProfileRepository.setGameNamespace(context, ns)
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            text = if (selectedGameNamespace == ns) "✓ $ns" else ns,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
 
             Button(
                 onClick = {
                     isRunningComparison = true
                     scope.launch {
                         withContext(Dispatchers.Default) {
-                            CharacterVoiceRouter.runFullAnonAndJennyComparison(context)
+                            CharacterVoiceRouter.runFullAnonAndJennyComparison(
+                                context = context,
+                                gameNamespace = selectedGameNamespace
+                            )
                         }
                         isRunningComparison = false
                     }
@@ -1126,9 +1161,9 @@ private fun PreviewVsLiveVoiceComparisonCard() {
             ) {
                 Text(
                     text = if (isRunningComparison) {
-                        "Comparing Preview vs Live Voice Routes..."
+                        "Verifying Preview vs Live Voice Routes..."
                     } else {
-                        "Run Preview vs Live Voice Comparison (Anon & Jenny)"
+                        "Run Preview vs Live Verification ($selectedGameNamespace)"
                     },
                     fontWeight = FontWeight.Bold
                 )
@@ -1151,34 +1186,56 @@ private fun PreviewVsLiveVoiceComparisonCard() {
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Text(
-                            text = report.summaryReport,
+                            text = "Status: ${report.verificationStatus} • Physical Device: ${report.physicalDeviceVerificationStatus}",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
-                        DiagnosisField(
-                            label = "Anon (Male Lead) — Preview vs Live",
-                            value = "Preview SID=${report.anonComparison.previewActualSid} vs Live SID=${report.anonComparison.liveActualSid} • Engine=${report.anonComparison.liveEngine} • RMS=${String.format(Locale.US, "%.4f", report.anonComparison.liveAudioRms)} • WAV=${report.anonComparison.liveWavPath.substringAfterLast('/')}"
+                        Text(
+                            text = report.summaryReport,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         DiagnosisField(
-                            label = "Jenny (Female Companion) — Preview vs Live",
-                            value = "Preview SID=${report.jennyComparison.previewActualSid} vs Live SID=${report.jennyComparison.liveActualSid} • Engine=${report.jennyComparison.liveEngine} • RMS=${String.format(Locale.US, "%.4f", report.jennyComparison.liveAudioRms)} • WAV=${report.jennyComparison.liveWavPath.substringAfterLast('/')}"
+                            label = "Anon (Male Lead) — Preview vs Live (${report.anonComparison.verificationStatus})",
+                            value = "Preview SID=${report.anonComparison.previewActualSid} vs Live SID=${report.anonComparison.liveActualSid} • Engine=${report.anonComparison.liveEngine} • RefSHA=${report.anonComparison.referenceAudioSha256.take(12)} • RMS=${report.anonComparison.liveAudioRmsDisplay} • MediaProjectionOCR=${report.anonComparison.usedCapturedMediaProjectionOcr}"
+                        )
+                        DiagnosisField(
+                            label = "Jenny (Female Companion) — Preview vs Live (${report.jennyComparison.verificationStatus})",
+                            value = "Preview SID=${report.jennyComparison.previewActualSid} vs Live SID=${report.jennyComparison.liveActualSid} • Engine=${report.jennyComparison.liveEngine} • RefSHA=${report.jennyComparison.referenceAudioSha256.take(12)} • RMS=${report.jennyComparison.liveAudioRmsDisplay} • MediaProjectionOCR=${report.jennyComparison.usedCapturedMediaProjectionOcr}"
                         )
                     }
+                }
+            }
+
+            if (liveRoutingLogs.isNotEmpty()) {
+                HorizontalDivider()
+                Text(
+                    text = "Real-Time Live OCR Voice Routing Debug Log (${liveRoutingLogs.size})",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                liveRoutingLogs.take(5).forEach { debugEntry ->
+                    Text(
+                        text = "• ${debugEntry.toCompactSummaryLine()}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
             if (auditLogs.isNotEmpty()) {
                 HorizontalDivider()
                 Text(
-                    text = "Recent Spoken Utterance Voice Audit Logs (${auditLogs.size})",
+                    text = "Recent Spoken Utterance Post-Synthesis Audit Logs (${auditLogs.size})",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.primary
                 )
                 auditLogs.take(4).forEach { entry ->
                     Text(
-                        text = "• [${entry.ocrCharacterName} → ${entry.normalizedCharacterName}] rule=${entry.resolutionRule} • reqSid=${entry.requestedSid} actSid=${entry.actualSidPassedToNative} • backend=${entry.actualBackend} • RMS=${String.format(Locale.US, "%.4f", entry.outputPcmRms)}",
+                        text = "• [${entry.ocrCharacterName} → ${entry.normalizedCharacterName}] rule=${entry.resolutionRule} • reqSid=${entry.requestedSid} actSid=${entry.actualSidPassedToNative} • backend=${entry.actualBackend} • RMS=${entry.outputPcmRmsDisplay} • fallback=${entry.fallbackReason.ifBlank { "none" }}",
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
