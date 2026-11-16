@@ -139,6 +139,8 @@ dependencies {
   implementation(libs.mlkit.text.recognition)
   implementation(libs.mlkit.translate)
   implementation(libs.mediapipe.tasks.audio)
+  implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.common)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

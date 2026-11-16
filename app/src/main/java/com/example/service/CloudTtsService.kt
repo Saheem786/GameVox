@@ -232,9 +232,12 @@ object CloudTtsService {
             }
             val emotionInstruction = when (emotionResult.emotion) {
                 SpeechEmotion.EXCITED -> "Speak as $characterDesc with bright excitement, high energy, and lively urgency."
+                SpeechEmotion.HAPPY -> "Speak as $characterDesc with warm happiness, friendly energy, and a cheerful tone."
                 SpeechEmotion.ANGRY -> "Speak as $characterDesc with intense frustration, firmness, and emotional urgency."
+                SpeechEmotion.FEAR -> "Speak as $characterDesc with breathless urgency, fear, and anxious concern."
                 SpeechEmotion.SAD -> "Speak as $characterDesc with a soft, sad, hesitant tone and natural emotional pauses."
                 SpeechEmotion.WHISPER -> "Speak as $characterDesc in a hushed, secretive, quiet whisper with slow pacing."
+                SpeechEmotion.SERIOUS -> "Speak as $characterDesc with a composed, serious, tactical, and steady tone."
                 SpeechEmotion.NEUTRAL -> "Speak as $characterDesc in a warm, natural conversational Indian Hindi/Hinglish tone."
             }
 

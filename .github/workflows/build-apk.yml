@@ -75,7 +75,16 @@ jobs:
         run: |
           mkdir -p /tmp/sherpa_linux_jni
           curl -fSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-jni.tar.bz2" -o /tmp/sherpa_linux_jni/sherpa.tar.bz2
-          python3 -c 'import tarfile; tarfile.open("/tmp/sherpa_linux_jni/sherpa.tar.bz2", "r:bz2").extractall("/tmp/sherpa_linux_jni")'
+          curl -fSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-shared.tar.bz2" -o /tmp/sherpa_linux_jni/sherpa_shared.tar.bz2
+          python3 -c '
+          import tarfile, shutil, os
+          tarfile.open("/tmp/sherpa_linux_jni/sherpa.tar.bz2", "r:bz2").extractall("/tmp/sherpa_linux_jni")
+          tarfile.open("/tmp/sherpa_linux_jni/sherpa_shared.tar.bz2", "r:bz2").extractall("/tmp/sherpa_linux_jni")
+          dst = "/tmp/sherpa_linux_jni/sherpa-onnx-v2.0.1-linux-x64-jni/lib"
+          src = "/tmp/sherpa_linux_jni/sherpa-onnx-v2.0.1-linux-x64-shared/lib"
+          for f in ["libsherpa-onnx-c-api.so", "libsherpa-onnx-cxx-api.so"]:
+              shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
+          '
 
       - name: Run JVM & Robolectric Unit Tests
         run: ./gradlew testDebugUnitTest --no-daemon --stacktrace

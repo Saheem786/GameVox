@@ -73,7 +73,12 @@ object HindiTranslationEngine {
             "i won't let you down!" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा!",
             "don't mess with me!" to "मुझसे पंगा मत लो!",
             "what the hell is going on?" to "ये सब क्या चल रहा है यार?",
-            "get out of here!" to "यहाँ से निकलो जल्दी!",
+            "get out of here!" to "यहाँ से निकलो, जल्दी!",
+            "get out of here." to "यहाँ से निकलो, जल्दी!",
+            "i was so worried about you." to "मुझे तुम्हारी कितनी फिक्र हो रही थी!",
+            "i was so worried about you!" to "मुझे तुम्हारी कितनी फिक्र हो रही थी!",
+            "you think you can beat me?" to "तुम्हें लगता है तुम मुझे हरा दोगे?",
+            "do you think you can beat me?" to "तुम्हें लगता है तुम मुझे हरा दोगे?",
             "watch your back!" to "पीछे ध्यान रखना!",
             "stay right behind me." to "बिल्कुल मेरे पीछे रहना।",
             "wait for me! where are you going so fast?" to "अरे मेरा वेट करो! इतनी जल्दी कहाँ जा रहे हो?",
@@ -114,7 +119,13 @@ object HindiTranslationEngine {
             "i am so sad... why did you leave..." to
                 "मैं बहुत दुखी हूँ... तुम क्यों चले गए...",
             "don't make a sound... stay quiet." to
-                "कोई आवाज़ मत करना... बिल्कुल चुप रहो।"
+                "कोई आवाज़ मत करना... बिल्कुल चुप रहो।",
+            "we finally made it! look at that view!" to
+                "आखिर हम पहुँच ही गए! वो नज़ारा तो देखो!",
+            "something is moving in the shadows... stay back!" to
+                "अंधेरे में कुछ हिल रहा है... पीछे रहो!",
+            "this ends right here, right now." to
+                "ये सब यहीं और अभी खत्म होगा।"
         ),
         TargetLanguage.MARATHI to mapOf(
             "alert! target secured in sector 7. engage protocols." to
@@ -551,6 +562,25 @@ object HindiTranslationEngine {
                 false
             }
         }
+    }
+
+    /**
+     * Synchronous lookup against the modern conversational Hindi phrasebook and local lexicon
+     * after stripping any leading speaker name prefix.
+     */
+    fun translateOfflinePhrasebook(
+        englishText: String,
+        targetLanguage: TargetLanguage = TargetLanguage.HINDI
+    ): String? {
+        val withoutSpeaker = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
+        val clean = STAGE_DIRECTION_PREFIX_REGEX.replace(withoutSpeaker, "").replace(Regex("\\s+"), " ").trim()
+        if (clean.isEmpty()) return null
+        val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
+        MULTI_LANG_DIALOGUE_MAP[targetLanguage]?.get(normalized)?.let { return it }
+        return convertFormalHindiToModernCasual(
+            translateOfflineFallback(clean, targetLanguage),
+            normalized
+        )
     }
 
     /**

@@ -227,11 +227,32 @@ data class TranslatorAppState(
     val translationLatencyMs: Long = 0L,
     val totalPipelineLatencyMs: Long = 0L,
     val ttsInitLatencyMs: Long = 0L,
+    val serverRequestLatencyMs: Long = 0L,
+    val serverInferenceLatencyMs: Long = 0L,
+    val conditioningLatencyMs: Long = 0L,
+    val conditioningCached: Boolean = false,
     val ttsFirstAudioLatencyMs: Long = 0L,
     val ttsFirstPcmChunkLatencyMs: Long = 0L,
     val ttsAudioTrackWriteLatencyMs: Long = 0L,
     val ttsEstimatedPlayoutLatencyMs: Long = 0L,
+    val endToEndSubtitleToAudioLatencyMs: Long = 0L,
     val ttsSpeechDurationMs: Long = 0L,
+    val lastSynthesizedVoiceSha256: String = "",
+    val lastSynthesizedRms: Float = 0.0f,
+    val chatterboxServerUrl: String = "http://192.168.1.100:8765",
+    val chatterboxAuthToken: String = "gamevox-local-secret-2026",
+    val chatterboxServerReachable: Boolean = false,
+    val chatterboxModelLoaded: Boolean = false,
+    val chatterboxDevice: String = "untested",
+    val chatterboxModelId: String = "ResembleAI/Chatterbox-Multilingual-hi",
+    val chatterboxEngineName: String = "ResembleAI Chatterbox Multilingual V3 (Hindi)",
+    val chatterboxSampleRate: Int = 24000,
+    val chatterboxReferenceVoiceFilesCount: Int = 2,
+    val chatterboxUniqueVoicesSha256Count: Int = 2,
+    val chatterboxConditionalsCachedCount: Int = 0,
+    val chatterboxPingRttMs: Long = 0L,
+    val isTestingChatterboxConnection: Boolean = false,
+    val chatterboxServerStatusText: String = "Not tested — enter Windows PC local IP (e.g. http://192.168.1.100:8765) & tap Test",
     val isRunningTtsBenchmark: Boolean = false,
     val isRealHardwareBenchmark: Boolean = false,
     val ttsBenchmarkSummary: String = "Not run yet — tap Run TTS Benchmark on an Android device",
@@ -288,6 +309,8 @@ object TranslatorStateRepository {
     private const val KEY_TRANSLATION_MODE = "translation_mode_v1"
     private const val KEY_AI_PRIVACY_CONSENT = "ai_privacy_consent_v1"
     private const val KEY_GLOSSARY_JSON = "pronunciation_glossary_v1"
+    private const val KEY_CHATTERBOX_SERVER_URL = "chatterbox_server_url_v1"
+    private const val KEY_CHATTERBOX_AUTH_TOKEN = "chatterbox_auth_token_v1"
 
     private val _state = MutableStateFlow(TranslatorAppState())
     val state: StateFlow<TranslatorAppState> = _state.asStateFlow()
@@ -312,6 +335,10 @@ object TranslatorStateRepository {
         )
         val kokoroModelPath = prefs.getString(KEY_KOKORO_MODEL_PATH, "").orEmpty().trim()
         val kokoroUseGpu = prefs.getBoolean(KEY_KOKORO_USE_GPU, true)
+        val chatterboxUrl = prefs.getString(KEY_CHATTERBOX_SERVER_URL, "http://192.168.1.100:8765")
+            .orEmpty().trim().ifBlank { "http://192.168.1.100:8765" }
+        val chatterboxToken = prefs.getString(KEY_CHATTERBOX_AUTH_TOKEN, "gamevox-local-secret-2026")
+            .orEmpty().trim().ifBlank { "gamevox-local-secret-2026" }
         val showScanBox = prefs.getBoolean(KEY_SHOW_SCAN_BOX, true)
         val showSubtitleBox = prefs.getBoolean(KEY_SHOW_SUBTITLE_BOX, true)
         val voiceMuted = prefs.getBoolean(KEY_VOICE_MUTED, false)
@@ -333,6 +360,8 @@ object TranslatorStateRepository {
                 freeVoiceBackend = freeVoiceBackend,
                 kokoroModelPath = kokoroModelPath,
                 kokoroUseGpu = kokoroUseGpu,
+                chatterboxServerUrl = chatterboxUrl,
+                chatterboxAuthToken = chatterboxToken,
                 showTargetBoxOverlay = showScanBox,
                 isSubtitleVisible = showSubtitleBox,
                 isVoiceMuted = voiceMuted,
@@ -794,6 +823,60 @@ object TranslatorStateRepository {
         }
     }
 
+    fun updateChatterboxServerConfig(
+        context: Context,
+        serverUrl: String,
+        authToken: String,
+        statusMessage: String? = null
+    ) {
+        val cleanUrl = serverUrl.trim().ifBlank { "http://192.168.1.100:8765" }
+        val cleanToken = authToken.trim().ifBlank { "gamevox-local-secret-2026" }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CHATTERBOX_SERVER_URL, cleanUrl)
+            .putString(KEY_CHATTERBOX_AUTH_TOKEN, cleanToken)
+            .apply()
+        _state.update {
+            it.copy(
+                chatterboxServerUrl = cleanUrl,
+                chatterboxAuthToken = cleanToken,
+                chatterboxServerStatusText = statusMessage ?: it.chatterboxServerStatusText
+            )
+        }
+    }
+
+    fun updateChatterboxServerStatus(
+        reachable: Boolean,
+        modelLoaded: Boolean,
+        device: String,
+        statusText: String,
+        modelId: String? = null,
+        engineName: String? = null,
+        sampleRate: Int? = null,
+        referenceVoiceFilesCount: Int? = null,
+        uniqueVoicesSha256Count: Int? = null,
+        conditionalsCachedCount: Int? = null,
+        pingRttMs: Long? = null,
+        isTesting: Boolean = false
+    ) {
+        _state.update {
+            it.copy(
+                chatterboxServerReachable = reachable,
+                chatterboxModelLoaded = modelLoaded,
+                chatterboxDevice = device,
+                chatterboxServerStatusText = statusText,
+                chatterboxModelId = modelId?.ifBlank { it.chatterboxModelId } ?: it.chatterboxModelId,
+                chatterboxEngineName = engineName?.ifBlank { it.chatterboxEngineName } ?: it.chatterboxEngineName,
+                chatterboxSampleRate = sampleRate ?: it.chatterboxSampleRate,
+                chatterboxReferenceVoiceFilesCount = referenceVoiceFilesCount ?: it.chatterboxReferenceVoiceFilesCount,
+                chatterboxUniqueVoicesSha256Count = uniqueVoicesSha256Count ?: it.chatterboxUniqueVoicesSha256Count,
+                chatterboxConditionalsCachedCount = conditionalsCachedCount ?: it.chatterboxConditionalsCachedCount,
+                chatterboxPingRttMs = pingRttMs ?: it.chatterboxPingRttMs,
+                isTestingChatterboxConnection = isTesting
+            )
+        }
+    }
+
     fun updateDiagnosisMetrics(
         captureLatencyMs: Long? = null,
         ocrLatencyMs: Long? = null,
@@ -802,27 +885,46 @@ object TranslatorStateRepository {
         roiDimensionsText: String? = null,
         translationSourceLabel: String? = null,
         lastPipelineError: String? = null,
+        serverRequestLatencyMs: Long? = null,
+        serverInferenceLatencyMs: Long? = null,
+        conditioningLatencyMs: Long? = null,
+        conditioningCached: Boolean? = null,
         ttsFirstAudioLatencyMs: Long? = null,
         ttsFirstPcmChunkLatencyMs: Long? = null,
         ttsAudioTrackWriteLatencyMs: Long? = null,
         ttsEstimatedPlayoutLatencyMs: Long? = null,
+        endToEndSubtitleToAudioLatencyMs: Long? = null,
         ttsSynthesisRtf: Float? = null,
+        lastSynthesizedVoiceSha256: String? = null,
+        lastSynthesizedRms: Float? = null,
         activeVoiceName: String? = null
     ) {
         _state.update { current ->
+            val newOcr = ocrLatencyMs ?: current.ocrLatencyMs
+            val newTrans = translationLatencyMs ?: current.translationLatencyMs
+            val newFirstAudio = ttsFirstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs
+            val computedEndToEnd = endToEndSubtitleToAudioLatencyMs
+                ?: if (newFirstAudio > 0L) (newOcr + newTrans + newFirstAudio) else current.endToEndSubtitleToAudioLatencyMs
             current.copy(
                 captureLatencyMs = captureLatencyMs ?: current.captureLatencyMs,
-                ocrLatencyMs = ocrLatencyMs ?: current.ocrLatencyMs,
-                translationLatencyMs = translationLatencyMs ?: current.translationLatencyMs,
+                ocrLatencyMs = newOcr,
+                translationLatencyMs = newTrans,
                 totalPipelineLatencyMs = totalPipelineLatencyMs ?: current.totalPipelineLatencyMs,
                 roiDimensionsText = roiDimensionsText ?: current.roiDimensionsText,
                 translationSourceLabel = translationSourceLabel ?: current.translationSourceLabel,
                 lastPipelineError = lastPipelineError ?: current.lastPipelineError,
-                ttsFirstAudioLatencyMs = ttsFirstAudioLatencyMs ?: current.ttsFirstAudioLatencyMs,
+                serverRequestLatencyMs = serverRequestLatencyMs ?: current.serverRequestLatencyMs,
+                serverInferenceLatencyMs = serverInferenceLatencyMs ?: current.serverInferenceLatencyMs,
+                conditioningLatencyMs = conditioningLatencyMs ?: current.conditioningLatencyMs,
+                conditioningCached = conditioningCached ?: current.conditioningCached,
+                ttsFirstAudioLatencyMs = newFirstAudio,
                 ttsFirstPcmChunkLatencyMs = ttsFirstPcmChunkLatencyMs ?: current.ttsFirstPcmChunkLatencyMs,
                 ttsAudioTrackWriteLatencyMs = ttsAudioTrackWriteLatencyMs ?: current.ttsAudioTrackWriteLatencyMs,
                 ttsEstimatedPlayoutLatencyMs = ttsEstimatedPlayoutLatencyMs ?: current.ttsEstimatedPlayoutLatencyMs,
+                endToEndSubtitleToAudioLatencyMs = computedEndToEnd,
                 ttsSynthesisRtf = ttsSynthesisRtf ?: current.ttsSynthesisRtf,
+                lastSynthesizedVoiceSha256 = lastSynthesizedVoiceSha256 ?: current.lastSynthesizedVoiceSha256,
+                lastSynthesizedRms = lastSynthesizedRms ?: current.lastSynthesizedRms,
                 activeVoiceName = activeVoiceName ?: current.activeVoiceName
             )
         }

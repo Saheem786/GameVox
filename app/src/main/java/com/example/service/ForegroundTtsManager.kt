@@ -14,6 +14,7 @@ import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.example.data.CharacterVoiceAssignment
 import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
@@ -47,6 +48,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Real-time TTS playback telemetry and 24-band spectrum state consumed by the Jetpack Compose
@@ -134,6 +136,10 @@ class ForegroundTtsManager private constructor(context: Context) {
     private val appContext: Context = context.applicationContext
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     val sherpaEngine = SherpaSupertonicBackend(appContext)
+    val exoPlayerManager = HindiExoPlayerManager.getInstance(appContext)
+    val neuralVoiceClient = NeuralVoiceClient().apply {
+        attachExoPlayerManager(exoPlayerManager)
+    }
     private val kokoroEngine = KokoroMediaPipeTtsEngine.getInstance(appContext)
 
     private val downloadListeners = CopyOnWriteArraySet<VoiceDataDownloadListener>()
@@ -1234,6 +1240,223 @@ class ForegroundTtsManager private constructor(context: Context) {
             ssmlPreview = emotionResult.ssmlMarkup
         )
 
+        // 0. User-Visible Mode: Pause Dubbing (subtitles remain active, audio playback paused)
+        if (state.freeVoiceBackend == FreeVoiceBackend.PAUSE_DUBBING) {
+            TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                backendType = "PAUSE_DUBBING",
+                modelLoaded = false,
+                modelPath = "",
+                speakerCount = sherpaEngine.numSpeakers,
+                selectedSid = VoiceProfileRepository.activeCharacterAssignment.value?.speakerId ?: 0,
+                modelVersion = "Paused by user",
+                jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                configuredSteps = sherpaEngine.configuredNumSteps,
+                lastError = ""
+            )
+            TranslatorStateRepository.updateDiagnosisMetrics(
+                activeVoiceName = "Pause Dubbing (Subtitles Only)"
+            )
+            return false
+        }
+
+        // 0b. User-Visible Mode: Human Voice — Local Neural Server (ResembleAI Chatterbox Multilingual V3 Hindi)
+        if (state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER) {
+            val epoch = _playbackEpoch.incrementAndGet()
+            val activeAssignment = VoiceProfileRepository.activeCharacterAssignment.value
+                ?: CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+            val utteranceId = "chatterbox_${UUID.randomUUID().toString().take(8)}"
+            val fallbackDispatched = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            // Apply character-specific pronunciation overrides before sending to Chatterbox
+            val spokenWithOverrides = if (activeAssignment.pronunciationOverrides.isNotEmpty()) {
+                com.example.engine.PronunciationGlossary.applyForSpeech(
+                    emotionResult.cleanSpokenText,
+                    activeAssignment.pronunciationOverrides
+                )
+            } else {
+                emotionResult.cleanSpokenText
+            }
+
+            val effectiveExaggeration = if (emotionResult.emotion == SpeechEmotion.NEUTRAL) {
+                activeAssignment.exaggeration
+            } else {
+                emotionResult.chatterboxExaggeration
+            }
+            val effectiveCfgWeight = if (emotionResult.emotion == SpeechEmotion.NEUTRAL) {
+                activeAssignment.cfgWeight
+            } else {
+                emotionResult.chatterboxCfgWeight
+            }
+
+            val synthReq = NeuralSynthesizeRequest(
+                text = spokenWithOverrides,
+                characterId = activeAssignment.characterName,
+                referenceVoiceId = activeAssignment.referenceVoiceId,
+                languageId = state.targetLanguage.code,
+                emotion = emotionResult.emotion.code,
+                exaggeration = effectiveExaggeration,
+                cfgWeight = effectiveCfgWeight,
+                requestId = utteranceId,
+                epoch = epoch
+            )
+
+            isSpeakingUtterance = true
+            activeUtteranceId = utteranceId
+            startRealtimeVisualizerSync(
+                utteranceId = utteranceId,
+                text = spokenWithOverrides,
+                voiceProfile = voiceProfile,
+                emotionResult = emotionResult,
+                overrideVoiceName = "Chatterbox V3 (${activeAssignment.displayName} • ${activeAssignment.referenceVoiceId})"
+            )
+
+            managerScope.launch(Dispatchers.Default) {
+                val success = neuralVoiceClient.synthesizeAndPlay(
+                    rawBaseUrl = state.chatterboxServerUrl,
+                    authToken = state.chatterboxAuthToken,
+                    request = synthReq,
+                    onSynthesisTelemetry = { outcome ->
+                        TranslatorStateRepository.updateChatterboxServerStatus(
+                            reachable = true,
+                            modelLoaded = true,
+                            device = outcome.deviceUsed,
+                            statusText = "Connected (${outcome.deviceUsed.uppercase(Locale.ROOT)}) • Infer ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", outcome.parsedWav.waveformRms)}"
+                        )
+                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                            backendType = "CHATTERBOX_LOCAL_SERVER",
+                            modelLoaded = true,
+                            modelPath = "${state.chatterboxServerUrl} (${outcome.voiceId}.wav)",
+                            speakerCount = VoiceProfileRepository.getUniqueReferenceVoiceSummary().first,
+                            selectedSid = activeAssignment.speakerId,
+                            modelVersion = "ResembleAI/Chatterbox-Multilingual-hi (${outcome.deviceUsed})",
+                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                            configuredSteps = sherpaEngine.configuredNumSteps,
+                            firstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                            lastError = ""
+                        )
+                        TranslatorStateRepository.updateDiagnosisMetrics(
+                            serverRequestLatencyMs = outcome.serverRequestLatencyMs,
+                            serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                            conditioningLatencyMs = outcome.conditioningLatencyMs,
+                            conditioningCached = outcome.conditioningCached,
+                            ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                            lastSynthesizedVoiceSha256 = outcome.voiceSha256,
+                            lastSynthesizedRms = outcome.parsedWav.waveformRms,
+                            activeVoiceName = "Chatterbox V3 (${activeAssignment.displayName} • ${outcome.voiceId})"
+                        )
+                    },
+                    onFirstAudioStarted = { firstPlayableMs ->
+                        TranslatorStateRepository.updateDiagnosisMetrics(
+                            ttsFirstAudioLatencyMs = firstPlayableMs,
+                            ttsAudioTrackWriteLatencyMs = firstPlayableMs
+                        )
+                    },
+                    onCompleted = {
+                        if (_playbackEpoch.get() == epoch) {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                            TranslatorStateRepository.updateTtsLifecycleEvent(
+                                event = "onDone(ChatterboxServer)",
+                                utteranceId = utteranceId,
+                                error = ""
+                            )
+                            onUtteranceCompletedImmediately?.invoke(utteranceId)
+                            thirtySecondRepeatDelayJob?.cancel()
+                            thirtySecondRepeatDelayJob = managerScope.launch {
+                                delay(30000L)
+                                onThirtySecondPostSpeechDelayCompleted?.invoke(utteranceId)
+                            }
+                        }
+                    },
+                    onError = { err ->
+                        if (fallbackDispatched.compareAndSet(false, true)) {
+                            Log.w(TAG, "Chatterbox local server unavailable ($err) — switching to explicit offline fallback")
+                            TranslatorStateRepository.updateChatterboxServerStatus(
+                                reachable = false,
+                                modelLoaded = false,
+                                device = "offline",
+                                statusText = "Local server unreachable ($err) — Offline Fallback Active"
+                            )
+                            if (_playbackEpoch.get() == epoch) {
+                                isSpeakingUtterance = false
+                                if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                                stopVisualizerSync()
+                                if (!isBenchmarkRun) {
+                                    // Honest fallback: never claim Chatterbox is active when falling back
+                                    if (SupertonicModelManager.isModelReady(appContext)) {
+                                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                                            backendType = "SHERPA_FALLBACK (Server Offline)",
+                                            modelLoaded = true,
+                                            modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
+                                            speakerCount = sherpaEngine.numSpeakers,
+                                            selectedSid = activeAssignment.speakerId,
+                                            modelVersion = SupertonicModelManager.modelInfo.version,
+                                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                            configuredSteps = sherpaEngine.configuredNumSteps,
+                                            lastError = "Chatterbox server offline: $err"
+                                        )
+                                        managerScope.launch(Dispatchers.Default) {
+                                            sherpaEngine.synthesizeAndPlay(
+                                                text = spokenWithOverrides,
+                                                sid = activeAssignment.speakerId,
+                                                speed = activeAssignment.speed,
+                                                pitch = activeAssignment.pitch,
+                                                epoch = epoch,
+                                                onFirstAudioStarted = { latencyMs ->
+                                                    TranslatorStateRepository.updateDiagnosisMetrics(
+                                                        ttsFirstAudioLatencyMs = latencyMs,
+                                                        activeVoiceName = "SHERPA_FALLBACK: Supertonic Sid #${activeAssignment.speakerId} (Server Offline)"
+                                                    )
+                                                },
+                                                onCompleted = {
+                                                    onUtteranceCompletedImmediately?.invoke(utteranceId)
+                                                },
+                                                onError = { sherpaErr ->
+                                                    managerScope.launch(Dispatchers.Main) {
+                                                        TranslatorStateRepository.updateDiagnosisMetrics(
+                                                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} ($sherpaErr)"
+                                                        )
+                                                        speakOnAndroidTts(text, sourceEnglishText, voiceProfile, false)
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                                            backendType = "SYSTEM_FALLBACK (Server Offline)",
+                                            modelLoaded = false,
+                                            modelPath = state.chatterboxServerUrl,
+                                            speakerCount = sherpaEngine.numSpeakers,
+                                            selectedSid = activeAssignment.speakerId,
+                                            modelVersion = SupertonicModelManager.modelInfo.version,
+                                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                            configuredSteps = sherpaEngine.configuredNumSteps,
+                                            lastError = "Chatterbox server offline: $err"
+                                        )
+                                        TranslatorStateRepository.updateDiagnosisMetrics(
+                                            activeVoiceName = "SYSTEM_FALLBACK: ${state.activeTtsEngineLabel} (Chatterbox Offline)"
+                                        )
+                                        managerScope.launch(Dispatchers.Main) {
+                                            if (_playbackEpoch.get() == epoch) {
+                                                speakOnAndroidTts(text, sourceEnglishText, voiceProfile, false)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+                if (!success && _playbackEpoch.get() == epoch && fallbackDispatched.compareAndSet(false, true)) {
+                    isSpeakingUtterance = false
+                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                    stopVisualizerSync()
+                }
+            }
+            return true
+        }
+
         // 1. Direct in-process Sherpa-ONNX Supertonic 3 Neural TTS Path
         if (state.freeVoiceBackend == FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT || SupertonicModelManager.isModelReady(appContext)) {
             val epoch = _playbackEpoch.incrementAndGet()
@@ -2100,8 +2323,215 @@ class ForegroundTtsManager private constructor(context: Context) {
         }
     }
 
+    fun testLocalChatterboxServerConnection(
+        onResult: (NeuralServerHealthReport) -> Unit = {}
+    ) {
+        val state = TranslatorStateRepository.state.value
+        TranslatorStateRepository.updateChatterboxServerStatus(
+            reachable = false,
+            modelLoaded = false,
+            device = "checking",
+            statusText = "Testing connection to ${state.chatterboxServerUrl}...",
+            isTesting = true
+        )
+        managerScope.launch {
+            val report = neuralVoiceClient.checkServerHealth(
+                rawBaseUrl = state.chatterboxServerUrl,
+                authToken = state.chatterboxAuthToken
+            )
+            val statusSummary = if (report.reachable && report.modelLoaded) {
+                "READY on ${report.device.uppercase(Locale.ROOT)} • ${report.uniqueReferenceVoicesSha256Count} unique reference voices (${report.roundTripLatencyMs}ms RTT)"
+            } else if (report.reachable) {
+                "Server reachable (${report.roundTripLatencyMs}ms), but model not loaded: ${report.errorMessage.ifBlank { report.status }}"
+            } else {
+                "Unreachable (${report.errorMessage}) — start run_server_windows.bat on your Windows PC"
+            }
+            TranslatorStateRepository.updateChatterboxServerStatus(
+                reachable = report.reachable,
+                modelLoaded = report.modelLoaded,
+                device = report.device,
+                statusText = statusSummary,
+                modelId = report.modelId,
+                engineName = report.engineName,
+                sampleRate = report.sampleRate,
+                referenceVoiceFilesCount = report.referenceVoiceFilesCount,
+                uniqueVoicesSha256Count = report.uniqueReferenceVoicesSha256Count,
+                conditionalsCachedCount = report.conditionalsCachedCount,
+                pingRttMs = report.roundTripLatencyMs,
+                isTesting = false
+            )
+            onResult(report)
+        }
+    }
+
+    /**
+     * Synthesizes a Hindi test line for a specific [CharacterVoiceAssignment] and optional [explicitEmotion]
+     * (used by the Character Voice Library and Phase 6 A/B Voice Testing Screen), exporting the
+     * resulting WAV file if [exportWavFile] is provided and reporting `(success, engineUsedSummary, waveformRms)`.
+     */
+    fun synthesizeCharacterPreview(
+        assignment: com.example.data.CharacterVoiceAssignment,
+        hindiText: String,
+        explicitEmotion: SpeechEmotion? = null,
+        exportWavFile: File? = null,
+        onResult: (Boolean, String, Float) -> Unit = { _, _, _ -> }
+    ) {
+        val state = TranslatorStateRepository.state.value
+        val cleanText = com.example.engine.SpeakerHeuristicEngine.stripLeadingCharacterName(hindiText).trim()
+        if (cleanText.isBlank()) {
+            onResult(false, "Empty text", 0f)
+            return
+        }
+
+        VoiceProfileRepository.setUserOverrideForCharacter(
+            context = appContext,
+            characterName = assignment.characterName,
+            sid = assignment.speakerId,
+            speed = assignment.speed,
+            pitch = assignment.pitch,
+            displayName = assignment.displayName,
+            referenceVoiceId = assignment.referenceVoiceId,
+            voicePresentation = assignment.voicePresentation,
+            vocalStyleDescription = assignment.vocalStyleDescription,
+            voiceEngine = assignment.voiceEngine,
+            defaultEmotion = (explicitEmotion?.code ?: assignment.defaultEmotion),
+            exaggeration = explicitEmotion?.chatterboxExaggeration ?: assignment.exaggeration,
+            cfgWeight = explicitEmotion?.chatterboxCfgWeight ?: assignment.cfgWeight,
+            pronunciationOverrides = assignment.pronunciationOverrides
+        )
+
+        val epoch = _playbackEpoch.incrementAndGet()
+        val emotionToUse = explicitEmotion ?: SpeechEmotion.fromCode(assignment.defaultEmotion)
+        val effectiveExag = explicitEmotion?.chatterboxExaggeration ?: assignment.exaggeration
+        val effectiveCfg = explicitEmotion?.chatterboxCfgWeight ?: assignment.cfgWeight
+
+        val spokenWithOverrides = if (assignment.pronunciationOverrides.isNotEmpty()) {
+            com.example.engine.PronunciationGlossary.applyForSpeech(cleanText, assignment.pronunciationOverrides)
+        } else {
+            cleanText
+        }
+
+        if (state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER || assignment.voiceEngine == "chatterbox_local_server") {
+            managerScope.launch(Dispatchers.Default) {
+                var reportedRms = 0f
+                var reportedSummary = ""
+                val ok = neuralVoiceClient.synthesizeAndPlay(
+                    rawBaseUrl = state.chatterboxServerUrl,
+                    authToken = state.chatterboxAuthToken,
+                    request = NeuralSynthesizeRequest(
+                        text = spokenWithOverrides,
+                        characterId = assignment.characterName,
+                        referenceVoiceId = assignment.referenceVoiceId,
+                        languageId = "hi",
+                        emotion = emotionToUse.code,
+                        exaggeration = effectiveExag,
+                        cfgWeight = effectiveCfg,
+                        epoch = epoch
+                    ),
+                    exportWavFile = exportWavFile,
+                    onSynthesisTelemetry = { outcome ->
+                        reportedRms = outcome.parsedWav.waveformRms
+                        reportedSummary = "Chatterbox V3 (${outcome.voiceId}.wav • SHA ${outcome.voiceSha256.take(8)} • ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", reportedRms)})"
+                        TranslatorStateRepository.updateDiagnosisMetrics(
+                            serverRequestLatencyMs = outcome.serverRequestLatencyMs,
+                            serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                            conditioningLatencyMs = outcome.conditioningLatencyMs,
+                            conditioningCached = outcome.conditioningCached,
+                            ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                            lastSynthesizedVoiceSha256 = outcome.voiceSha256,
+                            lastSynthesizedRms = reportedRms,
+                            activeVoiceName = "Chatterbox V3 (${assignment.displayName} • ${outcome.voiceId})"
+                        )
+                    },
+                    onError = { err ->
+                        reportedSummary = "Local Server Unavailable ($err)"
+                    }
+                )
+                if (ok) {
+                    withContext(Dispatchers.Main) {
+                        onResult(true, reportedSummary, reportedRms)
+                    }
+                    return@launch
+                }
+
+                // Honest fallback to Supertonic or Android TTS if local server is offline during preview
+                if (SupertonicModelManager.isModelReady(appContext) && (sherpaEngine.isReady || sherpaEngine.initialize())) {
+                    val wavTarget = exportWavFile ?: File(appContext.cacheDir, "ab_preview_${assignment.characterName}_sid${assignment.speakerId}.wav")
+                    val valResult = sherpaEngine.synthesizeAndValidateToWav(
+                        text = spokenWithOverrides,
+                        sid = assignment.speakerId,
+                        speed = assignment.speed,
+                        numSteps = sherpaEngine.configuredNumSteps,
+                        outputWavFile = wavTarget
+                    )
+                    sherpaEngine.synthesizeAndPlay(
+                        text = spokenWithOverrides,
+                        sid = assignment.speakerId,
+                        speed = assignment.speed,
+                        pitch = assignment.pitch,
+                        epoch = epoch
+                    )
+                    withContext(Dispatchers.Main) {
+                        onResult(
+                            valResult.waveformRms > 0.001f,
+                            "SHERPA_FALLBACK (Sid #${assignment.speakerId} • ${valResult.totalSynthesisTimeMs}ms • RMS ${String.format(Locale.US, "%.4f", valResult.waveformRms)})",
+                            valResult.waveformRms
+                        )
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        val fallbackOk = speakOnAndroidTts(spokenWithOverrides, cleanText, null, false)
+                        onResult(
+                            fallbackOk,
+                            "SYSTEM_FALLBACK (${state.activeTtsEngineLabel} — Local Chatterbox server offline)",
+                            0.05f
+                        )
+                    }
+                }
+            }
+            return
+        }
+
+        // Direct Supertonic path
+        managerScope.launch(Dispatchers.Default) {
+            if (SupertonicModelManager.isModelReady(appContext) && (sherpaEngine.isReady || sherpaEngine.initialize())) {
+                val wavTarget = exportWavFile ?: File(appContext.cacheDir, "ab_preview_${assignment.characterName}_sid${assignment.speakerId}.wav")
+                val valResult = sherpaEngine.synthesizeAndValidateToWav(
+                    text = spokenWithOverrides,
+                    sid = assignment.speakerId,
+                    speed = assignment.speed,
+                    numSteps = sherpaEngine.configuredNumSteps,
+                    outputWavFile = wavTarget
+                )
+                sherpaEngine.synthesizeAndPlay(
+                    text = spokenWithOverrides,
+                    sid = assignment.speakerId,
+                    speed = assignment.speed,
+                    pitch = assignment.pitch,
+                    epoch = epoch
+                )
+                withContext(Dispatchers.Main) {
+                    onResult(
+                        valResult.waveformRms > 0.001f,
+                        "Supertonic 3 Direct (Sid #${assignment.speakerId} • ${valResult.totalSynthesisTimeMs}ms • RMS ${String.format(Locale.US, "%.4f", valResult.waveformRms)})",
+                        valResult.waveformRms
+                    )
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    val fallbackOk = speakOnAndroidTts(spokenWithOverrides, cleanText, null, false)
+                    onResult(
+                        fallbackOk,
+                        "SYSTEM_FALLBACK (${state.activeTtsEngineLabel})",
+                        0.05f
+                    )
+                }
+            }
+        }
+    }
+
     fun stopSpeaking() {
-        _playbackEpoch.incrementAndGet()
+        val newEpoch = _playbackEpoch.incrementAndGet()
         pendingSubtitleToSpeak = null
         activeNetworkUtterances.clear()
         utteranceSubmitElapsedMs.clear()
@@ -2120,6 +2550,18 @@ class ForegroundTtsManager private constructor(context: Context) {
         CloudTtsService.stopPlayback()
         kokoroEngine.stopPlayback()
         sherpaEngine.stop()
+        exoPlayerManager.stopAndClearQueue()
+        neuralVoiceClient.stop()
+        val state = TranslatorStateRepository.state.value
+        if (state.freeVoiceBackend == FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER) {
+            managerScope.launch(Dispatchers.IO) {
+                neuralVoiceClient.cancelStaleSynthesis(
+                    rawBaseUrl = state.chatterboxServerUrl,
+                    authToken = state.chatterboxAuthToken,
+                    minValidEpoch = newEpoch
+                )
+            }
+        }
         try {
             tts?.stop()
         } catch (_: Exception) {
@@ -2130,5 +2572,10 @@ class ForegroundTtsManager private constructor(context: Context) {
             utteranceId = "",
             error = ""
         )
+    }
+
+    fun releaseAudioResources() {
+        stopSpeaking()
+        exoPlayerManager.release()
     }
 }

@@ -129,7 +129,8 @@ private val SUPERTONIC_BASE_SPEAKERS = SUPERTONIC_VOICE_SPECS.map { it.sid to "$
 fun VoiceManagerScreen(
     onNavigateBack: () -> Unit,
     onPlayVoicePreview: (VoiceProfile) -> Unit,
-    onSelectVoice: (VoiceProfile) -> Unit
+    onSelectVoice: (VoiceProfile) -> Unit,
+    onOpenAbVoiceTesting: (() -> Unit)? = null
 ) {
     BackHandler {
         onNavigateBack()
@@ -197,13 +198,21 @@ fun VoiceManagerScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "${characterAssignments.size} Character Profiles • Supertonic 3 (sid: 0..9)",
+                            text = VoiceProfileRepository.getUniqueReferenceVoiceSummary().third,
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
+                    if (onOpenAbVoiceTesting != null) {
+                        TextButton(
+                            onClick = onOpenAbVoiceTesting,
+                            modifier = Modifier.testTag("voice_screen_open_ab_lab_button")
+                        ) {
+                            Text("A/B Lab", fontWeight = FontWeight.Bold)
+                        }
+                    }
                     IconButton(
                         onClick = {
                             VoiceProfileRepository.restoreAllCharacterDefaults(context)
@@ -338,25 +347,41 @@ fun VoiceManagerScreen(
                         ) {
                             items(filteredCharacters, key = { it.characterName }) { charItem ->
                                 val isCurrentlyActive = activeCharacterAssignment?.characterName == charItem.characterName
+                                val sharingDisclosure = remember(charItem, characterAssignments) {
+                                    CharacterVoiceAssignment.buildVoiceSharingDisclosure(charItem, characterAssignments)
+                                }
                                 CharacterAssignmentCard(
                                     item = charItem,
+                                    sharingDisclosure = sharingDisclosure,
                                     isActiveInDialogue = isCurrentlyActive,
                                     onChangeSid = { characterToChangeSid = charItem },
                                     onRename = { characterToRename = charItem },
+                                    onPlayReferenceClip = {
+                                        VoiceProfileRepository.playCharacterReferenceVoiceClip(
+                                            context = context,
+                                            assignment = charItem
+                                        ) { ok ->
+                                            coroutineScope.launch {
+                                                snackbarHostState.showSnackbar(
+                                                    if (ok) {
+                                                        "Playing raw reference clip: ${charItem.referenceVoiceId}.wav (SHA-256: ${charItem.referenceAudioSha256.take(12)}…)"
+                                                    } else {
+                                                        "Reference clip not found for ${charItem.displayName}"
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    },
                                     onPlayPreview = {
-                                        val sampleText = "नमस्ते, मैं ${charItem.displayName} हूँ।"
-                                        val previewProfile = VoiceProfile(
-                                            id = "char_preview_${charItem.characterName}",
-                                            name = charItem.displayName,
-                                            description = charItem.characterRoleNote,
-                                            pitch = charItem.pitch,
-                                            speechRate = charItem.speed,
-                                            engineVoiceIndex = charItem.speakerId
-                                        )
-                                        ForegroundTtsManager.getInstance(context).speakNonBlocking(
-                                            text = sampleText,
-                                            voiceProfile = previewProfile
-                                        )
+                                        val sampleText = "नमस्ते, मैं ${charItem.displayName} हूँ। यहाँ से निकलो, जल्दी!"
+                                        ForegroundTtsManager.getInstance(context).synthesizeCharacterPreview(
+                                            assignment = charItem,
+                                            hindiText = sampleText
+                                        ) { _, status, _ ->
+                                            coroutineScope.launch {
+                                                snackbarHostState.showSnackbar("${charItem.displayName}: $status")
+                                            }
+                                        }
                                     },
                                     onResetDefault = {
                                         VoiceProfileRepository.resetCharacterToDefault(context, charItem.characterName)
@@ -578,43 +603,90 @@ fun VoiceManagerScreen(
         }
     }
 
-    // Dialog: Change Supertonic Speaker SID (0..9)
+    // Dialog: Change Character Voice Profile (Reference Clip, Presentation, SID 0..9, Emotion)
     characterToChangeSid?.let { charItem ->
         var selectedSid by remember { mutableIntStateOf(charItem.speakerId) }
+        var selectedRefId by remember { mutableStateOf(charItem.referenceVoiceId) }
+        var selectedPresentation by remember { mutableStateOf(charItem.voicePresentation) }
+        var selectedEmotion by remember { mutableStateOf(charItem.defaultEmotion) }
 
         AlertDialog(
             onDismissRequest = { characterToChangeSid = null },
             title = {
                 Text(
-                    text = "Assign Voice: ${charItem.displayName}",
+                    text = "Configure Voice: ${charItem.displayName}",
                     fontWeight = FontWeight.Bold
                 )
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Text(
-                        text = "Select one of Supertonic 3's 10 base speaker IDs (0..9):",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        text = "1. Reference Voice Identity (Chatterbox V3):",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
                     )
-                    SUPERTONIC_BASE_SPEAKERS.forEach { (sid, label) ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { selectedSid = sid }
-                                .padding(vertical = 4.dp)
-                        ) {
-                            RadioButton(
-                                selected = selectedSid == sid,
-                                onClick = { selectedSid = sid }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = selectedRefId == CharacterVoiceAssignment.DEFAULT_MALE_REF_ID,
+                            onClick = {
+                                selectedRefId = CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+                                selectedPresentation = "male"
+                            },
+                            label = { Text("anon_male_ref.wav") }
+                        )
+                        FilterChip(
+                            selected = selectedRefId == CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID,
+                            onClick = {
+                                selectedRefId = CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+                                selectedPresentation = "female"
+                            },
+                            label = { Text("jenny_female_ref.wav") }
+                        )
+                    }
+
+                    Text(
+                        text = "2. Default Emotion Preset: $selectedEmotion",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("NEUTRAL", "HAPPY", "SAD", "ANGRY", "FEAR", "WHISPER", "EXCITED", "SERIOUS").forEach { emo ->
+                            FilterChip(
+                                selected = selectedEmotion == emo,
+                                onClick = { selectedEmotion = emo },
+                                label = { Text(emo, style = MaterialTheme.typography.labelSmall) }
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (selectedSid == sid) FontWeight.Bold else FontWeight.Normal
-                            )
+                        }
+                    }
+
+                    Text(
+                        text = "3. Supertonic 3 Offline Speaker SID (0..9):",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    LazyColumn(modifier = Modifier.height(180.dp)) {
+                        items(SUPERTONIC_BASE_SPEAKERS, key = { it.first }) { (sid, label) ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedSid = sid }
+                                    .padding(vertical = 2.dp)
+                            ) {
+                                RadioButton(
+                                    selected = selectedSid == sid,
+                                    onClick = { selectedSid = sid }
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = if (selectedSid == sid) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
                         }
                     }
                 }
@@ -626,11 +698,15 @@ fun VoiceManagerScreen(
                             context = context,
                             characterName = charItem.characterName,
                             sid = selectedSid,
-                            displayName = charItem.displayName
+                            referenceVoiceId = selectedRefId,
+                            voicePresentation = selectedPresentation,
+                            defaultEmotion = selectedEmotion
                         )
                         characterToChangeSid = null
                         coroutineScope.launch {
-                            snackbarHostState.showSnackbar("Assigned Sid $selectedSid to ${charItem.displayName}")
+                            snackbarHostState.showSnackbar(
+                                "Saved ${charItem.displayName}: Ref=$selectedRefId, SID=$selectedSid, Emotion=$selectedEmotion"
+                            )
                         }
                     }
                 ) {
@@ -887,9 +963,11 @@ fun VoiceManagerScreen(
 @Composable
 private fun CharacterAssignmentCard(
     item: CharacterVoiceAssignment,
+    sharingDisclosure: String,
     isActiveInDialogue: Boolean,
     onChangeSid: () -> Unit,
     onRename: () -> Unit,
+    onPlayReferenceClip: () -> Unit,
     onPlayPreview: () -> Unit,
     onResetDefault: () -> Unit,
     onDelete: () -> Unit
@@ -911,7 +989,7 @@ private fun CharacterAssignmentCard(
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             // Header Row: Display Name + Badges
             Row(
@@ -922,7 +1000,7 @@ private fun CharacterAssignmentCard(
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = item.displayName,
+                            text = "${item.displayName} (${item.voicePresentation.uppercase(Locale.ROOT)})",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
@@ -941,8 +1019,18 @@ private fun CharacterAssignmentCard(
                         }
                     }
                     Text(
-                        text = "OCR Tag: '${item.characterName}' • ${item.characterRoleNote}",
+                        text = "OCR Tag: '${item.characterName}' • Namespace: ${item.gameNamespace} • ${item.characterRoleNote}",
                         style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Vocal Style: ${item.vocalStyleDescription} • Emotion: ${item.defaultEmotion} (exag=${String.format(Locale.US, "%.2f", item.exaggeration)})",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = sharingDisclosure,
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -961,50 +1049,70 @@ private fun CharacterAssignmentCard(
                 }
             }
 
-            // Action Buttons
+            // Separate Play Reference Voice Clip + Synthesize Hindi Preview + Edit Voice Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedButton(
-                    onClick = onPlayPreview,
+                    onClick = onPlayReferenceClip,
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
                     modifier = Modifier
                         .weight(1f)
                         .height(40.dp)
+                        .testTag("play_ref_clip_${item.characterName}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Mic,
+                        contentDescription = "Play Reference Voice Clip",
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Ref Clip", style = MaterialTheme.typography.labelSmall)
+                }
+
+                OutlinedButton(
+                    onClick = onPlayPreview,
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier
+                        .weight(1.1f)
+                        .height(40.dp)
+                        .testTag("synthesize_preview_${item.characterName}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Preview",
-                        modifier = Modifier.size(16.dp)
+                        contentDescription = "Synthesize Hindi Preview",
+                        modifier = Modifier.size(15.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Preview", style = MaterialTheme.typography.labelMedium)
+                    Text("Hindi Preview", style = MaterialTheme.typography.labelSmall)
                 }
 
                 Button(
                     onClick = onChangeSid,
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
                     modifier = Modifier
-                        .weight(1.2f)
+                        .weight(1f)
                         .height(40.dp)
+                        .testTag("configure_voice_${item.characterName}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Tune,
-                        contentDescription = "Change SID",
-                        modifier = Modifier.size(16.dp)
+                        contentDescription = "Configure Voice",
+                        modifier = Modifier.size(15.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Change SID", style = MaterialTheme.typography.labelMedium)
+                    Text("Edit Voice", style = MaterialTheme.typography.labelSmall)
                 }
 
                 if (isUserOverride) {
                     IconButton(
                         onClick = onResetDefault,
-                        modifier = Modifier.size(40.dp)
+                        modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Refresh,

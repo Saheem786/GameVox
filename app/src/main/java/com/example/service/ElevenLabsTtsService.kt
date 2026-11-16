@@ -118,9 +118,12 @@ class ElevenLabsTtsService(
 
         val (stability, similarity, style) = when (emotionResult.emotion) {
             SpeechEmotion.EXCITED -> Triple(0.32, 0.80, 0.75)
+            SpeechEmotion.HAPPY -> Triple(0.40, 0.78, 0.65)
             SpeechEmotion.ANGRY -> Triple(0.28, 0.82, 0.85)
+            SpeechEmotion.FEAR -> Triple(0.30, 0.80, 0.78)
             SpeechEmotion.SAD -> Triple(0.60, 0.78, 0.45)
             SpeechEmotion.WHISPER -> Triple(0.75, 0.85, 0.20)
+            SpeechEmotion.SERIOUS -> Triple(0.65, 0.82, 0.30)
             SpeechEmotion.NEUTRAL -> Triple(0.50, 0.75, 0.35)
         }
 

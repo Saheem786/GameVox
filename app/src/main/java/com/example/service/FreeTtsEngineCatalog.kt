@@ -15,10 +15,20 @@ enum class FreeVoiceBackend(
     val displayLabel: String,
     val subtitle: String
 ) {
+    LOCAL_CHATTERBOX_SERVER(
+        code = "local_chatterbox_server",
+        displayLabel = "Human Voice — Local Neural Server",
+        subtitle = "Expressive Hindi zero-shot voice cloning via local Windows/PC ResembleAI Chatterbox Multilingual V3 server (100% free self-hosted)"
+    ),
     SHERPA_SUPERTONIC_DIRECT(
         code = "sherpa_supertonic_direct",
-        displayLabel = "Sherpa-ONNX Supertonic 3 (In-Process Neural)",
-        subtitle = "Direct on-device neural voice with 10 speaker IDs & 20+ persistent character profiles (Zero API keys)"
+        displayLabel = "Fast Offline Voice — Supertonic",
+        subtitle = "Direct on-device Sherpa-ONNX Supertonic 3 neural voice with 10 speaker IDs & 20+ character profiles (Zero API keys)"
+    ),
+    PAUSE_DUBBING(
+        code = "pause_dubbing",
+        displayLabel = "Pause Dubbing",
+        subtitle = "Keep screen OCR & modern Hindi subtitle translation active while pausing voice playback"
     ),
     ANDROID_USER_SELECTED(
         code = "android_user_selected",

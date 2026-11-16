@@ -105,6 +105,7 @@ import com.example.service.FreeVoiceBackend
 import com.example.service.GameVoxAccessibilityService
 import com.example.service.KokoroMediaPipeTtsEngine
 import com.example.service.ScreenTranslatorService
+import com.example.ui.AbVoiceTestingScreen
 import com.example.ui.DiagnosisScreen
 import com.example.ui.SettingsScreen
 import com.example.ui.VoiceManagerScreen
@@ -115,7 +116,8 @@ private enum class AppScreen {
     HOME,
     SETTINGS,
     VOICE_MANAGER,
-    DIAGNOSIS
+    DIAGNOSIS,
+    AB_VOICE_TESTING
 }
 
 class MainActivity : ComponentActivity() {
@@ -170,6 +172,7 @@ fun GameVoxApp(
     var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
     var voiceManagerOrigin by remember { mutableStateOf(AppScreen.HOME) }
     var diagnosisOrigin by remember { mutableStateOf(AppScreen.HOME) }
+    var abTestingOrigin by remember { mutableStateOf(AppScreen.HOME) }
     var showAiConsentDialog by remember { mutableStateOf(false) }
 
     var hasOverlayPermission by remember {
@@ -338,7 +341,19 @@ fun GameVoxApp(
                     TranslatorStateRepository.updateTtsSpeechRate(context, voiceProfile.speechRate)
                     localPipeline.refreshTtsConfiguration()
                     localPipeline.previewVoiceProfile(voiceProfile)
+                },
+                onOpenAbVoiceTesting = {
+                    abTestingOrigin = AppScreen.VOICE_MANAGER
+                    currentScreen = AppScreen.AB_VOICE_TESTING
                 }
+            )
+            return
+        }
+
+        AppScreen.AB_VOICE_TESTING -> {
+            AbVoiceTestingScreen(
+                state = state,
+                onNavigateBack = { currentScreen = abTestingOrigin }
             )
             return
         }
@@ -479,6 +494,13 @@ fun GameVoxApp(
                 },
                 onClearQueueAndCache = {
                     localPipeline.resetAntiRepeatMemory()
+                },
+                onOpenAbVoiceTesting = {
+                    abTestingOrigin = AppScreen.DIAGNOSIS
+                    currentScreen = AppScreen.AB_VOICE_TESTING
+                },
+                onTestServerConnection = {
+                    localPipeline.ttsManager.testLocalChatterboxServerConnection()
                 }
             )
             return
@@ -943,6 +965,17 @@ fun GameVoxApp(
                         )
                     }
                 }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Compose-based UI component for instant mode switching on the main screen
+                com.example.ui.DubbingModeSwitchCard(
+                    state = state,
+                    onOpenAbLab = {
+                        abTestingOrigin = AppScreen.HOME
+                        currentScreen = AppScreen.AB_VOICE_TESTING
+                    }
+                )
 
                 // Minimal permission helper only when overlay permission is missing
                 if (!hasOverlayPermission) {

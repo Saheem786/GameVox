@@ -180,9 +180,12 @@ fun TtsAudioVisualizerCard(
             // Emotion Modulation Telemetry Pill + Live SSML Markup Badge
             val emotionTint = when (visualizerState.activeEmotion) {
                 SpeechEmotion.EXCITED -> SaffronGold
+                SpeechEmotion.HAPPY -> NeonEmerald
                 SpeechEmotion.ANGRY -> CrimsonAlert
+                SpeechEmotion.FEAR -> SaffronGold
                 SpeechEmotion.SAD -> Color(0xFF7C9EFF)
                 SpeechEmotion.WHISPER -> Color(0xFFCE93D8)
+                SpeechEmotion.SERIOUS -> Color(0xFF90CAF9)
                 SpeechEmotion.NEUTRAL -> NeonEmerald
             }
             Row(

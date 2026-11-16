@@ -724,7 +724,15 @@ object VoiceProfileRepository {
         sid: Int,
         speed: Float = 1.0f,
         pitch: Float = 1.0f,
-        displayName: String? = null
+        displayName: String? = null,
+        referenceVoiceId: String? = null,
+        voicePresentation: String? = null,
+        vocalStyleDescription: String? = null,
+        voiceEngine: String? = null,
+        defaultEmotion: String? = null,
+        exaggeration: Float? = null,
+        cfgWeight: Float? = null,
+        pronunciationOverrides: Map<String, String>? = null
     ): CharacterVoiceAssignment {
         val norm = CharacterVoiceAssignment.normalizeName(characterName)
         val currentList = _characterAssignments.value
@@ -733,6 +741,15 @@ object VoiceProfileRepository {
         val clampedPitch = pitch.coerceIn(0.6f, 1.5f)
 
         val existing = currentList.find { it.characterName == norm }
+        val resolvedRefId = referenceVoiceId?.trim()?.ifBlank { null }
+            ?: existing?.referenceVoiceId
+            ?: if (clampedSid in 0..4) CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID else CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+        val resolvedSha = when (resolvedRefId) {
+            CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID -> CharacterVoiceAssignment.JENNY_FEMALE_REF_SHA256
+            CharacterVoiceAssignment.DEFAULT_MALE_REF_ID -> CharacterVoiceAssignment.ANON_MALE_REF_SHA256
+            else -> existing?.referenceAudioSha256 ?: CharacterVoiceAssignment.ANON_MALE_REF_SHA256
+        }
+
         val updatedAssignment = if (existing != null) {
             existing.copy(
                 displayName = displayName?.trim()?.ifBlank { null } ?: existing.displayName,
@@ -740,18 +757,38 @@ object VoiceProfileRepository {
                 speed = clampedSpeed,
                 pitch = clampedPitch,
                 isUserOverride = true,
-                lastDetectedTimestamp = System.currentTimeMillis()
+                lastDetectedTimestamp = System.currentTimeMillis(),
+                referenceVoiceId = resolvedRefId,
+                referenceAudioSha256 = resolvedSha,
+                voicePresentation = voicePresentation?.trim()?.ifBlank { null } ?: existing.voicePresentation,
+                vocalStyleDescription = vocalStyleDescription?.trim()?.ifBlank { null } ?: existing.vocalStyleDescription,
+                voiceEngine = voiceEngine?.trim()?.ifBlank { null } ?: existing.voiceEngine,
+                defaultEmotion = defaultEmotion?.trim()?.ifBlank { null } ?: existing.defaultEmotion,
+                exaggeration = (exaggeration ?: existing.exaggeration).coerceIn(0.1f, 2.0f),
+                cfgWeight = (cfgWeight ?: existing.cfgWeight).coerceIn(0.1f, 1.5f),
+                pronunciationOverrides = pronunciationOverrides ?: existing.pronunciationOverrides
             )
         } else {
+            val pres = voicePresentation?.trim()?.ifBlank { null } ?: if (clampedSid in 0..4) "female" else "male"
             CharacterVoiceAssignment(
                 characterName = norm,
                 displayName = displayName?.trim()?.ifBlank { null } ?: characterName.trim(),
+                gameNamespace = activeGameNamespace,
                 speakerId = clampedSid,
                 speed = clampedSpeed,
                 pitch = clampedPitch,
                 isUserOverride = true,
                 lastDetectedTimestamp = System.currentTimeMillis(),
-                characterRoleNote = "User Override (sid: $clampedSid)"
+                characterRoleNote = "User Override (sid: $clampedSid)",
+                referenceVoiceId = resolvedRefId,
+                referenceAudioSha256 = resolvedSha,
+                voicePresentation = pres,
+                vocalStyleDescription = vocalStyleDescription?.trim()?.ifBlank { null } ?: "User Override ($pres • sid: $clampedSid)",
+                voiceEngine = voiceEngine?.trim()?.ifBlank { null } ?: "chatterbox_local_server",
+                defaultEmotion = defaultEmotion?.trim()?.ifBlank { null } ?: "neutral",
+                exaggeration = (exaggeration ?: 0.50f).coerceIn(0.1f, 2.0f),
+                cfgWeight = (cfgWeight ?: 0.40f).coerceIn(0.1f, 1.5f),
+                pronunciationOverrides = pronunciationOverrides ?: emptyMap()
             )
         }
 
@@ -762,6 +799,84 @@ object VoiceProfileRepository {
 
         saveCharacterAssignmentsToDisk(context, updatedList)
         return updatedAssignment
+    }
+
+    fun updateCharacterVoiceProfile(
+        context: Context,
+        updated: CharacterVoiceAssignment
+    ): CharacterVoiceAssignment {
+        val norm = CharacterVoiceAssignment.normalizeName(updated.characterName)
+        val currentList = _characterAssignments.value
+        val finalProfile = updated.copy(
+            characterName = norm,
+            isUserOverride = true,
+            lastDetectedTimestamp = System.currentTimeMillis()
+        )
+        val updatedList = currentList.filterNot { it.characterName == norm } + finalProfile
+        _characterAssignments.value = updatedList
+        if (_activeCharacterAssignment.value?.characterName == norm) {
+            _activeCharacterAssignment.value = finalProfile
+        }
+        saveCharacterAssignmentsToDisk(context, updatedList)
+        return finalProfile
+    }
+
+    /**
+     * Resolves or extracts a character's reference voice `.wav` file on disk so it can be
+     * played directly ("Play Reference Voice Clip") or inspected for SHA-256 and RMS verification.
+     */
+    fun resolveReferenceVoiceFile(context: Context, referenceVoiceId: String): File? {
+        val cleanId = referenceVoiceId.trim().removeSuffix(".wav")
+        if (cleanId.isBlank()) return null
+
+        val customDir = File(context.filesDir, "custom_voices").apply { mkdirs() }
+        val customFile = File(customDir, "$cleanId.wav")
+        if (customFile.exists() && customFile.length() > 100L) {
+            return customFile
+        }
+
+        return try {
+            context.assets.open("reference_voices/$cleanId.wav").use { input ->
+                FileOutputStream(customFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            if (customFile.exists() && customFile.length() > 100L) customFile else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Plays the raw reference voice clip (`.wav` prompt) for a character profile separately from
+     * synthesized Hindi speech so the user can audition the source speaker identity directly.
+     */
+    fun playCharacterReferenceVoiceClip(
+        context: Context,
+        assignment: CharacterVoiceAssignment,
+        onFinished: (Boolean) -> Unit = {}
+    ) {
+        val wavFile = resolveReferenceVoiceFile(context, assignment.referenceVoiceId)
+        if (wavFile == null || !wavFile.exists()) {
+            onFinished(false)
+            return
+        }
+        playRecordedReferenceSample(wavFile.absolutePath) {
+            onFinished(true)
+        }
+    }
+
+    /**
+     * Returns an honest summary of how many acoustically distinct reference voice clips (by SHA-256)
+     * are currently assigned across all character profiles.
+     */
+    fun getUniqueReferenceVoiceSummary(): Triple<Int, Int, String> {
+        val list = _characterAssignments.value
+        val uniqueCount = CharacterVoiceAssignment.countUniqueReferenceVoices(list)
+        val totalCount = list.size
+        val summary = "$uniqueCount unique reference voice clips across $totalCount character profiles " +
+            "(import consenting .wav clips to give additional characters dedicated voices)"
+        return Triple(uniqueCount, totalCount, summary)
     }
 
     fun renameCharacter(

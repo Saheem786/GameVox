@@ -18,35 +18,41 @@ enum class SpeechEmotion(
     val ssmlVolume: String,
     val cloudPitchSemitones: Double,
     val cloudSpeakingRate: Double,
-    val cloudVolumeGainDb: Double
+    val cloudVolumeGainDb: Double,
+    val chatterboxExaggeration: Float = 0.50f,
+    val chatterboxCfgWeight: Float = 0.40f
 ) {
-    EXCITED(
-        code = "excited",
-        displayLabel = "Excited (!)",
-        badgeColorHex = "#FFB300",
-        basePitchMultiplier = 1.2f,
-        baseSpeechRate = 1.1f,
+    NEUTRAL(
+        code = "neutral",
+        displayLabel = "Neutral",
+        badgeColorHex = "#00E676",
+        basePitchMultiplier = 1.0f,
+        baseSpeechRate = 1.0f,
         baseVolume = 1.0f,
-        ssmlRate = "110%",
-        ssmlPitch = "+20%",
-        ssmlVolume = "loud",
-        cloudPitchSemitones = 3.2,
-        cloudSpeakingRate = 1.12,
-        cloudVolumeGainDb = 1.5
+        ssmlRate = "medium",
+        ssmlPitch = "default",
+        ssmlVolume = "medium",
+        cloudPitchSemitones = 0.0,
+        cloudSpeakingRate = 1.0,
+        cloudVolumeGainDb = 0.0,
+        chatterboxExaggeration = 0.45f,
+        chatterboxCfgWeight = 0.45f
     ),
-    ANGRY(
-        code = "angry",
-        displayLabel = "Angry / Urgent (!)",
-        badgeColorHex = "#FF5252",
-        basePitchMultiplier = 1.2f,
-        baseSpeechRate = 1.1f,
+    HAPPY(
+        code = "happy",
+        displayLabel = "Happy / Warm",
+        badgeColorHex = "#69F0AE",
+        basePitchMultiplier = 1.12f,
+        baseSpeechRate = 1.05f,
         baseVolume = 1.0f,
-        ssmlRate = "110%",
-        ssmlPitch = "+18%",
-        ssmlVolume = "x-loud",
-        cloudPitchSemitones = 2.4,
-        cloudSpeakingRate = 1.14,
-        cloudVolumeGainDb = 2.5
+        ssmlRate = "105%",
+        ssmlPitch = "+12%",
+        ssmlVolume = "medium",
+        cloudPitchSemitones = 1.8,
+        cloudSpeakingRate = 1.05,
+        cloudVolumeGainDb = 0.5,
+        chatterboxExaggeration = 0.65f,
+        chatterboxCfgWeight = 0.35f
     ),
     SAD(
         code = "sad",
@@ -60,7 +66,41 @@ enum class SpeechEmotion(
         ssmlVolume = "medium",
         cloudPitchSemitones = -3.5,
         cloudSpeakingRate = 0.80,
-        cloudVolumeGainDb = -1.5
+        cloudVolumeGainDb = -1.5,
+        chatterboxExaggeration = 0.62f,
+        chatterboxCfgWeight = 0.48f
+    ),
+    ANGRY(
+        code = "angry",
+        displayLabel = "Angry / Urgent (!)",
+        badgeColorHex = "#FF5252",
+        basePitchMultiplier = 1.2f,
+        baseSpeechRate = 1.1f,
+        baseVolume = 1.0f,
+        ssmlRate = "110%",
+        ssmlPitch = "+18%",
+        ssmlVolume = "x-loud",
+        cloudPitchSemitones = 2.4,
+        cloudSpeakingRate = 1.14,
+        cloudVolumeGainDb = 2.5,
+        chatterboxExaggeration = 0.85f,
+        chatterboxCfgWeight = 0.25f
+    ),
+    FEAR(
+        code = "fear",
+        displayLabel = "Fear / Scared",
+        badgeColorHex = "#FFAB40",
+        basePitchMultiplier = 1.15f,
+        baseSpeechRate = 1.08f,
+        baseVolume = 0.92f,
+        ssmlRate = "108%",
+        ssmlPitch = "+15%",
+        ssmlVolume = "medium",
+        cloudPitchSemitones = 2.0,
+        cloudSpeakingRate = 1.08,
+        cloudVolumeGainDb = 0.0,
+        chatterboxExaggeration = 0.80f,
+        chatterboxCfgWeight = 0.28f
     ),
     WHISPER(
         code = "whisper",
@@ -74,21 +114,41 @@ enum class SpeechEmotion(
         ssmlVolume = "soft",
         cloudPitchSemitones = -2.0,
         cloudSpeakingRate = 0.75,
-        cloudVolumeGainDb = -8.0
+        cloudVolumeGainDb = -8.0,
+        chatterboxExaggeration = 0.28f,
+        chatterboxCfgWeight = 0.60f
     ),
-    NEUTRAL(
-        code = "neutral",
-        displayLabel = "Neutral",
-        badgeColorHex = "#00E676",
-        basePitchMultiplier = 1.0f,
-        baseSpeechRate = 1.0f,
+    EXCITED(
+        code = "excited",
+        displayLabel = "Excited (!)",
+        badgeColorHex = "#FFB300",
+        basePitchMultiplier = 1.2f,
+        baseSpeechRate = 1.1f,
         baseVolume = 1.0f,
-        ssmlRate = "medium",
-        ssmlPitch = "default",
+        ssmlRate = "110%",
+        ssmlPitch = "+20%",
+        ssmlVolume = "loud",
+        cloudPitchSemitones = 3.2,
+        cloudSpeakingRate = 1.12,
+        cloudVolumeGainDb = 1.5,
+        chatterboxExaggeration = 0.78f,
+        chatterboxCfgWeight = 0.30f
+    ),
+    SERIOUS(
+        code = "serious",
+        displayLabel = "Serious / Composed",
+        badgeColorHex = "#90CAF9",
+        basePitchMultiplier = 0.94f,
+        baseSpeechRate = 0.94f,
+        baseVolume = 1.0f,
+        ssmlRate = "94%",
+        ssmlPitch = "-6%",
         ssmlVolume = "medium",
-        cloudPitchSemitones = 0.0,
-        cloudSpeakingRate = 1.0,
-        cloudVolumeGainDb = 0.0
+        cloudPitchSemitones = -1.2,
+        cloudSpeakingRate = 0.94,
+        cloudVolumeGainDb = 0.0,
+        chatterboxExaggeration = 0.38f,
+        chatterboxCfgWeight = 0.55f
     );
 
     companion object {
@@ -101,7 +161,8 @@ enum class SpeechEmotion(
 /**
  * Full output of [EmotionSpeechEngine.analyzeEmotionAndBuildSsml]:
  * includes the detected [SpeechEmotion], clean dialogue text, W3C SSML `<speak><prosody ...>` markup,
- * and final gender-combined pitch, speechRate, and volume values for both Android TTS and Cloud TTS.
+ * final gender-combined pitch, speechRate, and volume values for Android TTS, plus calibrated
+ * Chatterbox Multilingual V3 `exaggeration` and `cfgWeight` parameters for neural voice synthesis.
  */
 data class EmotionAnalysisResult(
     val emotion: SpeechEmotion,
@@ -110,18 +171,25 @@ data class EmotionAnalysisResult(
     val effectivePitch: Float,
     val effectiveSpeechRate: Float,
     val effectiveVolume: Float,
-    val analysisReason: String
+    val analysisReason: String,
+    val chatterboxExaggeration: Float = emotion.chatterboxExaggeration,
+    val chatterboxCfgWeight: Float = emotion.chatterboxCfgWeight
 )
 
 /**
  * Analyzes game dialogue punctuation & emotional vocabulary to drive expressive TTS voice modulation:
- * 1. `'!'` or excited/angry cues -> [SpeechEmotion.EXCITED] / [SpeechEmotion.ANGRY] (`pitch = 1.2f`, `rate = 1.1f`)
- * 2. `'...'` (Ellipsis) or sad/hesitant cues -> [SpeechEmotion.SAD] (`pitch = 0.8f`, `rate = 0.8f`)
- * 3. Whisper markers (`*whispers*`, `(quietly)`, `shh`) -> [SpeechEmotion.WHISPER] (`volume = 0.35f`, `rate = 0.72f`)
- * 4. Normal dialogue -> [SpeechEmotion.NEUTRAL]
+ * Supports 8 acting categories:
+ * - [SpeechEmotion.NEUTRAL]
+ * - [SpeechEmotion.HAPPY]
+ * - [SpeechEmotion.SAD]
+ * - [SpeechEmotion.ANGRY]
+ * - [SpeechEmotion.FEAR]
+ * - [SpeechEmotion.WHISPER]
+ * - [SpeechEmotion.EXCITED]
+ * - [SpeechEmotion.SERIOUS]
  *
- * Also wraps spoken text into standard W3C SSML (`<speak><prosody ...>...</prosody></speak>`)
- * while preserving the character's 18-year-old Female (`Jenny`) or Male (`Anon`) vocal baseline.
+ * Maps emotion categories to ResembleAI Chatterbox Multilingual V3 `exaggeration` (0.25..0.90)
+ * and `cfg_weight` (0.25..0.60) conditioning parameters, as well as SSML/prosody for fallback TTS.
  */
 object EmotionSpeechEngine {
 
@@ -138,8 +206,14 @@ object EmotionSpeechEngine {
 
     private val ANGRY_KEYWORDS = listOf(
         "angry", "furious", "hate", "kill", "destroy", "dare", "alert", "attack",
-        "stop!", "get out", "shut up", "damn", "bastard", "enough!", "traitor",
-        "हिम्मत कैसे हुई", "अलर्ट", "बकवास बंद", "मार डालूंगा", "गुस्सा"
+        "stop!", "get out", "shut up", "damn", "bastard", "enough!", "traitor", "beat me",
+        "हिम्मत कैसे हुई", "अलर्ट", "बकवास बंद", "मार डालूंगा", "गुस्सा", "यहाँ से निकलो"
+    )
+
+    private val FEAR_KEYWORDS = listOf(
+        "terrified", "panic", "monster", "run away", "watch out!", "behind you!",
+        "worried about you", "something is moving", "danger!", "help me!", "trap!",
+        "फिक्र हो रही थी", "बचाओ", "खतरा", "पीछे रहो"
     )
 
     private val SAD_HESITANT_KEYWORDS = listOf(
@@ -147,6 +221,18 @@ object EmotionSpeechEngine {
         "miss you", "alone", "lonely", "afraid", "scared", "please...", "maybe...",
         "um,", "uh,", "i don't know", "forgive me", "goodbye", "lost everything",
         "फ्यूनरल", "सॉरी", "दुख", "माफ़", "रो", "अकेला", "अलविदा", "डर"
+    )
+
+    private val HAPPY_KEYWORDS = listOf(
+        "glad", "thank goodness", "happy", "smile", "safe now", "good to see you",
+        "welcome home", "proud of you", "great job",
+        "खुश", "शुक्र है", "बधाई", "स्वागत"
+    )
+
+    private val SERIOUS_KEYWORDS = listOf(
+        "protocol", "security override", "mission objective", "commander", "report",
+        "understand this", "listen carefully", "ancient temple", "this ends right here",
+        "प्रोटोकॉल", "सिक्योरिटी ओवरराइड", "ध्यान से सुनो"
     )
 
     private val EXCITED_KEYWORDS = listOf(
@@ -157,7 +243,7 @@ object EmotionSpeechEngine {
 
     /**
      * Detects the emotional state from [sourceEnglishText] + [spokenText] and constructs
-     * both SSML markup and gender-aware pitch/rate/volume parameters.
+     * both SSML markup, gender-aware pitch/rate/volume parameters, and Chatterbox conditioning weights.
      */
     fun analyzeEmotionAndBuildSsml(
         spokenText: String,
@@ -165,13 +251,18 @@ object EmotionSpeechEngine {
         gender: SpeakerGender = SpeakerGender.MALE_18,
         profilePitchOverride: Float? = null,
         profileRateOverride: Float? = null,
-        masterVolume: Float = 1.0f
+        masterVolume: Float = 1.0f,
+        explicitEmotionOverride: SpeechEmotion? = null
     ): EmotionAnalysisResult {
         val cleanSpoken = stripStageDirections(spokenText)
         val combinedText = "$sourceEnglishText $spokenText".trim()
         val lowerCombined = combinedText.lowercase(Locale.ROOT)
 
-        val (emotion, reason) = detectEmotion(combinedText, lowerCombined)
+        val (emotion, reason) = if (explicitEmotionOverride != null) {
+            explicitEmotionOverride to "Explicit emotion override → ${explicitEmotionOverride.displayLabel}"
+        } else {
+            detectEmotion(combinedText, lowerCombined)
+        }
 
         val (effectivePitch, effectiveRate, emotionVolume) = computeGenderEmotionProsody(
             emotion = emotion,
@@ -197,7 +288,9 @@ object EmotionSpeechEngine {
             effectivePitch = effectivePitch,
             effectiveSpeechRate = effectiveRate,
             effectiveVolume = effectiveVolume,
-            analysisReason = reason
+            analysisReason = reason,
+            chatterboxExaggeration = emotion.chatterboxExaggeration,
+            chatterboxCfgWeight = emotion.chatterboxCfgWeight
         )
     }
 
@@ -221,25 +314,35 @@ object EmotionSpeechEngine {
             return SpeechEmotion.SAD to "Ellipsis '...' detected → Sad / Hesitant (pitch 0.8x, rate 0.8x)"
         }
 
-        // 3. Check Exclamation '!' or Angry/Excited shouting
+        // 3. Check Exclamation '!' or Angry/Excited/Fear shouting
         val hasExclamation = combinedText.contains("!")
         val hasAngryKeyword = ANGRY_KEYWORDS.any { lowerCombined.contains(it) }
         val hasExcitedKeyword = EXCITED_KEYWORDS.any { lowerCombined.contains(it) }
+        val hasFearKeyword = FEAR_KEYWORDS.any { lowerCombined.contains(it) }
+        val hasHappyKeyword = HAPPY_KEYWORDS.any { lowerCombined.contains(it) }
+        val hasSeriousKeyword = SERIOUS_KEYWORDS.any { lowerCombined.contains(it) }
+
         val uppercaseShoutWords = combinedText.split(Regex("\\s+")).count { word ->
             val letters = word.filter { it.isLetter() }
             letters.length >= 3 && letters.all { it.isUpperCase() }
         }
 
         if (hasExclamation || uppercaseShoutWords >= 2) {
-            return if (hasAngryKeyword && !hasExcitedKeyword) {
-                SpeechEmotion.ANGRY to "Exclamation '!' + urgent/angry tone → Angry (pitch 1.2x, rate 1.1x)"
-            } else {
-                SpeechEmotion.EXCITED to "Exclamation '!' detected → Excited (pitch 1.2x, rate 1.1x)"
+            return when {
+                hasFearKeyword ->
+                    SpeechEmotion.FEAR to "Urgent concern/fear phrasing → Fear / Scared"
+                hasAngryKeyword && !hasExcitedKeyword ->
+                    SpeechEmotion.ANGRY to "Exclamation '!' + urgent/angry tone → Angry (pitch 1.2x, rate 1.1x)"
+                else ->
+                    SpeechEmotion.EXCITED to "Exclamation '!' detected → Excited (pitch 1.2x, rate 1.1x)"
             }
         }
 
         if (hasSadKeyword) {
             return SpeechEmotion.SAD to "Sad/somber context detected → Sad (pitch 0.8x, rate 0.8x)"
+        }
+        if (hasFearKeyword) {
+            return SpeechEmotion.FEAR to "Urgent concern/fear phrasing → Fear / Scared"
         }
         if (hasAngryKeyword) {
             return SpeechEmotion.ANGRY to "Urgent/angry phrasing → Angry (pitch 1.2x, rate 1.1x)"
@@ -247,18 +350,16 @@ object EmotionSpeechEngine {
         if (hasExcitedKeyword) {
             return SpeechEmotion.EXCITED to "Excited phrasing detected → Excited (pitch 1.2x, rate 1.1x)"
         }
+        if (hasHappyKeyword) {
+            return SpeechEmotion.HAPPY to "Warm/positive phrasing → Happy"
+        }
+        if (hasSeriousKeyword) {
+            return SpeechEmotion.SERIOUS to "Tactical/serious phrasing → Serious"
+        }
 
         return SpeechEmotion.NEUTRAL to "Normal sentence → Neutral (18yo natural baseline)"
     }
 
-    /**
-     * Combines the character's 18-year-old Female (`Jenny`) or Male (`Anon`) vocal baseline
-     * with the detected [SpeechEmotion] modulation:
-     * - **Excited / Angry**: High pitch (~1.2f) & faster speed (~1.1f)
-     * - **Sad / Hesitant**: Low pitch (~0.8f) & slower speed (~0.8f)
-     * - **Whisper**: Low volume (0.35f) & very slow speed (0.72f)
-     * - **Neutral**: Female `1.18f` / `1.0f`, Male `0.90f` / `1.0f`
-     */
     private fun computeGenderEmotionProsody(
         emotion: SpeechEmotion,
         gender: SpeakerGender,
@@ -278,6 +379,18 @@ object EmotionSpeechEngine {
                 Triple(p, r, 1.0f)
             }
 
+            SpeechEmotion.HAPPY -> {
+                val p = (baseGenderPitch * 1.05f).coerceIn(0.85f, 1.32f)
+                val r = (baseGenderRate * 1.05f).coerceIn(0.95f, 1.18f)
+                Triple(p, r, 1.0f)
+            }
+
+            SpeechEmotion.FEAR -> {
+                val p = (baseGenderPitch * 1.10f).coerceIn(0.92f, 1.36f)
+                val r = (baseGenderRate * 1.08f).coerceIn(1.02f, 1.22f)
+                Triple(p, r, 0.94f)
+            }
+
             SpeechEmotion.SAD -> {
                 val p = when (gender) {
                     SpeakerGender.FEMALE_18 -> (baseGenderPitch * 0.74f).coerceIn(0.80f, 0.94f)
@@ -295,16 +408,18 @@ object EmotionSpeechEngine {
                 Triple(p, 0.72f, 0.35f)
             }
 
+            SpeechEmotion.SERIOUS -> {
+                val p = (baseGenderPitch * 0.94f).coerceIn(0.68f, 1.22f)
+                val r = (baseGenderRate * 0.94f).coerceIn(0.82f, 1.05f)
+                Triple(p, r, 1.0f)
+            }
+
             SpeechEmotion.NEUTRAL -> {
                 Triple(baseGenderPitch.coerceIn(0.6f, 1.5f), baseGenderRate.coerceIn(0.7f, 1.3f), 1.0f)
             }
         }
     }
 
-    /**
-     * Converts [cleanText] into standard W3C SSML (`<speak><prosody ...>...</prosody></speak>`),
-     * inserting dramatic `<break>` pauses on ellipses (`...`) and `<emphasis>` on excited phrases.
-     */
     fun buildSsmlString(
         cleanText: String,
         emotion: SpeechEmotion,
@@ -321,7 +436,8 @@ object EmotionSpeechEngine {
             .replace(", ", ", <break time=\"140ms\"/>")
 
         val body = when (emotion) {
-            SpeechEmotion.EXCITED, SpeechEmotion.ANGRY -> "<emphasis level=\"strong\">$withPauses</emphasis>"
+            SpeechEmotion.EXCITED, SpeechEmotion.ANGRY, SpeechEmotion.FEAR ->
+                "<emphasis level=\"strong\">$withPauses</emphasis>"
             else -> withPauses
         }
 
@@ -329,16 +445,20 @@ object EmotionSpeechEngine {
             SpeechEmotion.SAD -> "slow"
             SpeechEmotion.WHISPER -> "x-slow"
             SpeechEmotion.EXCITED, SpeechEmotion.ANGRY -> "110%"
+            SpeechEmotion.FEAR -> "108%"
+            SpeechEmotion.HAPPY -> "105%"
+            SpeechEmotion.SERIOUS -> "94%"
             SpeechEmotion.NEUTRAL -> "${(effectiveRate * 100).toInt()}%"
         }
 
         val pitchAttr = when (emotion) {
             SpeechEmotion.SAD -> "low"
-            SpeechEmotion.EXCITED, SpeechEmotion.ANGRY -> {
-                val pct = ((effectivePitch - 1.0f) * 100f).toInt().coerceIn(10, 35)
+            SpeechEmotion.EXCITED, SpeechEmotion.ANGRY, SpeechEmotion.FEAR, SpeechEmotion.HAPPY -> {
+                val pct = ((effectivePitch - 1.0f) * 100f).toInt().coerceIn(8, 35)
                 "+${pct}%"
             }
             SpeechEmotion.WHISPER -> "-8%"
+            SpeechEmotion.SERIOUS -> "-6%"
             SpeechEmotion.NEUTRAL -> when (gender) {
                 SpeakerGender.FEMALE_18 -> "+14%"
                 SpeakerGender.MALE_18 -> "-8%"
