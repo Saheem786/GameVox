@@ -703,25 +703,7 @@ class ScreenTranslatorService : Service() {
         var image: Image? = null
         return try {
             image = reader.acquireLatestImage() ?: return null
-            val width = image.width
-            val height = image.height
-            val planes = image.planes
-            val buffer = planes[0].buffer
-            val pixelStride = planes[0].pixelStride
-            val rowStride = planes[0].rowStride
-            val rowPadding = rowStride - pixelStride * width
-
-            val paddedWidth = width + rowPadding / pixelStride
-            val fullBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
-            fullBitmap.copyPixelsFromBuffer(buffer)
-
-            if (rowPadding == 0) {
-                fullBitmap
-            } else {
-                val cropped = Bitmap.createBitmap(fullBitmap, 0, 0, width, height)
-                fullBitmap.recycle()
-                cropped
-            }
+            ImageProcessor.extractBitmapFromMediaImage(image)
         } catch (sec: SecurityException) {
             throw sec
         } catch (_: Exception) {

@@ -109,6 +109,18 @@ class SherpaSupertonicBackend(
         private set
 
     @Volatile
+    var lastRequestedSid: Int = -1
+        private set
+
+    @Volatile
+    var lastValidatedNativeSid: Int = -1
+        private set
+
+    @Volatile
+    var lastAudioDurationMs: Long = 0L
+        private set
+
+    @Volatile
     private var cachedSampleRate: Int = 0
 
     @Volatile
@@ -311,6 +323,8 @@ class SherpaSupertonicBackend(
 
             val availableSpeakers = tts.numSpeakers().coerceAtLeast(1)
             val validatedSid = sid.coerceIn(0, availableSpeakers - 1)
+            lastRequestedSid = sid
+            lastValidatedNativeSid = validatedSid
             val validatedSpeed = speed.coerceIn(0.65f, 1.45f)
             val currentSampleRate = tts.sampleRate().coerceAtLeast(8000)
 
@@ -418,6 +432,7 @@ class SherpaSupertonicBackend(
                 val totalSynthTime = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
                 lastTotalSynthesisTimeMs = totalSynthTime
                 val audioDurationMs = (effectiveSamples * 1000L) / currentSampleRate
+                lastAudioDurationMs = audioDurationMs
                 val rtf = if (audioDurationMs > 0) totalSynthTime.toFloat() / audioDurationMs else 0.0f
                 lastSynthesisRtf = rtf
 
@@ -520,6 +535,8 @@ class SherpaSupertonicBackend(
         val tts = offlineTts ?: throw IllegalStateException("OfflineTts is null")
         val availableSpeakers = tts.numSpeakers().coerceAtLeast(1)
         val validatedSid = sid.coerceIn(0, availableSpeakers - 1)
+        lastRequestedSid = sid
+        lastValidatedNativeSid = validatedSid
 
         val config = GenerationConfig(
             silenceScale = 0.2f,

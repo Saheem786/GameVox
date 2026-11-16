@@ -72,13 +72,19 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.TranslatorAppState
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfileRepository
+import com.example.engine.CharacterVoiceRouter
 import com.example.service.ForegroundTtsManager
 import com.example.service.FreeVoiceBackend
 import com.example.service.SupertonicModelManager
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -177,6 +183,9 @@ fun DiagnosisScreen(
                     },
                     onOpenAbVoiceTesting = onOpenAbVoiceTesting
                 )
+
+                // 1b. Preview vs Live Voice Comparison Diagnostic Card (Anon & Jenny)
+                PreviewVsLiveVoiceComparisonCard()
 
                 // 2. Capture Status & Error Card + Quick Controls
                 Card(
@@ -1060,6 +1069,119 @@ private fun LocalWifiVoiceServerDiagnosticCard(
                         .testTag("diagnosis_open_ab_lab_button")
                 ) {
                     Text("Open A/B Neural Voice Lab & Windows Server Setup")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreviewVsLiveVoiceComparisonCard() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val comparisonReport by CharacterVoiceRouter.lastComparisonReport.collectAsStateWithLifecycle()
+    val auditLogs by CharacterVoiceRouter.auditLogs.collectAsStateWithLifecycle()
+    var isRunningComparison by remember { mutableStateOf(false) }
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("preview_vs_live_comparison_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Preview vs Live Voice Comparison (Anon & Jenny)",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                text = "Synthesizes the same Hindi sentence through both the Voice Manager Preview route and the Live Game Dubbing route for Anon (Male Lead, SID #5) and Jenny (Female Companion, SID #1), exports paired WAV files, and verifies SID/engine parity.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Button(
+                onClick = {
+                    isRunningComparison = true
+                    scope.launch {
+                        withContext(Dispatchers.Default) {
+                            CharacterVoiceRouter.runFullAnonAndJennyComparison(context)
+                        }
+                        isRunningComparison = false
+                    }
+                },
+                enabled = !isRunningComparison,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("run_preview_vs_live_comparison_button")
+            ) {
+                Text(
+                    text = if (isRunningComparison) {
+                        "Comparing Preview vs Live Voice Routes..."
+                    } else {
+                        "Run Preview vs Live Voice Comparison (Anon & Jenny)"
+                    },
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            comparisonReport?.let { report ->
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (report.overallPassed) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                    } else {
+                        MaterialTheme.colorScheme.errorContainer
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("preview_vs_live_comparison_result_box")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = report.summaryReport,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        DiagnosisField(
+                            label = "Anon (Male Lead) — Preview vs Live",
+                            value = "Preview SID=${report.anonComparison.previewActualSid} vs Live SID=${report.anonComparison.liveActualSid} • Engine=${report.anonComparison.liveEngine} • RMS=${String.format(Locale.US, "%.4f", report.anonComparison.liveAudioRms)} • WAV=${report.anonComparison.liveWavPath.substringAfterLast('/')}"
+                        )
+                        DiagnosisField(
+                            label = "Jenny (Female Companion) — Preview vs Live",
+                            value = "Preview SID=${report.jennyComparison.previewActualSid} vs Live SID=${report.jennyComparison.liveActualSid} • Engine=${report.jennyComparison.liveEngine} • RMS=${String.format(Locale.US, "%.4f", report.jennyComparison.liveAudioRms)} • WAV=${report.jennyComparison.liveWavPath.substringAfterLast('/')}"
+                        )
+                    }
+                }
+            }
+
+            if (auditLogs.isNotEmpty()) {
+                HorizontalDivider()
+                Text(
+                    text = "Recent Spoken Utterance Voice Audit Logs (${auditLogs.size})",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                auditLogs.take(4).forEach { entry ->
+                    Text(
+                        text = "• [${entry.ocrCharacterName} → ${entry.normalizedCharacterName}] rule=${entry.resolutionRule} • reqSid=${entry.requestedSid} actSid=${entry.actualSidPassedToNative} • backend=${entry.actualBackend} • RMS=${String.format(Locale.US, "%.4f", entry.outputPcmRms)}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
         }

@@ -234,13 +234,22 @@ object SpeakerHeuristicEngine {
 
     /**
      * Determines whether the character is Female (`SpeakerGender.FEMALE_18`, e.g. `'Jenny'`)
-     * or Male (`SpeakerGender.MALE_18`, e.g. `'Anon'`).
+     * or Male (`SpeakerGender.MALE_18`, e.g. `'Anon'`) using saved profiles, user overrides,
+     * and explicit character/title tables — NEVER guessing gender from unknown name suffixes alone.
      */
     fun detectCharacterGender(speakerTag: String?, dialogue: String = ""): SpeakerGender {
         if (!speakerTag.isNullOrBlank()) {
             val normFull = normalizeSpeakerKey(speakerTag)
             val firstWord = normFull.split(" ").firstOrNull().orEmpty()
 
+            // 1. Check saved character profiles & manual user assignments first
+            val savedProfile = com.example.data.VoiceProfileRepository.findExistingAssignment(normFull)
+                ?: if (firstWord.isNotBlank()) com.example.data.VoiceProfileRepository.findExistingAssignment(firstWord) else null
+            if (savedProfile != null) {
+                return if (savedProfile.isFemale) SpeakerGender.FEMALE_18 else SpeakerGender.MALE_18
+            }
+
+            // 2. Check explicit known character name tables
             if (FEMALE_CHARACTER_NAMES.contains(normFull) || FEMALE_CHARACTER_NAMES.contains(firstWord)) {
                 return SpeakerGender.FEMALE_18
             }
@@ -248,7 +257,7 @@ object SpeakerHeuristicEngine {
                 return SpeakerGender.MALE_18
             }
 
-            // Check female title keywords inside multi-word tags (e.g. "Young Girl", "Sister Jenny", "Queen")
+            // 3. Check explicit role/title keywords inside multi-word tags (e.g. "Young Girl", "Sister Jenny", "Queen")
             if (normFull.contains("girl") || normFull.contains("female") || normFull.contains("woman") ||
                 normFull.contains("sister") || normFull.contains("mom") || normFull.contains("mother") ||
                 normFull.contains("queen") || normFull.contains("princess") || normFull.contains("lady") ||
@@ -266,28 +275,26 @@ object SpeakerHeuristicEngine {
                 return SpeakerGender.MALE_18
             }
 
-            // Phonetic/morphological name suffix heuristics for female first names (e.g. -a, -i, -ie, -y, -ia, -na, -ra, -la, -elle)
-            if (firstWord.length >= 3) {
-                val isFemaleSuffix = firstWord.endsWith("a") ||
-                    firstWord.endsWith("i") ||
-                    firstWord.endsWith("ie") ||
-                    firstWord.endsWith("y") ||
-                    firstWord.endsWith("ee") ||
-                    firstWord.endsWith("lyn") ||
-                    firstWord.endsWith("elle") ||
-                    firstWord.endsWith("ette")
-                if (isFemaleSuffix) {
-                    return SpeakerGender.FEMALE_18
-                }
-            }
-
-            return dynamicTagGenderMemory.getOrPut(normFull) {
-                // Unknown speaker: do not infer gender with certainty; assign default profile with user override
-                SpeakerGender.MALE_18
-            }
+            // 4. Unknown speaker: do NOT guess gender from name suffixes (-a, -i, -y, etc.).
+            // Use saved manual overrides if present in memory, otherwise default deterministically until user assigns.
+            return dynamicTagGenderMemory[normFull] ?: SpeakerGender.MALE_18
         }
 
         return SpeakerGender.MALE_18
+    }
+
+    /**
+     * Public helper used by [CharacterVoiceRouter] to extract `(speakerTag, cleanedDialogue)`
+     * from a raw OCR subtitle string BEFORE stripping the speaker label.
+     */
+    fun extractCharacterTagAndDialogue(rawScannedText: String): Pair<String, String>? {
+        val extraction = extractCharacterTagAndDialogue(
+            rawScannedText = rawScannedText,
+            availableVoices = emptyList(),
+            customTagVoiceBindings = emptyMap()
+        )
+        val tag = extraction.speakerTag?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return tag to extraction.dialogueText
     }
 
     private data class TagExtraction(
@@ -447,9 +454,19 @@ object SpeakerHeuristicEngine {
         if (!speakerTag.isNullOrBlank()) {
             val escapedTag = Regex.escape(speakerTag.trim())
             working = working.replaceFirst(
-                Regex("^\\[?$escapedTag\\]?\\s*[:：\\-–—]?\\s*", RegexOption.IGNORE_CASE),
+                Regex("^[\\[<(\\u3010]?$escapedTag[\\]>\\)\\u3011]?\\s*[:：\\-–—]?\\s*", RegexOption.IGNORE_CASE),
                 ""
             ).trim()
+        }
+
+        // Also strip if dialogue still begins with "[Name]: ..." or "<Name> ..."
+        val bracketMatch = BRACKET_TAG_REGEX.find(working)
+        if (bracketMatch != null) {
+            val candidateTag = bracketMatch.groupValues[1].trim()
+            val body = bracketMatch.groupValues[2].trim()
+            if (isValidSpeakerNameTag(candidateTag) && body.isNotBlank()) {
+                working = body
+            }
         }
 
         // Also strip if dialogue still begins with "Name: ..."

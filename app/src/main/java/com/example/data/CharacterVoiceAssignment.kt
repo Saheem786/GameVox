@@ -39,11 +39,18 @@ data class CharacterVoiceAssignment(
     val cfgWeight: Float = 0.40f,
     val speakerConsentConfirmed: Boolean = true
 ) {
+    val isFemale: Boolean
+        get() = voicePresentation.equals("female", ignoreCase = true) || speakerId in 0..4
+
+    val isUserOverridden: Boolean
+        get() = isUserOverride
+
     init {
         require(speakerId in 0..9) { "Supertonic 3 speakerId must be within 0..9, got: $speakerId" }
     }
 
     companion object {
+        const val DEFAULT_GAME_NAMESPACE = "default_game"
         const val DEFAULT_MALE_REF_ID = "anon_male_ref"
         const val DEFAULT_FEMALE_REF_ID = "jenny_female_ref"
         const val ANON_MALE_REF_SHA256 = "67f576d05c67766b20a52acf2f33c729e34a43747862d4f1a45903f2bae7836f"
@@ -51,10 +58,12 @@ data class CharacterVoiceAssignment(
 
         fun normalizeName(raw: String): String {
             return raw
+                .replace(Regex("\\s*\\([^)]*\\)"), "")
                 .trim()
                 .trim('[', ']', '<', '>', '(', ')', '{', '}', ':', '：', '-', '–', '—', ' ', '【', '】', '《', '》', '「', '」', '`', '"', '\'')
                 .lowercase(Locale.ROOT)
                 .replace(Regex("\\s+"), " ")
+                .trim()
         }
 
         /**

@@ -481,20 +481,21 @@ fun VoiceManagerScreen(
                                 spec = spec,
                                 assignedCharacters = assignedChars,
                                 onAudition = {
-                                    val previewProfile = VoiceProfile(
-                                        id = "matrix_preview_${spec.sid}",
-                                        name = spec.title,
-                                        description = spec.timbreDescription,
-                                        pitch = 1.0f,
-                                        speechRate = 1.0f,
-                                        engineVoiceIndex = spec.sid
+                                    val route = com.example.engine.CharacterVoiceRouter.routeBaseSpeakerAudition(
+                                        context = context,
+                                        sid = spec.sid,
+                                        speakerTitle = spec.title,
+                                        genderLabel = spec.gender,
+                                        hindiDialogue = VOICE_PREVIEW_HINDI_SAMPLE
                                     )
                                     ForegroundTtsManager.getInstance(context).speakNonBlocking(
                                         text = VOICE_PREVIEW_HINDI_SAMPLE,
-                                        voiceProfile = previewProfile
+                                        voiceProfile = route.voiceProfile,
+                                        characterAssignment = route.characterAssignment,
+                                        routeDecision = route
                                     )
                                     coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Auditioning ${spec.code} (${spec.title})")
+                                        snackbarHostState.showSnackbar("Auditioning ${spec.code} (${spec.title} • SID #${spec.sid})")
                                     }
                                 },
                                 onAssignToCharacter = {
@@ -520,20 +521,21 @@ fun VoiceManagerScreen(
                                 spec = spec,
                                 assignedCharacters = assignedChars,
                                 onAudition = {
-                                    val previewProfile = VoiceProfile(
-                                        id = "matrix_preview_${spec.sid}",
-                                        name = spec.title,
-                                        description = spec.timbreDescription,
-                                        pitch = 1.0f,
-                                        speechRate = 1.0f,
-                                        engineVoiceIndex = spec.sid
+                                    val route = com.example.engine.CharacterVoiceRouter.routeBaseSpeakerAudition(
+                                        context = context,
+                                        sid = spec.sid,
+                                        speakerTitle = spec.title,
+                                        genderLabel = spec.gender,
+                                        hindiDialogue = VOICE_PREVIEW_HINDI_SAMPLE
                                     )
                                     ForegroundTtsManager.getInstance(context).speakNonBlocking(
                                         text = VOICE_PREVIEW_HINDI_SAMPLE,
-                                        voiceProfile = previewProfile
+                                        voiceProfile = route.voiceProfile,
+                                        characterAssignment = route.characterAssignment,
+                                        routeDecision = route
                                     )
                                     coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Auditioning ${spec.code} (${spec.title})")
+                                        snackbarHostState.showSnackbar("Auditioning ${spec.code} (${spec.title} • SID #${spec.sid})")
                                     }
                                 },
                                 onAssignToCharacter = {

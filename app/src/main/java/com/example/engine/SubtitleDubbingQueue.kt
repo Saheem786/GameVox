@@ -1,5 +1,6 @@
 package com.example.engine
 
+import com.example.data.CharacterVoiceAssignment
 import com.example.data.VoiceProfile
 import java.util.Locale
 
@@ -8,7 +9,9 @@ data class PendingDubbingItem(
     val spokenDialogue: String,
     val translatedText: String,
     val voiceProfile: VoiceProfile?,
-    val speakerLabel: String
+    val speakerLabel: String,
+    val characterAssignment: CharacterVoiceAssignment? = null,
+    val routeDecision: VoiceRouteDecision? = null
 )
 
 sealed interface DubbingEnqueueOutcome {

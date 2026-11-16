@@ -421,6 +421,52 @@ class NeuralVoiceClientAndAbTest {
         }
     }
 
+    @Test
+    fun testVideoFrameCaptureMlKitOcrToTranslationPipeline() = runBlocking {
+        val pipeline = com.example.engine.OcrTranslationPipeline.getInstance(context)
+        val frameBitmap = android.graphics.Bitmap.createBitmap(1280, 720, android.graphics.Bitmap.Config.ARGB_8888)
+        frameBitmap.eraseColor(android.graphics.Color.rgb(24, 28, 36))
+
+        val testImageProcessor = com.example.engine.ImageProcessor(
+            customBlockRecognitionOverride = { _, _, _ ->
+                listOf(
+                    com.example.engine.DetectedOverlayBlock(
+                        text = "HP 100/100\nJenny: I was so worried about you.",
+                        boundingBox = android.graphics.Rect(100, 560, 1180, 680),
+                        isSubtitleRegion = true
+                    )
+                )
+            }
+        )
+
+        val result = pipeline.captureAndTranslateVideoFrame(
+            frameBitmap = frameBitmap,
+            rotationDegrees = 0,
+            targetRegionScreenRect = android.graphics.Rect(100, 540, 1180, 690),
+            rawScreenWidth = 1280,
+            rawScreenHeight = 720,
+            skipIfRegionUnchanged = false,
+            captureLatencyMs = 8L,
+            customImageProcessor = testImageProcessor
+        )
+
+        if (!frameBitmap.isRecycled) {
+            frameBitmap.recycle()
+        }
+
+        assertFalse("HUD noise 'HP 100/100' must be filtered out", result.extractedEnglish.contains("HP 100/100"))
+        assertEquals("I was so worried about you.", result.spokenDialogue)
+        assertTrue(
+            "Expected speakerName to start with Jenny, got: ${result.speakerName}",
+            result.speakerName.orEmpty().startsWith("Jenny", ignoreCase = true)
+        )
+        assertEquals("मुझे तुम्हारी कितनी फिक्र हो रही थी!", result.translatedHindi)
+        assertEquals(
+            "मुझे तुम्हारी कितनी फिक्र हो रही थी!",
+            com.example.data.TranslatorStateRepository.state.value.lastTranslatedHindi
+        )
+    }
+
     private fun buildPcm16WavBytes(sampleRate: Int, durationMs: Int, silent: Boolean): ByteArray {
         val numSamples = (sampleRate * durationMs) / 1000
         val pcmBytes = ByteArray(numSamples * 2)

@@ -103,7 +103,9 @@ data class ParsedDialogueLine(
     val resolvedRole: SpeakerRole,
     val detectedGender: SpeakerGender,
     val assignedVoice: VoiceProfile,
-    val matchedHeuristicRule: String = ""
+    val matchedHeuristicRule: String = "",
+    val characterAssignment: CharacterVoiceAssignment? = null,
+    val routeDecision: com.example.engine.VoiceRouteDecision? = null
 )
 
 /**
@@ -113,7 +115,7 @@ data class ParsedDialogueLine(
  *    pitch ($F_0$ autocorrelation) + cadence analysis to generate a custom cloned TTS voice profile.
  * 3. Audio file import (`content://` URI -> local storage + acoustic analysis).
  * 4. Multi-Speaker Dialogue speaker detection (`Character A`, `Character B`, named game speakers)
- *    and automatic per-character voice assignment.
+ *    and automatic per-character voice assignment via [com.example.engine.CharacterVoiceRouter].
  */
 object VoiceProfileRepository {
     private const val TAG = "VoiceProfileRepo"
@@ -132,7 +134,7 @@ object VoiceProfileRepository {
             description = "Natural 18-year-old young male TTS voice for Anon & male characters",
             pitch = SpeakerGender.MALE_18.defaultPitch18Yo,
             speechRate = SpeakerGender.MALE_18.defaultSpeechRate18Yo,
-            engineVoiceIndex = 0,
+            engineVoiceIndex = 5,
             assignedRole = SpeakerRole.CHARACTER_A,
             gender = SpeakerGender.MALE_18,
             isCustomCloned = false
@@ -154,7 +156,7 @@ object VoiceProfileRepository {
             description = "Deep male voice for bosses, guards & villains",
             pitch = 0.78f,
             speechRate = 0.98f,
-            engineVoiceIndex = 6,
+            engineVoiceIndex = 7,
             assignedRole = SpeakerRole.CHARACTER_C,
             gender = SpeakerGender.MALE_18,
             isCustomCloned = false
@@ -165,7 +167,7 @@ object VoiceProfileRepository {
             description = "Crisp young female voice for game terminals, quests & narration",
             pitch = 1.15f,
             speechRate = 1.0f,
-            engineVoiceIndex = 3,
+            engineVoiceIndex = 2,
             assignedRole = SpeakerRole.NARRATOR,
             gender = SpeakerGender.FEMALE_18,
             isCustomCloned = false
@@ -655,37 +657,53 @@ object VoiceProfileRepository {
         }
     }
 
-    fun getAssignmentForCharacter(rawName: String, context: Context? = null): CharacterVoiceAssignment {
-        val norm = CharacterVoiceAssignment.normalizeName(rawName)
+    fun findExistingAssignment(
+        rawOrNormalizedName: String,
+        gameNamespace: String = activeGameNamespace
+    ): CharacterVoiceAssignment? {
+        val norm = CharacterVoiceAssignment.normalizeName(rawOrNormalizedName)
+        if (norm.isBlank()) return null
+        val currentList = _characterAssignments.value
+        // 1. Exact match in requested namespace or default namespace
+        val exact = currentList.find { it.characterName == norm && it.gameNamespace == gameNamespace }
+            ?: currentList.find { it.characterName == norm }
+        if (exact != null) return exact
+
+        // 2. Whole-word token match for multi-word tags like "Sister Jenny" or "Commander Sarah"
+        val tokens = norm.split(" ").filter { it.length >= 2 }
+        if (tokens.size > 1) {
+            val tokenMatch = currentList.find { candidate ->
+                tokens.any { token -> token == candidate.characterName }
+            }
+            if (tokenMatch != null) return tokenMatch
+        }
+        return null
+    }
+
+    fun getOrCreateAssignmentForCharacter(
+        rawName: String,
+        normalizedKey: String = CharacterVoiceAssignment.normalizeName(rawName),
+        gameNamespace: String = activeGameNamespace,
+        context: Context? = null
+    ): CharacterVoiceAssignment {
+        val norm = normalizedKey.ifBlank { CharacterVoiceAssignment.normalizeName(rawName) }
         if (norm.isBlank()) {
             return _characterAssignments.value.firstOrNull { it.characterName == "anon" }
                 ?: CharacterVoiceAssignment.DEFAULT_PRESETS.first()
         }
 
+        val existing = findExistingAssignment(norm, gameNamespace)
+        if (existing != null) {
+            return existing
+        }
+
         val currentList = _characterAssignments.value
-        // 1. User overrides and exact matches take absolute priority
-        val exactMatch = currentList.find { it.characterName == norm }
-        if (exactMatch != null) {
-            return exactMatch
-        }
-
-        // 2. Check prefix / contains match from presets or detected list
-        val partialMatch = currentList.find { norm.contains(it.characterName) || it.characterName.contains(norm) }
-        if (partialMatch != null) {
-            return partialMatch
-        }
-
-        // 3. Deterministic assignment for newly encountered character:
-        // Audited Supertonic 3 voice.bin mapping:
-        // sid 0..4 = female F1..F5, sid 5..9 = male M1..M5
         val speakerCount = availableSpeakerCount.coerceAtLeast(1)
         val inferredGender = SpeakerHeuristicEngine.detectCharacterGender(rawName)
         val assignedSid = if (speakerCount >= 10) {
             if (inferredGender == SpeakerGender.FEMALE_18) {
-                // Female characters mapped to F1..F5 (sid 0..4)
                 Math.floorMod(norm.hashCode(), 5)
             } else {
-                // Male characters mapped to M1..M5 (sid 5..9)
                 5 + Math.floorMod(norm.hashCode(), 5)
             }
         } else {
@@ -697,18 +715,22 @@ object VoiceProfileRepository {
             .replace(Regex("\\s+"), " ")
             .ifBlank { "Character ${currentList.size + 1}" }
 
-        val genderTag = if (assignedSid in 0..4) "F${assignedSid + 1} (Female)" else "M${assignedSid - 4} (Male)"
+        val isFem = assignedSid in 0..4
+        val genderTag = if (isFem) "F${assignedSid + 1} (Female)" else "M${assignedSid - 4} (Male)"
         val newAssignment = CharacterVoiceAssignment(
             characterName = norm,
             displayName = cleanDisplay,
+            gameNamespace = gameNamespace,
             speakerId = assignedSid,
             speed = 1.0f,
             pitch = 1.0f,
             isUserOverride = false,
-            characterRoleNote = "Dynamically Discovered • $genderTag (sid: $assignedSid)"
+            characterRoleNote = "Dynamically Discovered • $genderTag (sid: $assignedSid)",
+            referenceVoiceId = if (isFem) CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID else CharacterVoiceAssignment.DEFAULT_MALE_REF_ID,
+            referenceAudioSha256 = if (isFem) CharacterVoiceAssignment.JENNY_FEMALE_REF_SHA256 else CharacterVoiceAssignment.ANON_MALE_REF_SHA256,
+            voicePresentation = if (isFem) "female" else "male"
         )
 
-        // Add to state list and persist dynamically discovered character name
         val updated = currentList + newAssignment
         _characterAssignments.value = updated
         val targetContext = context ?: appContext
@@ -716,6 +738,43 @@ object VoiceProfileRepository {
             saveCharacterAssignmentsToDisk(targetContext, updated)
         }
         return newAssignment
+    }
+
+    fun getAssignmentForCharacter(rawName: String, context: Context? = null): CharacterVoiceAssignment {
+        val (correctedNorm, _) = com.example.engine.CharacterVoiceRouter.normalizeAndCorrectSpeakerName(rawName)
+        return getOrCreateAssignmentForCharacter(
+            rawName = rawName,
+            normalizedKey = correctedNorm,
+            gameNamespace = activeGameNamespace,
+            context = context
+        )
+    }
+
+    fun buildVoiceProfileForAssignment(assignment: CharacterVoiceAssignment): VoiceProfile {
+        val role = when {
+            assignment.characterName == "jenny" || assignment.isFemale -> SpeakerRole.CHARACTER_B
+            assignment.characterName in setOf("kaal", "ragnar", "shadow") -> SpeakerRole.CHARACTER_C
+            assignment.characterName in setOf("ira", "oracle", "system", "narrator") -> SpeakerRole.NARRATOR
+            else -> SpeakerRole.CHARACTER_A
+        }
+        val basePreset = getVoiceForRole(role)
+        return basePreset.copy(
+            id = "char_profile_${assignment.characterName}_sid${assignment.speakerId}",
+            name = "${assignment.displayName} (Sid #${assignment.speakerId})",
+            engineVoiceIndex = assignment.speakerId,
+            pitch = assignment.pitch,
+            speechRate = assignment.speed,
+            assignedRole = role,
+            gender = if (assignment.isFemale) SpeakerGender.FEMALE_18 else SpeakerGender.MALE_18
+        )
+    }
+
+    fun recordActiveRouteDecision(decision: com.example.engine.VoiceRouteDecision) {
+        _activeCharacterAssignment.value = decision.characterAssignment
+        _lastAssignedSpeakerId.value = decision.selectedSpeakerId
+        _lastDetectedSpeaker.value = decision.characterAssignment.displayName
+        _lastAssignedVoiceName.value = "Supertonic Sid #${decision.selectedSpeakerId} (${decision.characterAssignment.displayName})"
+        _lastHeuristicRule.value = "${decision.resolutionRule} → ${decision.characterAssignment.displayName} (SID #${decision.selectedSpeakerId})"
     }
 
     fun setUserOverrideForCharacter(
@@ -897,6 +956,9 @@ object VoiceProfileRepository {
             isUserOverride = true
         )
 
+        // Register OCR typo alias so future scans of normOld automatically route to normNew
+        com.example.engine.CharacterVoiceRouter.registerOcrCharacterAlias(normOld, normNew)
+
         val updatedList = currentList.filterNot { it.characterName == normOld || it.characterName == normNew } + renamed
         _characterAssignments.value = updatedList
         if (_activeCharacterAssignment.value?.characterName == normOld) {
@@ -925,6 +987,7 @@ object VoiceProfileRepository {
     fun restoreAllCharacterDefaults(context: Context) {
         _characterAssignments.value = CharacterVoiceAssignment.DEFAULT_PRESETS
         _activeCharacterAssignment.value = CharacterVoiceAssignment.DEFAULT_PRESETS.first()
+        com.example.engine.CharacterVoiceRouter.resetContinuationContext()
         saveCharacterAssignmentsToDisk(context, CharacterVoiceAssignment.DEFAULT_PRESETS)
     }
 
@@ -951,47 +1014,30 @@ object VoiceProfileRepository {
     }
 
     /**
-     * Multi-Speaker Heuristic Dialogue Analyzer:
-     * Analyzes scan results via [SpeakerHeuristicEngine] to identify character name tags
-     * (e.g., `"Jenny:"`, `"[Anon]"`, `"Kaal: ..."`, or RPG nameplate headers)
-     * and maps them to the corresponding persistent [CharacterVoiceAssignment] and [VoiceProfile].
+     * Multi-Speaker Dialogue Analyzer routed through [com.example.engine.CharacterVoiceRouter]:
+     * Extracts speaker labels BEFORE stripping them from [rawSubtitleText], resolves the persistent
+     * [CharacterVoiceAssignment] (or continuation context when unlabeled), and returns [ParsedDialogueLine]
+     * carrying the immutable [com.example.engine.VoiceRouteDecision].
      */
     fun resolveSpeakerAndVoiceForSubtitle(rawSubtitleText: String): ParsedDialogueLine {
-        val allVoices = _voices.value.ifEmpty { defaultPresets }
-        val primaryVoice = allVoices.find { it.id == _selectedVoiceId.value } ?: allVoices.first()
-
-        val result = SpeakerHeuristicEngine.analyzeScanResult(
-            rawScannedText = rawSubtitleText,
-            availableVoices = allVoices,
-            selectedDefaultVoice = primaryVoice,
-            roleVoiceAssignments = _roleVoiceAssignments.value,
-            customTagVoiceBindings = _customTagVoiceBindings.value,
-            multiSpeakerEnabled = _multiSpeakerEnabled.value
+        val decision = com.example.engine.CharacterVoiceRouter.routeLiveSubtitle(
+            context = appContext,
+            rawOcrSubtitle = rawSubtitleText,
+            translatedHindi = "",
+            gameNamespace = activeGameNamespace
         )
-
-        // Resolve persistent CharacterVoiceAssignment for Supertonic 3 sid assignment
-        val candidateName = result.detectedSpeakerTag ?: result.displaySpeakerName.substringBefore(" •")
-        val characterAssignment = getAssignmentForCharacter(candidateName)
-        _activeCharacterAssignment.value = characterAssignment
-        _lastAssignedSpeakerId.value = characterAssignment.speakerId
-
-        _lastDetectedSpeaker.value = characterAssignment.displayName
-        _lastAssignedVoiceName.value = "Supertonic Sid #${characterAssignment.speakerId} (${characterAssignment.displayName})"
-        _lastHeuristicRule.value = result.matchedRuleDescription
-
-        val effectiveVoice = result.assignedVoice.copy(
-            engineVoiceIndex = characterAssignment.speakerId,
-            pitch = characterAssignment.pitch,
-            speechRate = characterAssignment.speed
-        )
+        val characterAssignment = decision.characterAssignment
+        val effectiveVoice = decision.voiceProfile
 
         val parsedLine = ParsedDialogueLine(
             speakerName = characterAssignment.displayName,
-            spokenDialogue = result.cleanedDialogueText,
-            resolvedRole = result.matchedRole,
-            detectedGender = result.detectedGender,
+            spokenDialogue = decision.strippedEnglishDialogue,
+            resolvedRole = effectiveVoice.assignedRole,
+            detectedGender = effectiveVoice.gender,
             assignedVoice = effectiveVoice,
-            matchedHeuristicRule = result.matchedRuleDescription
+            matchedHeuristicRule = "${decision.resolutionRule} (${characterAssignment.displayName} → SID #${decision.selectedSpeakerId})",
+            characterAssignment = characterAssignment,
+            routeDecision = decision
         )
         _lastParsedDialogue.value = parsedLine
         return parsedLine

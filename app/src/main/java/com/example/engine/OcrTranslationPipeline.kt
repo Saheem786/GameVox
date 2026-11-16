@@ -20,6 +20,22 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
+ * Structured output of capturing a video frame, running ML Kit Text Recognition to extract English
+ * subtitle text, and passing the extracted English directly into [HindiTranslationEngine].
+ */
+data class VideoFrameTranslationResult(
+    val extractedEnglish: String,
+    val spokenDialogue: String,
+    val speakerName: String?,
+    val translatedHindi: String,
+    val translationSource: String,
+    val ocrLatencyMs: Long,
+    val translationLatencyMs: Long,
+    val preprocessPassUsed: String,
+    val skippedUnchangedFrame: Boolean = false
+)
+
+/**
  * Process-wide Singleton coordinating:
  * 1. [ImageProcessor] Target Subtitle Region Cropping + Frame-Diff Optimization + Multi-Pass OCR
  * 2. [SubtitleTextFilter] to ignore HUD clutter, health bars, timers, and unrelated game UI text
@@ -119,6 +135,160 @@ class OcrTranslationPipeline private constructor(context: Context) {
         TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
     }
 
+    /**
+     * Extracts a software [Bitmap] from an [android.media.Image] video frame (`ImageReader`),
+     * runs the ML Kit Text Recognition pipeline ([ImageProcessor.extractTextFromOverlayBitmap]),
+     * and passes the extracted English text directly to [HindiTranslationEngine].
+     */
+    suspend fun captureAndTranslateMediaImage(
+        image: android.media.Image,
+        rotationDegrees: Int = 0,
+        excludeOverlayRect: Rect? = null,
+        targetRegionScreenRect: Rect? = null,
+        rawScreenWidth: Int = 0,
+        rawScreenHeight: Int = 0,
+        skipIfRegionUnchanged: Boolean = true,
+        customImageProcessor: ImageProcessor = imageProcessor
+    ): VideoFrameTranslationResult = withContext(Dispatchers.Default) {
+        val captureStart = System.currentTimeMillis()
+        val frameBitmap = ImageProcessor.extractBitmapFromMediaImage(image)
+            ?: return@withContext VideoFrameTranslationResult(
+                extractedEnglish = "",
+                spokenDialogue = "",
+                speakerName = null,
+                translatedHindi = "",
+                translationSource = "Empty Frame",
+                ocrLatencyMs = 0L,
+                translationLatencyMs = 0L,
+                preprocessPassUsed = "Invalid Image Frame"
+            )
+        val captureLatency = (System.currentTimeMillis() - captureStart).coerceAtLeast(0L)
+        try {
+            captureAndTranslateVideoFrame(
+                frameBitmap = frameBitmap,
+                rotationDegrees = rotationDegrees,
+                excludeOverlayRect = excludeOverlayRect,
+                targetRegionScreenRect = targetRegionScreenRect,
+                rawScreenWidth = rawScreenWidth,
+                rawScreenHeight = rawScreenHeight,
+                skipIfRegionUnchanged = skipIfRegionUnchanged,
+                captureLatencyMs = captureLatency,
+                customImageProcessor = customImageProcessor
+            )
+        } finally {
+            if (!frameBitmap.isRecycled) {
+                frameBitmap.recycle()
+            }
+        }
+    }
+
+    /**
+     * Direct ML Kit Text Recognition -> Hindi Translation pipeline for a captured video frame [frameBitmap]:
+     * 1. Crops [frameBitmap] to [targetRegionScreenRect] and runs multi-pass ML Kit OCR via [customImageProcessor].
+     * 2. Filters HUD noise ([SubtitleTextFilter]) and resolves speaker identity ([VoiceProfileRepository]).
+     * 3. Passes the extracted English dialogue directly to [HindiTranslationEngine.translateSuspendDetailed].
+     * 4. Updates [TranslatorStateRepository] diagnostics and returns [VideoFrameTranslationResult].
+     */
+    suspend fun captureAndTranslateVideoFrame(
+        frameBitmap: Bitmap,
+        rotationDegrees: Int = 0,
+        excludeOverlayRect: Rect? = null,
+        targetRegionScreenRect: Rect? = null,
+        rawScreenWidth: Int = 0,
+        rawScreenHeight: Int = 0,
+        skipIfRegionUnchanged: Boolean = false,
+        captureLatencyMs: Long = 0L,
+        customImageProcessor: ImageProcessor = imageProcessor
+    ): VideoFrameTranslationResult = withContext(Dispatchers.Default) {
+        val startTime = System.currentTimeMillis()
+        val appState = TranslatorStateRepository.state.value
+
+        val extractionResult = customImageProcessor.extractTextFromOverlayBitmap(
+            source = frameBitmap,
+            enableColorInversion = appState.invertColorsEnabled,
+            excludeOverlayRect = excludeOverlayRect,
+            targetRegionScreenRect = targetRegionScreenRect,
+            rawScreenWidth = rawScreenWidth,
+            rawScreenHeight = rawScreenHeight,
+            skipIfRegionUnchanged = skipIfRegionUnchanged,
+            rotationDegrees = rotationDegrees
+        )
+
+        val roiDimensions = "${extractionResult.roiWidth}x${extractionResult.roiHeight} (${extractionResult.preprocessPassUsed})"
+
+        val origThumb = BitmapInverter.createPreviewThumbnail(extractionResult.croppedOriginalBitmap)
+        val invThumb = BitmapInverter.createPreviewThumbnail(extractionResult.processedBitmap)
+        recycleExtractionBitmaps(
+            extractionResult.croppedOriginalBitmap,
+            extractionResult.processedBitmap,
+            origThumb,
+            invThumb
+        )
+        if (!extractionResult.skippedUnchangedFrame) {
+            TranslatorStateRepository.updateFramePreviews(origThumb, invThumb)
+        }
+
+        val extractedEnglish = cleanExtractedSubtitle(extractionResult.extractedText)
+        if (extractionResult.skippedUnchangedFrame || extractedEnglish.isBlank()) {
+            TranslatorStateRepository.updateDiagnosisMetrics(
+                captureLatencyMs = captureLatencyMs,
+                ocrLatencyMs = extractionResult.ocrLatencyMs,
+                roiDimensionsText = roiDimensions
+            )
+            return@withContext VideoFrameTranslationResult(
+                extractedEnglish = "",
+                spokenDialogue = "",
+                speakerName = null,
+                translatedHindi = "",
+                translationSource = "Idle",
+                ocrLatencyMs = extractionResult.ocrLatencyMs,
+                translationLatencyMs = 0L,
+                preprocessPassUsed = extractionResult.preprocessPassUsed,
+                skippedUnchangedFrame = extractionResult.skippedUnchangedFrame
+            )
+        }
+
+        val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(extractionResult.extractedText)
+        val dialogueToTranslate = parsedDialogue.spokenDialogue.trim().ifBlank { extractedEnglish }
+        val detailedTranslation = translateEnglishToHindiDetailed(
+            englishText = dialogueToTranslate,
+            speakerName = parsedDialogue.speakerName
+        )
+
+        val totalMs = (System.currentTimeMillis() - startTime).coerceAtLeast(1L)
+        TranslatorStateRepository.updateDiagnosisMetrics(
+            captureLatencyMs = captureLatencyMs,
+            ocrLatencyMs = extractionResult.ocrLatencyMs,
+            translationLatencyMs = detailedTranslation.latencyMs,
+            totalPipelineLatencyMs = totalMs + captureLatencyMs,
+            roiDimensionsText = roiDimensions,
+            translationSourceLabel = detailedTranslation.sourceLabel,
+            lastPipelineError = detailedTranslation.error.orEmpty()
+        )
+        if (detailedTranslation.translatedText.isNotBlank()) {
+            TranslatorStateRepository.recordTranslationResult(
+                english = dialogueToTranslate,
+                hindi = detailedTranslation.translatedText,
+                wasSpoken = false,
+                skippedReason = detailedTranslation.sourceLabel,
+                processingTimeMs = totalMs,
+                timestamp = timeFormatter.format(Date())
+            )
+        }
+
+        VideoFrameTranslationResult(
+            extractedEnglish = extractedEnglish,
+            spokenDialogue = dialogueToTranslate,
+            speakerName = parsedDialogue.speakerName,
+            translatedHindi = detailedTranslation.translatedText,
+            translationSource = detailedTranslation.sourceLabel,
+            ocrLatencyMs = extractionResult.ocrLatencyMs,
+            translationLatencyMs = detailedTranslation.latencyMs,
+            preprocessPassUsed = extractionResult.preprocessPassUsed,
+            skippedUnchangedFrame = false
+        )
+    }
+
     suspend fun processExtractedRawText(
         rawEnglishText: String,
         enforceActiveSession: Boolean = true,
@@ -158,6 +328,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
         skipIfRegionUnchanged: Boolean = true,
         captureLatencyMs: Long = 0L,
         enforceActiveSession: Boolean = true,
+        rotationDegrees: Int = 0,
         onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
         val entryEpoch = sessionEpoch.get()
@@ -176,7 +347,8 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     targetRegionScreenRect = targetRegionScreenRect,
                     rawScreenWidth = rawScreenWidth,
                     rawScreenHeight = rawScreenHeight,
-                    skipIfRegionUnchanged = skipIfRegionUnchanged
+                    skipIfRegionUnchanged = skipIfRegionUnchanged,
+                    rotationDegrees = rotationDegrees
                 )
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
@@ -354,12 +526,23 @@ class OcrTranslationPipeline private constructor(context: Context) {
         )
 
         val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
+        val finalRouteDecision = parsedDialogue.routeDecision?.copy(
+            hindiDialogue = CharacterVoiceRouter.prepareHindiDialogueForSpeech(
+                rawHindi = translatedText,
+                rawSpeakerTag = parsedDialogue.routeDecision.rawCharacterName,
+                assignment = parsedDialogue.characterAssignment
+                    ?: parsedDialogue.routeDecision.characterAssignment
+            ),
+            sessionEpoch = entryEpoch
+        )
         val queueItem = PendingDubbingItem(
             sourceEnglish = dialogueToTranslate,
             spokenDialogue = dialogueToTranslate,
             translatedText = translatedText,
             voiceProfile = assignedVoice,
-            speakerLabel = speakerTag
+            speakerLabel = speakerTag,
+            characterAssignment = parsedDialogue.characterAssignment,
+            routeDecision = finalRouteDecision
         )
 
         val outcome = dubbingQueue.enqueue(
@@ -443,7 +626,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
                         hindiText = translatedText,
                         forceSpeakEvenIfRepeat = false,
                         voiceProfile = assignedVoice,
-                        sourceEnglishText = dialogueToTranslate
+                        sourceEnglishText = dialogueToTranslate,
+                        characterAssignment = parsedDialogue.characterAssignment,
+                        routeDecision = finalRouteDecision
                     )
                 }
                 val genderBadge = parsedDialogue.detectedGender.displayLabel
@@ -495,7 +680,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 hindiText = next.translatedText,
                 forceSpeakEvenIfRepeat = true,
                 voiceProfile = next.voiceProfile,
-                sourceEnglishText = next.sourceEnglish
+                sourceEnglishText = next.sourceEnglish,
+                characterAssignment = next.characterAssignment,
+                routeDecision = next.routeDecision
             )
 
             TranslatorStateRepository.recordTranslationResult(
@@ -535,7 +722,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
         hindiText: String,
         forceSpeakEvenIfRepeat: Boolean = false,
         voiceProfile: VoiceProfile? = null,
-        sourceEnglishText: String = ""
+        sourceEnglishText: String = "",
+        characterAssignment: com.example.data.CharacterVoiceAssignment? = null,
+        routeDecision: VoiceRouteDecision? = null
     ): Boolean {
         if (hindiText.isBlank()) return false
         val state = TranslatorStateRepository.state.value
@@ -548,13 +737,17 @@ class OcrTranslationPipeline private constructor(context: Context) {
         } else {
             hindiText
         }
-        val activeProfile = voiceProfile ?: VoiceProfileRepository.voices.value.find {
-            it.id == VoiceProfileRepository.selectedVoiceId.value
-        }
+        val activeProfile = routeDecision?.voiceProfile
+            ?: voiceProfile
+            ?: VoiceProfileRepository.voices.value.find {
+                it.id == VoiceProfileRepository.selectedVoiceId.value
+            }
         return ttsManager.speakNonBlocking(
             text = speechReadyText,
             voiceProfile = activeProfile,
-            sourceEnglishText = sourceEnglishText
+            sourceEnglishText = sourceEnglishText,
+            characterAssignment = routeDecision?.characterAssignment ?: characterAssignment,
+            routeDecision = routeDecision
         )
     }
 
@@ -569,6 +762,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
     fun resetAntiRepeatMemory() {
         stopAndClearQueue()
+        CharacterVoiceRouter.resetContinuationContext()
         imageProcessor.resetFrameDiffCache()
         HindiTranslationEngine.clearSceneContext()
         lastSpokenText = ""

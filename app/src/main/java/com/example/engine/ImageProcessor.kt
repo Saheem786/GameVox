@@ -54,7 +54,8 @@ data class DetectedOverlayBlock(
 class ImageProcessor(
     private val recognizerProvider: () -> TextRecognizer = {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    }
+    },
+    private val customBlockRecognitionOverride: (suspend (processedBitmap: Bitmap, frameHeight: Int, rotationDegrees: Int) -> List<DetectedOverlayBlock>)? = null
 ) {
 
     @Volatile
@@ -128,6 +129,41 @@ class ImageProcessor(
                 y += stepY
             }
             return maxLuma <= 4 && varianceAccumulator <= 8
+        }
+
+        /**
+         * Converts an acquired [android.media.Image] video frame (`PixelFormat.RGBA_8888`) from
+         * [android.media.ImageReader] into a clean software `ARGB_8888` [Bitmap], stripping any
+         * hardware `rowStride` padding bytes.
+         */
+        fun extractBitmapFromMediaImage(image: android.media.Image): Bitmap? {
+            return try {
+                val width = image.width
+                val height = image.height
+                if (width <= 0 || height <= 0) return null
+                val planes = image.planes
+                if (planes.isEmpty()) return null
+                val buffer = planes[0].buffer ?: return null
+                buffer.rewind()
+                val pixelStride = planes[0].pixelStride.coerceAtLeast(4)
+                val rowStride = planes[0].rowStride.coerceAtLeast(width * pixelStride)
+                val rowPadding = (rowStride - pixelStride * width).coerceAtLeast(0)
+
+                val paddedWidth = width + rowPadding / pixelStride
+                val fullBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+                fullBitmap.copyPixelsFromBuffer(buffer)
+
+                if (rowPadding == 0 || paddedWidth == width) {
+                    fullBitmap
+                } else {
+                    val cropped = Bitmap.createBitmap(fullBitmap, 0, 0, width, height)
+                    fullBitmap.recycle()
+                    cropped
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to extract Bitmap from video frame Image", e)
+                null
+            }
         }
     }
 
@@ -326,7 +362,8 @@ class ImageProcessor(
     }
 
     /**
-     * Runs the complete ROI Crop -> Small-ROI Upscale -> Multi-Pass Preprocessing -> ML Kit [TextRecognizer] pipeline.
+     * Runs the complete ROI Crop -> Small-ROI Upscale -> Multi-Pass Preprocessing -> ML Kit [TextRecognizer] pipeline
+     * on a captured video frame [source].
      * Safely recycles intermediate temporary bitmaps so only [OcrExtractionResult.croppedOriginalBitmap]
      * and [OcrExtractionResult.processedBitmap] are returned live to the caller.
      */
@@ -337,7 +374,8 @@ class ImageProcessor(
         targetRegionScreenRect: Rect? = null,
         rawScreenWidth: Int = 0,
         rawScreenHeight: Int = 0,
-        skipIfRegionUnchanged: Boolean = true
+        skipIfRegionUnchanged: Boolean = true,
+        rotationDegrees: Int = 0
     ): OcrExtractionResult = withContext(Dispatchers.Default) {
         val ocrStartMs = System.currentTimeMillis()
         val regionBitmap = if (targetRegionScreenRect != null && !targetRegionScreenRect.isEmpty && rawScreenWidth > 0 && rawScreenHeight > 0) {
@@ -377,6 +415,10 @@ class ImageProcessor(
 
         val upscaledRoi = upscaleSmallRoiIfNeeded(regionBitmap)
         val maskRect = if (targetRegionScreenRect == null) excludeOverlayRect else null
+        val safeRotation = when (rotationDegrees) {
+            90, 180, 270 -> rotationDegrees
+            else -> 0
+        }
 
         // Pass 1: Inverted contrast-boosted grayscale (or natural if inversion disabled)
         val pass1Bitmap = preprocessForOcr(
@@ -385,7 +427,7 @@ class ImageProcessor(
             enableColorInversion = enableColorInversion,
             excludeOverlayRect = maskRect
         )
-        val pass1Blocks = runMlKitRecognition(pass1Bitmap, pass1Bitmap.height)
+        val pass1Blocks = runMlKitRecognition(pass1Bitmap, pass1Bitmap.height, safeRotation)
         val pass1Text = formatOverlayBlocks(pass1Blocks, isCroppedBox = targetRegionScreenRect != null)
 
         if (pass1Text.isNotBlank()) {
@@ -405,7 +447,7 @@ class ImageProcessor(
 
         // Pass 2: Bright White & Yellow Subtitle Isolation for busy/moving game backgrounds & outlines
         val pass2Bitmap = createBrightYellowWhiteIsolationBitmap(upscaledRoi)
-        val pass2Blocks = runMlKitRecognition(pass2Bitmap, pass2Bitmap.height)
+        val pass2Blocks = runMlKitRecognition(pass2Bitmap, pass2Bitmap.height, safeRotation)
         val pass2Text = formatOverlayBlocks(pass2Blocks, isCroppedBox = targetRegionScreenRect != null)
 
         if (pass2Text.isNotBlank()) {
@@ -433,7 +475,7 @@ class ImageProcessor(
                 enableColorInversion = false,
                 excludeOverlayRect = maskRect
             )
-            val pass3Blocks = runMlKitRecognition(pass3Bitmap, pass3Bitmap.height)
+            val pass3Blocks = runMlKitRecognition(pass3Bitmap, pass3Bitmap.height, safeRotation)
             val pass3Text = formatOverlayBlocks(pass3Blocks, isCroppedBox = targetRegionScreenRect != null)
 
             if (pass3Text.isNotBlank()) {
@@ -470,10 +512,15 @@ class ImageProcessor(
 
     private suspend fun runMlKitRecognition(
         processedBitmap: Bitmap,
-        frameHeight: Int
+        frameHeight: Int,
+        rotationDegrees: Int = 0
     ): List<DetectedOverlayBlock> {
+        val override = customBlockRecognitionOverride
+        if (override != null) {
+            return override(processedBitmap, frameHeight, rotationDegrees)
+        }
         return try {
-            val inputImage = InputImage.fromBitmap(processedBitmap, 0)
+            val inputImage = InputImage.fromBitmap(processedBitmap, rotationDegrees)
             val visionText: Text = recognizer.process(inputImage).await()
             parseDetectedOverlayBlocks(visionText, frameHeight)
         } catch (ce: kotlinx.coroutines.CancellationException) {
