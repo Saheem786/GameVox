@@ -49,11 +49,17 @@ enum class SpeakerGender(
         displayLabel = "18yo Boy (Male TTS Voice)",
         defaultPitch18Yo = 0.90f,
         defaultSpeechRate18Yo = 1.0f
+    ),
+    UNKNOWN(
+        code = "unknown",
+        displayLabel = "Unknown",
+        defaultPitch18Yo = 1.00f,
+        defaultSpeechRate18Yo = 1.0f
     );
 
     companion object {
         fun fromCode(code: String?): SpeakerGender {
-            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: MALE_18
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: UNKNOWN
         }
     }
 }
@@ -365,9 +371,70 @@ object VoiceProfileRepository {
             .putString(KEY_ROLE_ASSIGNMENTS_JSON, serializeRoleAssignmentsJson(updatedRoles))
             .apply()
 
+        // Synchronize active character assignment so Voice Test and live gameplay use the exact same voice configuration
+        val targetCharacterKey = when {
+            voice.id == "preset_char_b_companion" || voice.gender == SpeakerGender.FEMALE_18 -> "jenny"
+            voice.id == "preset_char_c_boss" -> "kaal"
+            voice.id == "preset_narrator_ai" -> "ira"
+            else -> "anon"
+        }
+        findExistingAssignment(targetCharacterKey, activeGameNamespace)?.let { matchedChar ->
+            _activeCharacterAssignment.value = matchedChar
+            _lastAssignedSpeakerId.value = matchedChar.speakerId
+        }
+
         // Also update the active pitch and speechRate in TranslatorStateRepository
         TranslatorStateRepository.updateTtsPitch(context, voice.pitch)
         TranslatorStateRepository.updateTtsSpeechRate(context, voice.speechRate)
+    }
+
+    /**
+     * Selects the active character manually from the Floating Menu or Voice Manager and saves
+     * that selection per game (`activeGameNamespace`).
+     * - Passing `null` or `"unknown"` clears the manual unlabeled override so unlabeled lines show `"Unknown"`.
+     * - Passing `"anon"`, `"jenny"`, `"kaal"`, `"ira"`, or any character name saves it per game as the
+     *   active character for unlabeled subtitles AND updates `_selectedVoiceId` + `_activeCharacterAssignment`.
+     *   Subsequent explicitly recognized character headers in OCR (`[Jenny]: ...`, `Anon: ...`) still
+     *   automatically switch voices!
+     */
+    fun selectActiveCharacterForGame(
+        context: Context?,
+        characterNameOrNull: String?,
+        gameNamespace: String = activeGameNamespace
+    ): CharacterVoiceAssignment {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        val norm = characterNameOrNull?.let { CharacterVoiceAssignment.normalizeName(it) }.orEmpty()
+        if (norm.isBlank() || norm == CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME) {
+            setUnlabeledSubtitleManualOverride(context, null, cleanNs)
+            val unknownAssignment = getUnknownSpeakerAssignment(cleanNs)
+            _activeCharacterAssignment.value = unknownAssignment
+            _lastDetectedSpeaker.value = unknownAssignment.displayName
+            _lastAssignedSpeakerId.value = unknownAssignment.speakerId
+            return unknownAssignment
+        }
+
+        setUnlabeledSubtitleManualOverride(context, norm, cleanNs)
+        val assignment = findExistingAssignment(norm, cleanNs)
+            ?: getOrCreateAssignmentForCharacter(norm, norm, cleanNs, context)
+        _activeCharacterAssignment.value = assignment
+        _lastDetectedSpeaker.value = assignment.displayName
+        _lastAssignedSpeakerId.value = assignment.speakerId
+
+        // Keep legacy VoiceProfile selection synchronized with the selected character's gender/role
+        val matchingPreset = if (assignment.isFemale) {
+            _voices.value.firstOrNull { it.gender == SpeakerGender.FEMALE_18 }
+        } else {
+            _voices.value.firstOrNull { it.gender == SpeakerGender.MALE_18 }
+        }
+        if (matchingPreset != null) {
+            _selectedVoiceId.value = matchingPreset.id
+            _lastAssignedVoiceName.value = "${assignment.displayName} (Sid #${assignment.speakerId})"
+            if (context != null) {
+                TranslatorStateRepository.updateTtsPitch(context, assignment.pitch)
+                TranslatorStateRepository.updateTtsSpeechRate(context, assignment.speed)
+            }
+        }
+        return assignment
     }
 
     fun assignVoiceToRole(context: Context, role: SpeakerRole, voice: VoiceProfile) {
@@ -820,10 +887,16 @@ object VoiceProfileRepository {
 
     fun buildVoiceProfileForAssignment(assignment: CharacterVoiceAssignment): VoiceProfile {
         val role = when {
+            assignment.isUnknownOrNeutral -> SpeakerRole.NARRATOR
             assignment.characterName == "jenny" || assignment.isFemale -> SpeakerRole.CHARACTER_B
             assignment.characterName in setOf("kaal", "ragnar", "shadow") -> SpeakerRole.CHARACTER_C
             assignment.characterName in setOf("ira", "oracle", "system", "narrator") -> SpeakerRole.NARRATOR
             else -> SpeakerRole.CHARACTER_A
+        }
+        val resolvedGender = when {
+            assignment.isUnknownOrNeutral -> SpeakerGender.UNKNOWN
+            assignment.isFemale -> SpeakerGender.FEMALE_18
+            else -> SpeakerGender.MALE_18
         }
         val basePreset = getVoiceForRole(role)
         return basePreset.copy(
@@ -833,7 +906,7 @@ object VoiceProfileRepository {
             pitch = assignment.pitch,
             speechRate = assignment.speed,
             assignedRole = role,
-            gender = if (assignment.isFemale) SpeakerGender.FEMALE_18 else SpeakerGender.MALE_18
+            gender = resolvedGender
         )
     }
 

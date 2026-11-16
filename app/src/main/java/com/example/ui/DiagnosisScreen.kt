@@ -925,13 +925,32 @@ private fun LocalWifiVoiceServerDiagnosticCard(
                     .fillMaxWidth()
                     .testTag("diagnosis_wifi_server_status_text")
             ) {
-                Text(
-                    text = state.chatterboxServerStatusText,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                    color = statusContentColor,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
-                )
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = state.chatterboxServerStatusText,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = statusContentColor
+                    )
+                    if (state.chatterboxErrorCategory.isNotBlank() && state.chatterboxErrorCategory != "NONE") {
+                        Text(
+                            text = "Diagnostic Error Classification: ${state.chatterboxErrorCategory}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = statusContentColor
+                        )
+                    }
+                    if (state.voiceEngineWarningMessage.isNotBlank()) {
+                        Text(
+                            text = "⚠ ${state.voiceEngineWarningMessage}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = statusContentColor
+                        )
+                    }
+                }
             }
 
             // Editable Local Wi-Fi URL & Auth Token
@@ -1198,11 +1217,11 @@ private fun PreviewVsLiveVoiceComparisonCard() {
                         )
                         DiagnosisField(
                             label = "Anon (Male Lead) — Preview vs Live (${report.anonComparison.verificationStatus})",
-                            value = "Preview SID=${report.anonComparison.previewActualSid} vs Live SID=${report.anonComparison.liveActualSid} • Engine=${report.anonComparison.liveEngine} • RefSHA=${report.anonComparison.referenceAudioSha256.take(12)} • RMS=${report.anonComparison.liveAudioRmsDisplay} • MediaProjectionOCR=${report.anonComparison.usedCapturedMediaProjectionOcr}"
+                            value = "Character=${report.anonComparison.characterName} • ${report.anonComparison.speakerIdOrReferenceWav} • PreviewEngine=${report.anonComparison.previewEngine} (${report.anonComparison.previewLatencyMs} ms, err=${report.anonComparison.previewErrorStatus}) vs LiveEngine=${report.anonComparison.liveEngine} (${report.anonComparison.liveLatencyMs} ms, err=${report.anonComparison.liveErrorStatus}) • RefSHA=${report.anonComparison.referenceAudioSha256.take(12)} • RMS=${report.anonComparison.liveAudioRmsDisplay}"
                         )
                         DiagnosisField(
                             label = "Jenny (Female Companion) — Preview vs Live (${report.jennyComparison.verificationStatus})",
-                            value = "Preview SID=${report.jennyComparison.previewActualSid} vs Live SID=${report.jennyComparison.liveActualSid} • Engine=${report.jennyComparison.liveEngine} • RefSHA=${report.jennyComparison.referenceAudioSha256.take(12)} • RMS=${report.jennyComparison.liveAudioRmsDisplay} • MediaProjectionOCR=${report.jennyComparison.usedCapturedMediaProjectionOcr}"
+                            value = "Character=${report.jennyComparison.characterName} • ${report.jennyComparison.speakerIdOrReferenceWav} • PreviewEngine=${report.jennyComparison.previewEngine} (${report.jennyComparison.previewLatencyMs} ms, err=${report.jennyComparison.previewErrorStatus}) vs LiveEngine=${report.jennyComparison.liveEngine} (${report.jennyComparison.liveLatencyMs} ms, err=${report.jennyComparison.liveErrorStatus}) • RefSHA=${report.jennyComparison.referenceAudioSha256.take(12)} • RMS=${report.jennyComparison.liveAudioRmsDisplay}"
                         )
                     }
                 }

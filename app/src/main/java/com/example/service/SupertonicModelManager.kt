@@ -4,13 +4,16 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
+import com.example.data.TranslatorStateRepository
+import com.k2fsa.sherpa.onnx.OfflineTts
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,13 +21,41 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 
 /**
- * Lifecycle and storage states for the local sherpa-onnx Supertonic 3 model bundle.
+ * Lifecycle, download progress, SHA-256 verification, and native readiness states for the
+ * local sherpa-onnx Supertonic 3 Hindi model bundle (`filesDir/sherpa_models/supertonic_3_hi/`).
+ *
+ * CRITICAL CONTRACT: [Ready] is NEVER emitted until:
+ * 1. All 7 required model files are present on disk.
+ * 2. All 7 files pass cryptographic SHA-256 verification against [SupertonicModelManager.EXPECTED_SHA256_HASHES].
+ * 3. Native `OfflineTts` initialization AND real Hindi native inference succeed for both Male (SID #5) and Female (SID #1).
  */
 sealed class SupertonicModelState {
     object NotDownloaded : SupertonicModelState()
-    data class Downloading(val progressFraction: Float, val bytesDownloaded: Long, val totalBytes: Long) : SupertonicModelState()
+    data class Downloading(
+        val progressFraction: Float,
+        val bytesDownloaded: Long,
+        val totalBytes: Long,
+        val currentFileName: String = "",
+        val currentFileIndex: Int = 0,
+        val totalFilesCount: Int = 7
+    ) : SupertonicModelState()
+    data class VerifyingSha256(
+        val currentFileName: String = "",
+        val verifiedFilesCount: Int = 0,
+        val totalFilesCount: Int = 7
+    ) : SupertonicModelState()
+    data class InitializingNative(
+        val stepDescription: String = "Initializing Sherpa-ONNX & running Hindi native inference check (Anon SID #5 & Jenny SID #1)..."
+    ) : SupertonicModelState()
     object Extracting : SupertonicModelState()
-    data class Ready(val modelDir: File, val totalSizeBytes: Long) : SupertonicModelState()
+    data class Ready(
+        val modelDir: File,
+        val totalSizeBytes: Long,
+        val nativeInferenceVerified: Boolean = true,
+        val sid5Rms: Float = 0f,
+        val sid1Rms: Float = 0f,
+        val readinessSummary: String = ""
+    ) : SupertonicModelState()
     data class Error(val errorMessage: String) : SupertonicModelState()
 }
 
@@ -47,20 +78,47 @@ data class SupertonicModelInfo(
 /**
  * Manages:
  * 1. Verification of on-device Supertonic 3 model assets in `filesDir/sherpa_models/supertonic_3_hi/`.
- * 2. User-initiated model download with optional Wi-Fi constraint and progress telemetry.
- * 3. Strict SHA-256 integrity validation before declaring Ready (including preexisting files).
- * 4. Model deletion/uninstall for zero-storage cleanup.
+ * 2. Reliable multi-file HTTP/HTTPS download (handling HTTP 301/302/303/307/308 & relative redirects) with per-file progress and exact error reporting.
+ * 3. Strict SHA-256 integrity validation of every file.
+ * 4. Native inference readiness verification (probing Male SID #5 and Female SID #1) BEFORE marking the model [SupertonicModelState.Ready].
+ * 5. Model deletion/uninstall for storage cleanup.
  */
 object SupertonicModelManager {
     private const val TAG = "SupertonicModelMgr"
     private const val RELATIVE_MODEL_DIR = "sherpa_models/supertonic_3_hi"
+    const val ESTIMATED_TOTAL_MODEL_BYTES = 145_295_768L
 
     val modelInfo = SupertonicModelInfo()
 
     @Volatile
     var overrideModelDirectory: File? = null
+        set(value) {
+            field = value
+            clearNativeVerificationState()
+        }
 
-    private val verifiedFileHashCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile
+    var overrideBaseDownloadUrl: String? = null
+
+    @Volatile
+    var overrideBackendFactoryForTest: ((Context) -> SherpaSupertonicBackend)? = null
+
+    private val verifiedFileHashCache = ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var nativeVerifiedModelDirKey: String? = null
+
+    @Volatile
+    private var lastVerifiedSid5Rms: Float = 0f
+
+    @Volatile
+    private var lastVerifiedSid1Rms: Float = 0f
+
+    @Volatile
+    private var lastVerifiedReadinessSummary: String = ""
+
+    @Volatile
+    private var lastNativeVerificationError: String? = null
 
     val REQUIRED_FILES = listOf(
         "duration_predictor.int8.onnx",
@@ -70,6 +128,19 @@ object SupertonicModelManager {
         "tts.json",
         "unicode_indexer.bin",
         "voice.bin"
+    )
+
+    /**
+     * Approximate individual file sizes in bytes for accurate progress reporting before Content-Length is known.
+     */
+    val EXPECTED_FILE_SIZES_BYTES = mapOf(
+        "duration_predictor.int8.onnx" to 521_270L,
+        "text_encoder.int8.onnx" to 9_114_150L,
+        "vector_estimator.int8.onnx" to 53_513_999L,
+        "vocoder.int8.onnx" to 81_747_116L,
+        "tts.json" to 12_883L,
+        "unicode_indexer.bin" to 262_152L,
+        "voice.bin" to 124_198L
     )
 
     /**
@@ -90,7 +161,8 @@ object SupertonicModelManager {
         val allValid: Boolean,
         val verifiedFilesCount: Int,
         val totalFilesCount: Int,
-        val mismatchedFiles: List<String>
+        val mismatchedFiles: List<String>,
+        val totalVerifiedBytes: Long = 0L
     )
 
     private val _modelState = MutableStateFlow<SupertonicModelState>(SupertonicModelState.NotDownloaded)
@@ -98,6 +170,76 @@ object SupertonicModelManager {
 
     fun getModelDirectory(context: Context): File {
         return overrideModelDirectory ?: File(context.filesDir, RELATIVE_MODEL_DIR)
+    }
+
+    fun clearNativeVerificationState() {
+        nativeVerifiedModelDirKey = null
+        lastVerifiedSid5Rms = 0f
+        lastVerifiedSid1Rms = 0f
+        lastVerifiedReadinessSummary = ""
+        lastNativeVerificationError = null
+    }
+
+    private fun buildModelDirectorySignatureKey(dir: File): String {
+        if (!dir.exists() || !dir.isDirectory) return ""
+        val sb = StringBuilder(dir.absolutePath)
+        for (fileName in REQUIRED_FILES) {
+            val f = File(dir, fileName)
+            sb.append('|').append(fileName).append(':').append(f.length())
+        }
+        return sb.toString()
+    }
+
+    fun isNativeInferenceVerifiedForCurrentFiles(context: Context): Boolean {
+        val dir = getModelDirectory(context)
+        val currentKey = buildModelDirectorySignatureKey(dir)
+        return currentKey.isNotEmpty() && currentKey == nativeVerifiedModelDirKey
+    }
+
+    /**
+     * Called by [SherpaSupertonicBackend.initialize] only AFTER native `OfflineTts` initialization
+     * AND real Hindi native inference for Male (SID #5) and Female (SID #1) have succeeded with non-silent PCM.
+     */
+    fun markNativeInferenceVerified(
+        context: Context,
+        sampleRate: Int,
+        numSpeakers: Int,
+        sid5Rms: Float,
+        sid1Rms: Float,
+        initLatencyMs: Long
+    ) {
+        val dir = getModelDirectory(context)
+        var totalSize = 0L
+        for (fileName in REQUIRED_FILES) {
+            val f = File(dir, fileName)
+            if (f.exists()) totalSize += f.length()
+        }
+        nativeVerifiedModelDirKey = buildModelDirectorySignatureKey(dir)
+        lastVerifiedSid5Rms = sid5Rms
+        lastVerifiedSid1Rms = sid1Rms
+        lastNativeVerificationError = null
+        val summary = "Native inference READY (${numSpeakers} speakers @ ${sampleRate}Hz • Init ${initLatencyMs}ms • Anon SID #5 RMS=${String.format(Locale.US, "%.4f", sid5Rms)}, Jenny SID #1 RMS=${String.format(Locale.US, "%.4f", sid1Rms)})"
+        lastVerifiedReadinessSummary = summary
+        _modelState.value = SupertonicModelState.Ready(
+            modelDir = dir,
+            totalSizeBytes = totalSize,
+            nativeInferenceVerified = true,
+            sid5Rms = sid5Rms,
+            sid1Rms = sid1Rms,
+            readinessSummary = summary
+        )
+        TranslatorStateRepository.clearVoiceEngineWarning()
+    }
+
+    /**
+     * Called when native `OfflineTts` initialization or native Hindi inference fails.
+     * Ensures the model is NEVER marked [SupertonicModelState.Ready] when native inference fails.
+     */
+    fun markNativeInferenceFailed(context: Context, exactError: String) {
+        nativeVerifiedModelDirKey = null
+        lastNativeVerificationError = exactError
+        val errState = SupertonicModelState.Error("Native inference readiness check failed: $exactError")
+        _modelState.value = errState
     }
 
     private fun getCachedOrComputeSha256(file: File): String {
@@ -109,16 +251,17 @@ object SupertonicModelManager {
     }
 
     /**
-     * Verifies the cryptographic SHA-256 integrity of all required model assets against trusted hashes.
+     * Verifies the cryptographic SHA-256 integrity of all required model assets on disk against trusted hashes.
      */
     fun verifyModelIntegrity(context: Context): ModelIntegrityReport {
         val dir = getModelDirectory(context)
         if (!dir.exists() || !dir.isDirectory) {
-            return ModelIntegrityReport(false, 0, REQUIRED_FILES.size, REQUIRED_FILES)
+            return ModelIntegrityReport(false, 0, REQUIRED_FILES.size, REQUIRED_FILES, 0L)
         }
 
         val mismatched = mutableListOf<String>()
         var verifiedCount = 0
+        var totalVerifiedBytes = 0L
 
         for (fileName in REQUIRED_FILES) {
             val file = File(dir, fileName)
@@ -131,11 +274,13 @@ object SupertonicModelManager {
                 val actualHash = getCachedOrComputeSha256(file)
                 if (actualHash.equals(expectedHash, ignoreCase = true)) {
                     verifiedCount++
+                    totalVerifiedBytes += file.length()
                 } else {
-                    mismatched.add("$fileName (hash mismatch)")
+                    mismatched.add("$fileName (SHA-256 mismatch: expected ${expectedHash.take(12)}…, got ${actualHash.take(12)}…)")
                 }
             } else {
                 verifiedCount++
+                totalVerifiedBytes += file.length()
             }
         }
 
@@ -143,35 +288,159 @@ object SupertonicModelManager {
             allValid = mismatched.isEmpty(),
             verifiedFilesCount = verifiedCount,
             totalFilesCount = REQUIRED_FILES.size,
-            mismatchedFiles = mismatched
+            mismatchedFiles = mismatched,
+            totalVerifiedBytes = totalVerifiedBytes
         )
     }
 
     /**
-     * Checks if all required Supertonic 3 model files are present AND pass SHA-256 integrity verification.
-     * Never declares Ready if any file is missing or fails SHA-256 verification.
+     * Returns `true` iff all 7 required model files exist on disk and pass SHA-256 verification.
+     * Note: This checks on-disk file integrity only; use [isModelReady] to check full native inference readiness.
      */
-    fun checkStatus(context: Context): SupertonicModelState {
+    fun areModelFilesVerifiedOnDisk(context: Context): Boolean {
+        val dir = getModelDirectory(context)
+        if (!dir.exists() || !dir.isDirectory) return false
+        for (fileName in REQUIRED_FILES) {
+            val f = File(dir, fileName)
+            if (!f.exists() || f.length() < 100) return false
+        }
+        return verifyModelIntegrity(context).allValid
+    }
+
+    /**
+     * Verifies all 7 model files on disk by SHA-256 AND runs native Hindi inference initialization
+     * and synthesis checks (Male SID #5 + Female SID #1) before marking [SupertonicModelState.Ready].
+     */
+    fun verifyAndInitializeReadiness(
+        context: Context,
+        sherpaBackend: SherpaSupertonicBackend? = null
+    ): Boolean {
         val dir = getModelDirectory(context)
         if (!dir.exists() || !dir.isDirectory) {
+            clearNativeVerificationState()
+            _modelState.value = SupertonicModelState.NotDownloaded
+            return false
+        }
+
+        var missingCount = 0
+        for (fileName in REQUIRED_FILES) {
+            val file = File(dir, fileName)
+            if (!file.exists() || file.length() < 100) {
+                missingCount++
+            }
+        }
+        if (missingCount == REQUIRED_FILES.size) {
+            clearNativeVerificationState()
+            _modelState.value = SupertonicModelState.NotDownloaded
+            return false
+        }
+
+        val integrity = verifyModelIntegrity(context)
+        if (!integrity.allValid) {
+            clearNativeVerificationState()
+            val errorState = SupertonicModelState.Error(
+                "Model integrity verification failed (${integrity.verifiedFilesCount}/${integrity.totalFilesCount} valid): ${integrity.mismatchedFiles.joinToString(", ")}"
+            )
+            _modelState.value = errorState
+            return false
+        }
+
+        if (isNativeInferenceVerifiedForCurrentFiles(context)) {
+            val readyState = SupertonicModelState.Ready(
+                modelDir = dir,
+                totalSizeBytes = integrity.totalVerifiedBytes,
+                nativeInferenceVerified = true,
+                sid5Rms = lastVerifiedSid5Rms,
+                sid1Rms = lastVerifiedSid1Rms,
+                readinessSummary = lastVerifiedReadinessSummary
+            )
+            _modelState.value = readyState
+            return true
+        }
+
+        _modelState.value = SupertonicModelState.InitializingNative(
+            "7/7 files SHA-256 verified (${String.format(Locale.US, "%.1f", integrity.totalVerifiedBytes / 1_000_000.0)} MB). Initializing Sherpa-ONNX & testing native Hindi inference (Anon SID #5 & Jenny SID #1)..."
+        )
+
+        val backendToUse = sherpaBackend
+            ?: overrideBackendFactoryForTest?.invoke(context)
+            ?: ForegroundTtsManager.peekSherpaBackend()
+            ?: SherpaSupertonicBackend(context)
+
+        val isTransientBackend = sherpaBackend == null &&
+            overrideBackendFactoryForTest == null &&
+            ForegroundTtsManager.peekSherpaBackend() == null
+
+        return try {
+            val initialized = backendToUse.initialize()
+            if (initialized && isNativeInferenceVerifiedForCurrentFiles(context)) {
+                true
+            } else {
+                val err = backendToUse.initializationError
+                    ?: lastNativeVerificationError
+                    ?: "Native Sherpa-ONNX inference check did not complete (${OfflineTts.jniStatusSummary})"
+                markNativeInferenceFailed(context, err)
+                false
+            }
+        } finally {
+            if (isTransientBackend) {
+                try {
+                    backendToUse.release()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Checks if all required Supertonic 3 model files are present, pass SHA-256 integrity verification,
+     * AND pass native inference readiness verification.
+     * Never declares [SupertonicModelState.Ready] until native inference succeeds.
+     */
+    fun checkStatus(
+        context: Context,
+        sherpaBackend: SherpaSupertonicBackend? = null
+    ): SupertonicModelState {
+        val dir = getModelDirectory(context)
+        if (!dir.exists() || !dir.isDirectory) {
+            clearNativeVerificationState()
             val state = SupertonicModelState.NotDownloaded
             _modelState.value = state
             return state
         }
 
-        var totalSize = 0L
+        var presentFiles = 0
         for (fileName in REQUIRED_FILES) {
             val file = File(dir, fileName)
-            if (!file.exists() || file.length() < 100) {
-                val state = SupertonicModelState.NotDownloaded
-                _modelState.value = state
-                return state
+            if (file.exists() && file.length() >= 100) {
+                presentFiles++
             }
-            totalSize += file.length()
+        }
+        if (presentFiles == 0) {
+            clearNativeVerificationState()
+            val state = SupertonicModelState.NotDownloaded
+            _modelState.value = state
+            return state
+        }
+        if (presentFiles < REQUIRED_FILES.size) {
+            clearNativeVerificationState()
+            val missing = REQUIRED_FILES.filter { !File(dir, it).exists() || File(dir, it).length() < 100 }
+            val state = if (_modelState.value is SupertonicModelState.Downloading) {
+                _modelState.value
+            } else if (presentFiles == 0) {
+                SupertonicModelState.NotDownloaded
+            } else {
+                SupertonicModelState.Error(
+                    "Incomplete model bundle ($presentFiles/${REQUIRED_FILES.size} files present; missing: ${missing.joinToString(", ")})"
+                )
+            }
+            _modelState.value = state
+            return state
         }
 
         val integrity = verifyModelIntegrity(context)
         if (!integrity.allValid) {
+            clearNativeVerificationState()
             val errorState = SupertonicModelState.Error(
                 "Model integrity verification failed: ${integrity.mismatchedFiles.joinToString(", ")}"
             )
@@ -179,12 +448,32 @@ object SupertonicModelManager {
             return errorState
         }
 
-        val readyState = SupertonicModelState.Ready(dir, totalSize)
-        _modelState.value = readyState
-        return readyState
+        if (isNativeInferenceVerifiedForCurrentFiles(context)) {
+            val readyState = SupertonicModelState.Ready(
+                modelDir = dir,
+                totalSizeBytes = integrity.totalVerifiedBytes,
+                nativeInferenceVerified = true,
+                sid5Rms = lastVerifiedSid5Rms,
+                sid1Rms = lastVerifiedSid1Rms,
+                readinessSummary = lastVerifiedReadinessSummary
+            )
+            _modelState.value = readyState
+            return readyState
+        }
+
+        verifyAndInitializeReadiness(context, sherpaBackend)
+        return _modelState.value
     }
 
+    /**
+     * Returns `true` ONLY when all 7 Supertonic 3 files are verified by SHA-256 on disk
+     * AND native Hindi inference has succeeded.
+     */
     fun isModelReady(context: Context): Boolean {
+        val current = _modelState.value
+        if (current is SupertonicModelState.Ready && current.nativeInferenceVerified && isNativeInferenceVerifiedForCurrentFiles(context)) {
+            return true
+        }
         return checkStatus(context) is SupertonicModelState.Ready
     }
 
@@ -194,6 +483,7 @@ object SupertonicModelManager {
     fun uninstallModel(context: Context): Boolean {
         val dir = getModelDirectory(context)
         verifiedFileHashCache.clear()
+        clearNativeVerificationState()
         val success = if (dir.exists()) {
             dir.deleteRecursively()
         } else {
@@ -216,35 +506,108 @@ object SupertonicModelManager {
     }
 
     /**
-     * Downloads individual Supertonic model files to `filesDir/sherpa_models/supertonic_3_hi/`.
-     * Verifies SHA-256 hashes of both preexisting files and newly downloaded files before marking Ready.
+     * Opens an HTTP/HTTPS connection and manually follows HTTP 301, 302, 303, 307, and 308 redirects
+     * (including relative `Location` headers like HuggingFace's `307 /api/resolve-cache/...` and
+     * cross-domain `302 https://us.aws.cdn.hf.co/...` redirects).
+     */
+    fun openConnectionFollowingRedirects(
+        initialUrl: URL,
+        maxRedirects: Int = 8,
+        connectTimeoutMs: Int = 20000,
+        readTimeoutMs: Int = 60000
+    ): Pair<HttpURLConnection, URL> {
+        var currentUrl = initialUrl
+        var redirects = 0
+
+        while (redirects <= maxRedirects) {
+            val conn = (currentUrl.openConnection() as HttpURLConnection).apply {
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
+                instanceFollowRedirects = false
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "GameVox-Android/1.0 (Sherpa-ONNX Supertonic-3)")
+                setRequestProperty("Accept", "*/*")
+            }
+
+            val code = conn.responseCode
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val location = conn.getHeaderField("Location") ?: conn.getHeaderField("location")
+                conn.disconnect()
+                if (location.isNullOrBlank()) {
+                    throw IllegalStateException("HTTP $code redirect from $currentUrl missing Location header")
+                }
+                // Resolve relative or absolute Location against currentUrl
+                currentUrl = URL(currentUrl, location.trim())
+                redirects++
+                continue
+            }
+
+            return conn to currentUrl
+        }
+
+        throw IllegalStateException("Too many HTTP redirects (> $maxRedirects) starting from $initialUrl")
+    }
+
+    /**
+     * Downloads all 7 Supertonic 3 Hindi model files to `filesDir/sherpa_models/supertonic_3_hi/`,
+     * verifies each file's SHA-256 hash against [EXPECTED_SHA256_HASHES], initializes [SherpaSupertonicBackend],
+     * and runs native Hindi inference verification for Male (`Anon`, SID #5) and Female (`Jenny`, SID #1).
+     *
+     * Does NOT mark the model [SupertonicModelState.Ready] or return `true` unless native inference succeeds.
      */
     suspend fun downloadModel(
         context: Context,
         requireWifi: Boolean = false,
+        sherpaBackend: SherpaSupertonicBackend? = null,
         onProgress: (Float) -> Unit = {}
     ): Boolean = withContext(Dispatchers.IO) {
         if (requireWifi && !isConnectedToWifi(context)) {
-            _modelState.value = SupertonicModelState.Error("Wi-Fi network required to download (~145 MB)")
+            _modelState.value = SupertonicModelState.Error("Wi-Fi network required to download Supertonic 3 (~145 MB)")
             return@withContext false
         }
 
         val targetDir = getModelDirectory(context).apply { mkdirs() }
-        _modelState.value = SupertonicModelState.Downloading(0.0f, 0L, 145_000_000L)
+        clearNativeVerificationState()
+        val totalEstimatedBytes = ESTIMATED_TOTAL_MODEL_BYTES
+        _modelState.value = SupertonicModelState.Downloading(
+            progressFraction = 0.0f,
+            bytesDownloaded = 0L,
+            totalBytes = totalEstimatedBytes,
+            currentFileName = REQUIRED_FILES.first(),
+            currentFileIndex = 1,
+            totalFilesCount = REQUIRED_FILES.size
+        )
 
         try {
-            val baseUrl = modelInfo.fallbackMirrorUrl
+            val rawBaseUrl = (overrideBaseDownloadUrl ?: modelInfo.fallbackMirrorUrl).trim()
+            val baseUrl = if (rawBaseUrl.endsWith("/")) rawBaseUrl else "$rawBaseUrl/"
             var downloadedBytesTotal = 0L
-            val estimatedTotalBytes = 145_300_000L
 
-            for (fileName in REQUIRED_FILES) {
+            for ((index, fileName) in REQUIRED_FILES.withIndex()) {
+                val fileNumber = index + 1
                 val destFile = File(targetDir, fileName)
                 val expectedHash = EXPECTED_SHA256_HASHES[fileName]
 
-                if (destFile.exists() && destFile.length() > 100) {
+                // 1. Check if preexisting file on disk already matches expected SHA-256
+                if (destFile.exists() && destFile.length() >= 100) {
+                    _modelState.value = SupertonicModelState.VerifyingSha256(
+                        currentFileName = fileName,
+                        verifiedFilesCount = index,
+                        totalFilesCount = REQUIRED_FILES.size
+                    )
                     val existingHash = computeSha256(destFile)
                     if (expectedHash == null || existingHash.equals(expectedHash, ignoreCase = true)) {
                         downloadedBytesTotal += destFile.length()
+                        val progress = (downloadedBytesTotal.toFloat() / totalEstimatedBytes).coerceIn(0.0f, 0.92f)
+                        _modelState.value = SupertonicModelState.Downloading(
+                            progressFraction = progress,
+                            bytesDownloaded = downloadedBytesTotal,
+                            totalBytes = totalEstimatedBytes,
+                            currentFileName = fileName,
+                            currentFileIndex = fileNumber,
+                            totalFilesCount = REQUIRED_FILES.size
+                        )
+                        onProgress(progress)
                         continue
                     } else {
                         Log.w(TAG, "Deleting corrupted preexisting file $fileName (SHA-256 mismatch)")
@@ -252,65 +615,122 @@ object SupertonicModelManager {
                     }
                 }
 
+                // 2. Download file following HTTP 301/302/303/307/308 redirects (including relative Location headers)
                 val fileUrl = URL("$baseUrl$fileName")
-                val connection = (fileUrl.openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 15000
-                    readTimeout = 30000
-                    instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "GameVox-Android/1.0")
+                _modelState.value = SupertonicModelState.Downloading(
+                    progressFraction = (downloadedBytesTotal.toFloat() / totalEstimatedBytes).coerceIn(0.0f, 0.92f),
+                    bytesDownloaded = downloadedBytesTotal,
+                    totalBytes = totalEstimatedBytes,
+                    currentFileName = fileName,
+                    currentFileIndex = fileNumber,
+                    totalFilesCount = REQUIRED_FILES.size
+                )
+
+                val (connection, resolvedUrl) = try {
+                    openConnectionFollowingRedirects(fileUrl)
+                } catch (connErr: Exception) {
+                    val exactErr = "Network error downloading $fileName ($fileNumber/${REQUIRED_FILES.size}): ${connErr.localizedMessage ?: connErr.javaClass.simpleName}"
+                    Log.e(TAG, exactErr, connErr)
+                    _modelState.value = SupertonicModelState.Error(exactErr)
+                    return@withContext false
                 }
 
-                if (connection.responseCode in 200..299) {
-                    val tempFile = File(targetDir, "$fileName.tmp")
+                val responseCode = connection.responseCode
+                if (responseCode !in 200..299) {
+                    val responseMsg = try { connection.responseMessage.orEmpty() } catch (_: Exception) { "" }
+                    connection.disconnect()
+                    val exactErr = "Download failed for $fileName ($fileNumber/${REQUIRED_FILES.size}): HTTP $responseCode $responseMsg from ${resolvedUrl.host}"
+                    Log.e(TAG, exactErr)
+                    _modelState.value = SupertonicModelState.Error(exactErr)
+                    return@withContext false
+                }
 
+                val tempFile = File(targetDir, "$fileName.tmp")
+                if (tempFile.exists()) tempFile.delete()
+
+                try {
                     connection.inputStream.use { input ->
                         FileOutputStream(tempFile).use { output ->
-                            val buffer = ByteArray(8192)
+                            val buffer = ByteArray(32 * 1024)
                             var read: Int
+                            var lastEmitBytes = downloadedBytesTotal
                             while (input.read(buffer).also { read = it } != -1) {
                                 output.write(buffer, 0, read)
                                 downloadedBytesTotal += read
-                                val progress = (downloadedBytesTotal.toFloat() / estimatedTotalBytes).coerceIn(0.0f, 0.98f)
-                                _modelState.value = SupertonicModelState.Downloading(
-                                    progressFraction = progress,
-                                    bytesDownloaded = downloadedBytesTotal,
-                                    totalBytes = estimatedTotalBytes
-                                )
-                                onProgress(progress)
+                                if (downloadedBytesTotal - lastEmitBytes >= 65536L || read < buffer.size) {
+                                    lastEmitBytes = downloadedBytesTotal
+                                    val progress = (downloadedBytesTotal.toFloat() / totalEstimatedBytes).coerceIn(0.0f, 0.92f)
+                                    _modelState.value = SupertonicModelState.Downloading(
+                                        progressFraction = progress,
+                                        bytesDownloaded = downloadedBytesTotal,
+                                        totalBytes = totalEstimatedBytes.coerceAtLeast(downloadedBytesTotal),
+                                        currentFileName = fileName,
+                                        currentFileIndex = fileNumber,
+                                        totalFilesCount = REQUIRED_FILES.size
+                                    )
+                                    onProgress(progress)
+                                }
                             }
                         }
                     }
-                    if (tempFile.exists() && tempFile.length() > 0) {
-                        if (expectedHash != null) {
-                            val computed = computeSha256(tempFile)
-                            if (!computed.equals(expectedHash, ignoreCase = true)) {
-                                tempFile.delete()
-                                _modelState.value = SupertonicModelState.Error(
-                                    "Integrity check failed for $fileName (SHA-256 mismatch: expected $expectedHash, got $computed)"
-                                )
-                                return@withContext false
-                            }
-                        }
-                        if (destFile.exists()) destFile.delete()
-                        tempFile.renameTo(destFile)
-                    }
-                } else {
+                } finally {
                     connection.disconnect()
+                }
+
+                if (!tempFile.exists() || tempFile.length() < 100) {
+                    val actualLen = if (tempFile.exists()) tempFile.length() else 0L
+                    tempFile.delete()
+                    val exactErr = "Download failed for $fileName ($fileNumber/${REQUIRED_FILES.size}): received incomplete file ($actualLen bytes)"
+                    _modelState.value = SupertonicModelState.Error(exactErr)
+                    return@withContext false
+                }
+
+                // 3. Per-file cryptographic SHA-256 verification before atomic rename
+                _modelState.value = SupertonicModelState.VerifyingSha256(
+                    currentFileName = fileName,
+                    verifiedFilesCount = index,
+                    totalFilesCount = REQUIRED_FILES.size
+                )
+                if (expectedHash != null) {
+                    val computed = computeSha256(tempFile)
+                    if (!computed.equals(expectedHash, ignoreCase = true)) {
+                        tempFile.delete()
+                        val exactErr = "SHA-256 verification failed for $fileName ($fileNumber/${REQUIRED_FILES.size}): expected ${expectedHash.take(12)}…, got ${computed.take(12)}…"
+                        Log.e(TAG, exactErr)
+                        _modelState.value = SupertonicModelState.Error(exactErr)
+                        return@withContext false
+                    }
+                }
+
+                if (destFile.exists()) destFile.delete()
+                if (!tempFile.renameTo(destFile)) {
+                    tempFile.copyTo(destFile, overwrite = true)
+                    tempFile.delete()
                 }
             }
 
             verifiedFileHashCache.clear()
-            val status = checkStatus(context)
-            if (status is SupertonicModelState.Ready) {
+            onProgress(0.95f)
+
+            // 4. Verify all 7 files on disk + initialize Sherpa-ONNX + run real Hindi native inference readiness check
+            val ready = verifyAndInitializeReadiness(context, sherpaBackend)
+            if (ready && _modelState.value is SupertonicModelState.Ready) {
                 onProgress(1.0f)
                 true
             } else {
-                _modelState.value = SupertonicModelState.Error("One or more model files could not be downloaded or failed SHA-256 verification")
+                val errState = _modelState.value
+                if (errState !is SupertonicModelState.Error) {
+                    _modelState.value = SupertonicModelState.Error(
+                        "Model files downloaded & verified, but native inference readiness check failed (${OfflineTts.jniStatusSummary})"
+                    )
+                }
                 false
             }
         } catch (e: Exception) {
             Log.e(TAG, "Model download error", e)
-            _modelState.value = SupertonicModelState.Error("Download failed: ${e.localizedMessage ?: e.javaClass.simpleName}")
+            _modelState.value = SupertonicModelState.Error(
+                "Download failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
             false
         }
     }
@@ -322,16 +742,16 @@ object SupertonicModelManager {
         if (!file.exists()) return ""
         val digest = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { fis ->
-            val buffer = ByteArray(8192)
+            val buffer = ByteArray(16384)
             var read: Int
             while (fis.read(buffer).also { read = it } != -1) {
                 digest.update(buffer, 0, read)
             }
         }
         val bytes = digest.digest()
-        val sb = StringBuilder()
+        val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) {
-            sb.append(String.format("%02x", b))
+            sb.append(String.format(Locale.US, "%02x", b))
         }
         return sb.toString()
     }

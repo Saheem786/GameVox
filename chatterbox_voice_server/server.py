@@ -572,4 +572,19 @@ if __name__ == "__main__":
 
     host = os.environ.get("GAMEVOX_HOST", "0.0.0.0")
     port = int(os.environ.get("GAMEVOX_PORT", "8765"))
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    ssl_certfile = os.environ.get("GAMEVOX_SSL_CERTFILE", "").strip() or None
+    ssl_keyfile = os.environ.get("GAMEVOX_SSL_KEYFILE", "").strip() or None
+    if ssl_certfile and ssl_keyfile:
+        logger.info("Starting GameVox Chatterbox server with HTTPS TLS on https://%s:%d", host, port)
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
+            log_level="info",
+        )
+    else:
+        logger.info("Starting GameVox Chatterbox server on Local LAN HTTP http://%s:%d", host, port)
+        uvicorn.run(app, host=host, port=port, log_level="info")
+

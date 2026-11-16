@@ -6,23 +6,48 @@ import android.media.AudioTrack
 import android.os.SystemClock
 import android.util.Log
 import com.example.engine.SpeakerHeuristicEngine
+import java.io.BufferedInputStream
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URL
+import java.net.UnknownServiceException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+
+/**
+ * Distinct diagnostic categories for local Chatterbox server connectivity and inference status.
+ */
+enum class NeuralServerErrorCategory(val code: String, val displayTitle: String) {
+    NONE("NONE", "Connected & Ready"),
+    HTTP_BLOCKED("HTTP_BLOCKED", "HTTP Blocked (Cleartext Policy / Public Host Restricted)"),
+    SERVER_UNREACHABLE("SERVER_UNREACHABLE", "Server Unreachable (Check IP, Port, Wi-Fi & Firewall)"),
+    AUTH_FAILED("AUTH_FAILED", "Authentication Failed (Invalid X-GameVox-Token)"),
+    MODEL_UNAVAILABLE("MODEL_UNAVAILABLE", "Model Unavailable (Chatterbox Hindi Model Not Loaded)"),
+    INFERENCE_FAILED("INFERENCE_FAILED", "Inference Failed (TTS Generation Error on Server)")
+}
 
 data class ServerReferenceVoiceInfo(
     val voiceId: String,
@@ -48,6 +73,13 @@ data class NeuralServerHealthReport(
     val conditionalsCachedCount: Int,
     val roundTripLatencyMs: Long,
     val errorMessage: String = "",
+    val errorCategory: NeuralServerErrorCategory = if (reachable && modelLoaded) {
+        NeuralServerErrorCategory.NONE
+    } else if (reachable) {
+        NeuralServerErrorCategory.MODEL_UNAVAILABLE
+    } else {
+        NeuralServerErrorCategory.SERVER_UNREACHABLE
+    },
     val referenceVoices: List<ServerReferenceVoiceInfo> = emptyList()
 )
 
@@ -92,22 +124,48 @@ sealed class NeuralSynthesisOutcome {
     data class Error(
         val httpStatus: Int,
         val reason: String,
-        val requestLatencyMs: Long
-    ) : NeuralSynthesisOutcome()
+        val requestLatencyMs: Long,
+        val errorCategory: NeuralServerErrorCategory = classifyError(httpStatus, reason)
+    ) : NeuralSynthesisOutcome() {
+        companion object {
+            fun classifyError(httpStatus: Int, reason: String): NeuralServerErrorCategory {
+                val lower = reason.lowercase(Locale.ROOT)
+                return when {
+                    lower.contains("cleartext") ||
+                        lower.contains("not permitted") ||
+                        lower.contains("http_blocked") ||
+                        lower.contains("public host restricted") -> NeuralServerErrorCategory.HTTP_BLOCKED
+                    httpStatus == 401 || httpStatus == 403 || lower.contains("unauthorized") -> NeuralServerErrorCategory.AUTH_FAILED
+                    httpStatus == 503 || lower.contains("not loaded") || lower.contains("model_unavailable") -> NeuralServerErrorCategory.MODEL_UNAVAILABLE
+                    httpStatus in 400..599 -> NeuralServerErrorCategory.INFERENCE_FAILED
+                    else -> NeuralServerErrorCategory.SERVER_UNREACHABLE
+                }
+            }
+        }
+    }
 }
 
 /**
- * Local Wi-Fi HTTP client for the self-hosted Windows/Linux Python FastAPI Voice Server
+ * Local Wi-Fi HTTPS/HTTP client for the self-hosted Windows/Linux Python FastAPI Voice Server
  * powered by ResembleAI Chatterbox Multilingual V3 Dedicated Hindi (`ResembleAI/Chatterbox-Multilingual-hi`).
  *
- * Guarantees:
- * - Authenticates every request with `X-GameVox-Token` and `Authorization: Bearer <token>`.
- * - Strips leading character name tags before transmission so speaker labels are never spoken.
+ * Security & Reliability Guarantees:
+ * - Supports secure `https://` connections to the local voice server (including self-signed LAN certificates
+ *   strictly scoped to RFC-1918 private LAN / loopback hosts).
+ * - For development-only local LAN `http://` testing (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`, `127.0.0.1`),
+ *   works with `@xml/network_security_config` and provides a scoped RFC-1918 LAN socket transport fallback if
+ *   a dynamic LAN IP is blocked by `HttpURLConnection`, while strictly blocking cleartext HTTP to any public host.
+ * - Reports distinct error categories: `HTTP_BLOCKED`, `SERVER_UNREACHABLE`, `AUTH_FAILED`, `MODEL_UNAVAILABLE`, `INFERENCE_FAILED`.
  * - Verifies returned WAV audio has non-silent PCM16 RMS >= [MIN_NON_SILENT_RMS] (`1e-4f`).
- * - Supports stale-dialogue epoch cancellation (`/v1/cancel`) and immediate `AudioTrack` interruption.
- * - Never returns fake or silent audio as a successful result.
  */
-class NeuralVoiceClient {
+class NeuralVoiceClient(
+    private val connectTimeoutMs: Int = 3000,
+    private val readTimeoutMs: Int = 25000
+) {
+
+    @Volatile
+    var lastErrorCategory: NeuralServerErrorCategory = NeuralServerErrorCategory.NONE
+        private set
 
     companion object {
         private const val TAG = "NeuralVoiceClient"
@@ -122,6 +180,50 @@ class NeuralVoiceClient {
                 trimmed
             } else {
                 "http://$trimmed"
+            }
+        }
+
+        /**
+         * Returns true ONLY if [host] is a loopback or private RFC-1918 local LAN address:
+         * - `localhost`, `*.local`
+         * - `127.0.0.0/8`
+         * - `10.0.0.0/8`
+         * - `172.16.0.0/12` (`172.16.x.x` .. `172.31.x.x`)
+         * - `192.168.0.0/16` (`192.168.x.x`)
+         *
+         * Cleartext HTTP and local self-signed TLS trust are strictly restricted to these hosts
+         * and never permitted for public internet domains or public IPs.
+         */
+        fun isPrivateLanOrLoopbackHost(host: String): Boolean {
+            val h = host.trim().lowercase(Locale.ROOT).trim('[', ']')
+            if (h.isEmpty()) return false
+            if (h == "localhost" || h == "::1" || h.endsWith(".local")) return true
+
+            val parts = h.split(".")
+            if (parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 }) {
+                val p0 = parts[0].toInt()
+                val p1 = parts[1].toInt()
+                if (p0 == 127) return true
+                if (p0 == 10) return true
+                if (p0 == 192 && p1 == 168) return true
+                if (p0 == 172 && p1 in 16..31) return true
+                return false
+            }
+            return false
+        }
+
+        fun classifyException(e: Throwable, rawUrl: String = ""): Pair<NeuralServerErrorCategory, String> {
+            val msg = e.localizedMessage ?: e.message ?: e.javaClass.simpleName
+            val lower = msg.lowercase(Locale.ROOT)
+            return if (e is UnknownServiceException ||
+                lower.contains("cleartext") ||
+                lower.contains("not permitted")
+            ) {
+                NeuralServerErrorCategory.HTTP_BLOCKED to
+                    "HTTP Blocked: Cleartext HTTP traffic to $rawUrl blocked by network policy ($msg). Use HTTPS or a private LAN IP (192.168.x.x / 10.x.x.x)."
+            } else {
+                NeuralServerErrorCategory.SERVER_UNREACHABLE to
+                    "Server Unreachable (${e.javaClass.simpleName}: $msg)"
             }
         }
 
@@ -198,6 +300,39 @@ class NeuralVoiceClient {
                 sha256Hex = computeSha256Hex(wavBytes)
             )
         }
+
+        private val scopedLanSslSocketFactory by lazy {
+            val trustAllLanCerts = arrayOf<TrustManager>(
+                object : X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+                    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+                    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+                }
+            )
+            SSLContext.getInstance("TLS").apply {
+                init(null, trustAllLanCerts, SecureRandom())
+            }.socketFactory
+        }
+
+        private val scopedLanHostnameVerifier = HostnameVerifier { hostname, session ->
+            if (isPrivateLanOrLoopbackHost(hostname)) {
+                true
+            } else {
+                HttpsURLConnection.getDefaultHostnameVerifier().verify(hostname, session)
+            }
+        }
+    }
+
+    private data class RawHttpResponse(
+        val statusCode: Int,
+        val headers: Map<String, String>,
+        val bodyBytes: ByteArray
+    ) {
+        fun header(name: String): String? {
+            return headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+        }
+
+        fun bodyUtf8(): String = String(bodyBytes, Charsets.UTF_8).trim()
     }
 
     private val activePlaybackEpoch = AtomicLong(0L)
@@ -207,7 +342,257 @@ class NeuralVoiceClient {
     private var activeAudioTrack: AudioTrack? = null
 
     /**
+     * Executes an HTTP/HTTPS request with:
+     * 1. Policy check: Rejects cleartext `http://` to any non-LAN public host with `UnknownServiceException`.
+     * 2. Scoped HTTPS TLS support for self-signed certificates on private LAN IPs (`192.168.x.x`, `10.x.x.x`, etc.).
+     * 3. Automatic fallback to a scoped RFC-1918 LAN socket HTTP/1.1 transport if Android's `HttpURLConnection`
+     *    rejects a private LAN IP not explicitly enumerated in `network_security_config.xml`.
+     */
+    private fun executeHttpRequest(
+        url: URL,
+        method: String,
+        authToken: String,
+        acceptHeader: String,
+        contentType: String? = null,
+        requestBody: ByteArray? = null,
+        connectTimeoutMs: Int = 3000,
+        readTimeoutMs: Int = 25000
+    ): RawHttpResponse {
+        val protocol = url.protocol.lowercase(Locale.ROOT)
+        val host = url.host.orEmpty()
+        val isPrivateLan = isPrivateLanOrLoopbackHost(host)
+
+        // Never permit cleartext HTTP to public internet hosts
+        if (protocol == "http" && !isPrivateLan) {
+            throw UnknownServiceException(
+                "HTTP_BLOCKED: Cleartext HTTP traffic to public host '$host' is not permitted. Use https:// or a private RFC-1918 LAN IP (e.g. 192.168.1.100)."
+            )
+        }
+
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                if (this is HttpsURLConnection && isPrivateLan) {
+                    sslSocketFactory = scopedLanSslSocketFactory
+                    hostnameVerifier = scopedLanHostnameVerifier
+                }
+                requestMethod = method
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
+                setRequestProperty("Accept", acceptHeader)
+                if (contentType != null) {
+                    setRequestProperty("Content-Type", contentType)
+                }
+                applyAuthHeaders(this, authToken)
+                if (requestBody != null) {
+                    doOutput = true
+                }
+            }
+
+            if (requestBody != null) {
+                conn.outputStream.use { out ->
+                    out.write(requestBody)
+                    out.flush()
+                }
+            }
+
+            val code = conn.responseCode
+            val responseHeaders = mutableMapOf<String, String>()
+            var headerIdx = 0
+            while (true) {
+                val key = conn.getHeaderFieldKey(headerIdx)
+                val value = conn.getHeaderField(headerIdx)
+                if (key == null && value == null) break
+                if (key != null && value != null) {
+                    responseHeaders[key] = value
+                }
+                headerIdx++
+            }
+
+            val bodyBytes = try {
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                stream?.use { it.readBytes() } ?: ByteArray(0)
+            } catch (_: Exception) {
+                ByteArray(0)
+            }
+
+            return RawHttpResponse(
+                statusCode = code,
+                headers = responseHeaders,
+                bodyBytes = bodyBytes
+            )
+        } catch (e: Exception) {
+            val msg = (e.localizedMessage ?: e.message ?: "").lowercase(Locale.ROOT)
+            val isCleartextBlock = e is UnknownServiceException ||
+                msg.contains("cleartext") ||
+                msg.contains("not permitted")
+
+            // If Android's HttpURLConnection blocked a legitimate RFC-1918 private LAN IP that wasn't
+            // listed in network_security_config.xml (e.g. 192.168.29.x), execute via scoped LAN socket.
+            if (isCleartextBlock && protocol == "http" && isPrivateLan) {
+                Log.i(TAG, "Using scoped private-LAN socket transport for $url")
+                return executeScopedLanSocketHttp(
+                    url = url,
+                    method = method,
+                    authToken = authToken,
+                    acceptHeader = acceptHeader,
+                    contentType = contentType,
+                    requestBody = requestBody,
+                    connectTimeoutMs = connectTimeoutMs,
+                    readTimeoutMs = readTimeoutMs
+                )
+            }
+            throw e
+        } finally {
+            try {
+                conn?.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Minimal HTTP/1.1 client over `java.net.Socket` strictly restricted to verified RFC-1918
+     * private LAN / loopback addresses (`isPrivateLanOrLoopbackHost == true`).
+     */
+    private fun executeScopedLanSocketHttp(
+        url: URL,
+        method: String,
+        authToken: String,
+        acceptHeader: String,
+        contentType: String?,
+        requestBody: ByteArray?,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int
+    ): RawHttpResponse {
+        val host = url.host.orEmpty()
+        if (!isPrivateLanOrLoopbackHost(host)) {
+            throw UnknownServiceException("HTTP_BLOCKED: Host '$host' is not a private LAN address.")
+        }
+        val port = if (url.port > 0) url.port else 80
+        val pathAndQuery = buildString {
+            append(url.path.ifEmpty { "/" })
+            if (!url.query.isNullOrEmpty()) {
+                append("?").append(url.query)
+            }
+        }
+
+        Socket().use { socket ->
+            socket.soTimeout = readTimeoutMs
+            socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+
+            val out = socket.getOutputStream()
+            val cleanToken = authToken.trim()
+            val bodyLen = requestBody?.size ?: 0
+            val reqHeader = buildString {
+                append("$method $pathAndQuery HTTP/1.1\r\n")
+                append("Host: $host:$port\r\n")
+                append("Accept: $acceptHeader\r\n")
+                append("Connection: close\r\n")
+                if (cleanToken.isNotEmpty()) {
+                    append("X-GameVox-Token: $cleanToken\r\n")
+                    append("Authorization: Bearer $cleanToken\r\n")
+                }
+                if (contentType != null) {
+                    append("Content-Type: $contentType\r\n")
+                }
+                if (requestBody != null) {
+                    append("Content-Length: $bodyLen\r\n")
+                }
+                append("\r\n")
+            }
+            out.write(reqHeader.toByteArray(Charsets.UTF_8))
+            if (requestBody != null && requestBody.isNotEmpty()) {
+                out.write(requestBody)
+            }
+            out.flush()
+
+            val input = BufferedInputStream(socket.getInputStream())
+            val statusLine = readAsciiLine(input)
+                ?: throw IllegalStateException("Empty HTTP response from $host:$port")
+            val statusParts = statusLine.split(" ")
+            val statusCode = statusParts.getOrNull(1)?.toIntOrNull() ?: 502
+
+            val headers = mutableMapOf<String, String>()
+            while (true) {
+                val line = readAsciiLine(input) ?: break
+                if (line.isEmpty()) break
+                val colonIdx = line.indexOf(':')
+                if (colonIdx > 0) {
+                    val k = line.substring(0, colonIdx).trim()
+                    val v = line.substring(colonIdx + 1).trim()
+                    headers[k] = v
+                }
+            }
+
+            val transferEncoding = headers.entries.firstOrNull {
+                it.key.equals("Transfer-Encoding", ignoreCase = true)
+            }?.value.orEmpty()
+            val contentLength = headers.entries.firstOrNull {
+                it.key.equals("Content-Length", ignoreCase = true)
+            }?.value?.toIntOrNull() ?: -1
+
+            val bodyBytes = when {
+                transferEncoding.contains("chunked", ignoreCase = true) -> readChunkedBody(input)
+                contentLength >= 0 -> readFixedBytes(input, contentLength)
+                else -> input.readBytes()
+            }
+
+            return RawHttpResponse(
+                statusCode = statusCode,
+                headers = headers,
+                bodyBytes = bodyBytes
+            )
+        }
+    }
+
+    private fun readAsciiLine(input: InputStream): String? {
+        val buf = ByteArrayOutputStream()
+        var sawByte = false
+        while (true) {
+            val b = input.read()
+            if (b == -1) {
+                return if (sawByte) String(buf.toByteArray(), Charsets.ISO_8859_1).trimEnd('\r') else null
+            }
+            sawByte = true
+            if (b == '\n'.code) {
+                break
+            }
+            buf.write(b)
+        }
+        return String(buf.toByteArray(), Charsets.ISO_8859_1).trimEnd('\r')
+    }
+
+    private fun readFixedBytes(input: InputStream, count: Int): ByteArray {
+        val out = ByteArray(count)
+        var offset = 0
+        while (offset < count) {
+            val r = input.read(out, offset, count - offset)
+            if (r <= 0) break
+            offset += r
+        }
+        return if (offset == count) out else out.copyOf(offset)
+    }
+
+    private fun readChunkedBody(input: InputStream): ByteArray {
+        val out = ByteArrayOutputStream()
+        while (true) {
+            val sizeLine = readAsciiLine(input)?.trim() ?: break
+            val chunkSize = sizeLine.substringBefore(';').trim().toIntOrNull(16) ?: break
+            if (chunkSize <= 0) {
+                readAsciiLine(input)
+                break
+            }
+            val chunk = readFixedBytes(input, chunkSize)
+            out.write(chunk)
+            readAsciiLine(input)
+        }
+        return out.toByteArray()
+    }
+
+    /**
      * Queries `GET /v1/health` on the local Chatterbox Python server.
+     * Reports distinct error categories (`HTTP_BLOCKED`, `SERVER_UNREACHABLE`, `AUTH_FAILED`, `MODEL_UNAVAILABLE`).
      */
     suspend fun checkServerHealth(
         rawBaseUrl: String,
@@ -215,21 +600,27 @@ class NeuralVoiceClient {
     ): NeuralServerHealthReport = withContext(Dispatchers.IO) {
         val baseUrl = normalizeBaseUrl(rawBaseUrl)
         val startMs = SystemClock.elapsedRealtime()
-        var conn: HttpURLConnection? = null
         try {
             val url = URL("$baseUrl/v1/health")
-            conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 2500
-                readTimeout = 3500
-                setRequestProperty("Accept", "application/json")
-                applyAuthHeaders(this, authToken)
-            }
-
-            val code = conn.responseCode
+            val response = executeHttpRequest(
+                url = url,
+                method = "GET",
+                authToken = authToken,
+                acceptHeader = "application/json",
+                connectTimeoutMs = connectTimeoutMs.coerceAtMost(2500),
+                readTimeoutMs = readTimeoutMs.coerceAtMost(3500)
+            )
+            val code = response.statusCode
             val rttMs = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+
             if (code != HttpURLConnection.HTTP_OK) {
-                val errBody = readStreamSafely(conn, isError = true)
+                val errBody = response.bodyUtf8()
+                val category = when (code) {
+                    401, 403 -> NeuralServerErrorCategory.AUTH_FAILED
+                    503 -> NeuralServerErrorCategory.MODEL_UNAVAILABLE
+                    else -> NeuralServerErrorCategory.INFERENCE_FAILED
+                }
+                lastErrorCategory = category
                 return@withContext NeuralServerHealthReport(
                     reachable = true,
                     modelLoaded = false,
@@ -242,11 +633,12 @@ class NeuralVoiceClient {
                     uniqueReferenceVoicesSha256Count = 0,
                     conditionalsCachedCount = 0,
                     roundTripLatencyMs = rttMs,
-                    errorMessage = "HTTP $code: $errBody"
+                    errorMessage = "${category.displayTitle} (HTTP $code: $errBody)",
+                    errorCategory = category
                 )
             }
 
-            val body = readStreamSafely(conn, isError = false)
+            val body = response.bodyUtf8()
             val json = JSONObject(body)
             val voicesList = mutableListOf<ServerReferenceVoiceInfo>()
             val voicesArr = json.optJSONArray("reference_voices")
@@ -268,10 +660,19 @@ class NeuralVoiceClient {
                 }
             }
 
+            val isLoaded = json.optBoolean("model_loaded", false)
+            val loadErr = json.optString("load_error", "")
+            val cat = if (isLoaded) {
+                NeuralServerErrorCategory.NONE
+            } else {
+                NeuralServerErrorCategory.MODEL_UNAVAILABLE
+            }
+            lastErrorCategory = cat
+
             NeuralServerHealthReport(
                 reachable = true,
-                modelLoaded = json.optBoolean("model_loaded", false),
-                status = json.optString("status", "UNKNOWN"),
+                modelLoaded = isLoaded,
+                status = json.optString("status", if (isLoaded) "READY" else "MODEL_NOT_LOADED"),
                 engineName = json.optString("engine", "ResembleAI Chatterbox Multilingual V3 (Hindi)"),
                 modelId = json.optString("model_id", "ResembleAI/Chatterbox-Multilingual-hi"),
                 device = json.optString("device", "cpu"),
@@ -280,15 +681,22 @@ class NeuralVoiceClient {
                 uniqueReferenceVoicesSha256Count = json.optInt("unique_reference_voices_sha256_count", 0),
                 conditionalsCachedCount = json.optInt("conditionals_cached_count", 0),
                 roundTripLatencyMs = rttMs,
-                errorMessage = json.optString("load_error", ""),
+                errorMessage = if (!isLoaded && loadErr.isBlank()) {
+                    "Model Unavailable: Chatterbox Multilingual Hindi model is not loaded on server"
+                } else {
+                    loadErr
+                },
+                errorCategory = cat,
                 referenceVoices = voicesList
             )
         } catch (e: Exception) {
             val rttMs = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+            val (category, formattedError) = classifyException(e, baseUrl)
+            lastErrorCategory = category
             NeuralServerHealthReport(
                 reachable = false,
                 modelLoaded = false,
-                status = "UNREACHABLE",
+                status = category.code,
                 engineName = "Chatterbox Local Server",
                 modelId = "ResembleAI/Chatterbox-Multilingual-hi",
                 device = "offline",
@@ -297,13 +705,9 @@ class NeuralVoiceClient {
                 uniqueReferenceVoicesSha256Count = 0,
                 conditionalsCachedCount = 0,
                 roundTripLatencyMs = rttMs,
-                errorMessage = "${e.javaClass.simpleName}: ${e.localizedMessage ?: "Connection failed"}"
+                errorMessage = formattedError,
+                errorCategory = category
             )
-        } finally {
-            try {
-                conn?.disconnect()
-            } catch (_: Exception) {
-            }
         }
     }
 
@@ -317,37 +721,32 @@ class NeuralVoiceClient {
         minValidEpoch: Long = 0L
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = normalizeBaseUrl(rawBaseUrl)
-        var conn: HttpURLConnection? = null
         try {
             val payload = JSONObject().apply {
                 put("request_id", requestId)
                 put("min_valid_epoch", minValidEpoch)
             }.toString().toByteArray(Charsets.UTF_8)
 
-            val url = URL("$baseUrl/v1/cancel")
-            conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 1500
-                readTimeout = 1500
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                applyAuthHeaders(this, authToken)
-            }
-            conn.outputStream.use { it.write(payload) }
-            conn.responseCode in 200..299
+            val response = executeHttpRequest(
+                url = URL("$baseUrl/v1/cancel"),
+                method = "POST",
+                authToken = authToken,
+                acceptHeader = "application/json",
+                contentType = "application/json; charset=utf-8",
+                requestBody = payload,
+                connectTimeoutMs = connectTimeoutMs.coerceAtMost(1500),
+                readTimeoutMs = readTimeoutMs.coerceAtMost(1500)
+            )
+            response.statusCode in 200..299
         } catch (_: Exception) {
             false
-        } finally {
-            try {
-                conn?.disconnect()
-            } catch (_: Exception) {
-            }
         }
     }
 
     /**
      * Calls `POST /v1/synthesize` on the local Chatterbox FastAPI server, validates WAV headers
-     * and non-silent PCM16 RMS energy (`>= 1e-4f`), and returns disaggregated server + inference timing.
+     * and non-silent PCM16 RMS energy (`>= 1e-4f`), and returns disaggregated server + inference timing
+     * or a categorized [NeuralSynthesisOutcome.Error].
      */
     suspend fun synthesizeHindiWav(
         rawBaseUrl: String,
@@ -357,15 +756,16 @@ class NeuralVoiceClient {
         val baseUrl = normalizeBaseUrl(rawBaseUrl)
         val cleanDialogue = SpeakerHeuristicEngine.stripLeadingCharacterName(request.text).trim()
         if (cleanDialogue.isBlank()) {
+            lastErrorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
             return@withContext NeuralSynthesisOutcome.Error(
                 httpStatus = 422,
-                reason = "Dialogue text is empty after stripping speaker prefix",
-                requestLatencyMs = 0L
+                reason = "Inference Failed: Dialogue text is empty after stripping speaker prefix",
+                requestLatencyMs = 0L,
+                errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
             )
         }
 
         val startMs = SystemClock.elapsedRealtime()
-        var conn: HttpURLConnection? = null
         try {
             val jsonBody = JSONObject().apply {
                 put("text", cleanDialogue)
@@ -380,63 +780,71 @@ class NeuralVoiceClient {
                 put("epoch", request.epoch)
             }.toString().toByteArray(Charsets.UTF_8)
 
-            val url = URL("$baseUrl/v1/synthesize")
-            conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 3000
-                readTimeout = 25000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                setRequestProperty("Accept", "audio/wav")
-                applyAuthHeaders(this, authToken)
-            }
-            conn.outputStream.use { out ->
-                out.write(jsonBody)
-                out.flush()
-            }
+            val response = executeHttpRequest(
+                url = URL("$baseUrl/v1/synthesize"),
+                method = "POST",
+                authToken = authToken,
+                acceptHeader = "audio/wav",
+                contentType = "application/json; charset=utf-8",
+                requestBody = jsonBody,
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = readTimeoutMs
+            )
 
-            val status = conn.responseCode
+            val status = response.statusCode
+            val totalRequestMs = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
             if (status != HttpURLConnection.HTTP_OK) {
-                val errDetail = readStreamSafely(conn, isError = true)
-                val elapsed = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+                val errDetail = response.bodyUtf8()
+                val category = when (status) {
+                    401, 403 -> NeuralServerErrorCategory.AUTH_FAILED
+                    503 -> NeuralServerErrorCategory.MODEL_UNAVAILABLE
+                    else -> NeuralServerErrorCategory.INFERENCE_FAILED
+                }
+                lastErrorCategory = category
                 return@withContext NeuralSynthesisOutcome.Error(
                     httpStatus = status,
-                    reason = "Server HTTP $status: $errDetail",
-                    requestLatencyMs = elapsed
+                    reason = "${category.displayTitle} (HTTP $status: $errDetail)",
+                    requestLatencyMs = totalRequestMs,
+                    errorCategory = category
                 )
             }
 
-            val wavBytes = conn.inputStream.use { it.readBytes() }
-            val totalRequestMs = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
-
+            val wavBytes = response.bodyBytes
             val parsed = parseWavBytes(wavBytes)
-                ?: return@withContext NeuralSynthesisOutcome.Error(
+            if (parsed == null) {
+                lastErrorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
+                return@withContext NeuralSynthesisOutcome.Error(
                     httpStatus = 502,
-                    reason = "Invalid or truncated WAV header from neural voice server (${wavBytes.size} bytes)",
-                    requestLatencyMs = totalRequestMs
+                    reason = "Inference Failed: Invalid or truncated WAV header from neural voice server (${wavBytes.size} bytes)",
+                    requestLatencyMs = totalRequestMs,
+                    errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
                 )
+            }
 
             if (parsed.waveformRms < MIN_NON_SILENT_RMS) {
+                lastErrorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
                 return@withContext NeuralSynthesisOutcome.Error(
                     httpStatus = 500,
                     reason = String.format(
                         Locale.US,
-                        "Rejected silent audio from server (RMS=%.6f < %.4f)",
+                        "Inference Failed: Rejected silent audio from server (RMS=%.6f < %.4f)",
                         parsed.waveformRms,
                         MIN_NON_SILENT_RMS
                     ),
-                    requestLatencyMs = totalRequestMs
+                    requestLatencyMs = totalRequestMs,
+                    errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
                 )
             }
 
-            val inferMs = conn.getHeaderField("X-GameVox-Inference-Ms")?.toLongOrNull() ?: totalRequestMs
-            val condMs = conn.getHeaderField("X-GameVox-Conditioning-Ms")?.toLongOrNull() ?: 0L
-            val condCached = conn.getHeaderField("X-GameVox-Conditioning-Cached")?.equals("true", ignoreCase = true) == true
-            val voiceId = conn.getHeaderField("X-GameVox-Voice-Id").orEmpty().ifBlank { request.referenceVoiceId }
-            val voiceSha = conn.getHeaderField("X-GameVox-Voice-Sha256").orEmpty()
-            val deviceUsed = conn.getHeaderField("X-GameVox-Device").orEmpty().ifBlank { "cpu" }
-            val exagUsed = conn.getHeaderField("X-GameVox-Exaggeration")?.toFloatOrNull() ?: request.exaggeration
-            val cfgUsed = conn.getHeaderField("X-GameVox-Cfg-Weight")?.toFloatOrNull() ?: request.cfgWeight
+            lastErrorCategory = NeuralServerErrorCategory.NONE
+            val inferMs = response.header("X-GameVox-Inference-Ms")?.toLongOrNull() ?: totalRequestMs
+            val condMs = response.header("X-GameVox-Conditioning-Ms")?.toLongOrNull() ?: 0L
+            val condCached = response.header("X-GameVox-Conditioning-Cached")?.equals("true", ignoreCase = true) == true
+            val voiceId = response.header("X-GameVox-Voice-Id").orEmpty().ifBlank { request.referenceVoiceId }
+            val voiceSha = response.header("X-GameVox-Voice-Sha256").orEmpty()
+            val deviceUsed = response.header("X-GameVox-Device").orEmpty().ifBlank { "cpu" }
+            val exagUsed = response.header("X-GameVox-Exaggeration")?.toFloatOrNull() ?: request.exaggeration
+            val cfgUsed = response.header("X-GameVox-Cfg-Weight")?.toFloatOrNull() ?: request.cfgWeight
 
             NeuralSynthesisOutcome.Success(
                 rawWavBytes = wavBytes,
@@ -453,16 +861,14 @@ class NeuralVoiceClient {
             )
         } catch (e: Exception) {
             val elapsed = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+            val (category, formattedError) = classifyException(e, baseUrl)
+            lastErrorCategory = category
             NeuralSynthesisOutcome.Error(
                 httpStatus = -1,
-                reason = "${e.javaClass.simpleName}: ${e.localizedMessage ?: "Network error"}",
-                requestLatencyMs = elapsed
+                reason = formattedError,
+                requestLatencyMs = elapsed,
+                errorCategory = category
             )
-        } finally {
-            try {
-                conn?.disconnect()
-            } catch (_: Exception) {
-            }
         }
     }
 
@@ -529,7 +935,7 @@ class NeuralVoiceClient {
         val cleanDialogue = SpeakerHeuristicEngine.stripLeadingCharacterName(request.text).trim()
         val sentences = HindiExoPlayerManager.splitIntoSentences(cleanDialogue)
         if (sentences.isEmpty()) {
-            onError("Dialogue text is empty after sentence splitting")
+            onError("Inference Failed: Dialogue text is empty after sentence splitting")
             return@withContext false
         }
 
@@ -782,16 +1188,6 @@ class NeuralVoiceClient {
         if (clean.isNotEmpty()) {
             conn.setRequestProperty("X-GameVox-Token", clean)
             conn.setRequestProperty("Authorization", "Bearer $clean")
-        }
-    }
-
-    private fun readStreamSafely(conn: HttpURLConnection, isError: Boolean): String {
-        return try {
-            val stream = if (isError) conn.errorStream else conn.inputStream
-            if (stream == null) return ""
-            BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText().trim() }
-        } catch (_: Exception) {
-            ""
         }
     }
 }

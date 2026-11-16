@@ -467,6 +467,150 @@ class NeuralVoiceClientAndAbTest {
         )
     }
 
+    @Test
+    fun testP0ChatterboxErrorClassificationAndPrivateLanAllowance() = runBlocking {
+        val client = NeuralVoiceClient(connectTimeoutMs = 400, readTimeoutMs = 600)
+
+        // 1. Verify RFC-1918 private LAN and loopback host detection
+        assertTrue(NeuralVoiceClient.isPrivateLanOrLoopbackHost("192.168.1.100"))
+        assertTrue(NeuralVoiceClient.isPrivateLanOrLoopbackHost("10.0.2.2"))
+        assertTrue(NeuralVoiceClient.isPrivateLanOrLoopbackHost("172.16.5.4"))
+        assertTrue(NeuralVoiceClient.isPrivateLanOrLoopbackHost("127.0.0.1"))
+        assertFalse(NeuralVoiceClient.isPrivateLanOrLoopbackHost("8.8.8.8"))
+        assertFalse(NeuralVoiceClient.isPrivateLanOrLoopbackHost("example.com"))
+
+        // 2. Public cleartext HTTP is blocked with HTTP_BLOCKED
+        val publicCleartextHealth = client.checkServerHealth("http://example.com:8765", "token")
+        assertFalse(publicCleartextHealth.reachable)
+        assertEquals(com.example.service.NeuralServerErrorCategory.HTTP_BLOCKED, publicCleartextHealth.errorCategory)
+
+        val publicCleartextSynth = client.synthesizeHindiWav(
+            rawBaseUrl = "http://example.com:8765",
+            authToken = "token",
+            request = NeuralSynthesizeRequest(
+                text = "नमस्ते",
+                characterId = "anon",
+                referenceVoiceId = "anon_male_ref"
+            )
+        )
+        assertTrue(publicCleartextSynth is NeuralSynthesisOutcome.Error)
+        assertEquals(
+            com.example.service.NeuralServerErrorCategory.HTTP_BLOCKED,
+            (publicCleartextSynth as NeuralSynthesisOutcome.Error).errorCategory
+        )
+
+        // 3. Unreachable port on loopback returns SERVER_UNREACHABLE
+        val unreachableHealth = client.checkServerHealth("http://127.0.0.1:59999", "token")
+        assertFalse(unreachableHealth.reachable)
+        assertEquals(com.example.service.NeuralServerErrorCategory.SERVER_UNREACHABLE, unreachableHealth.errorCategory)
+    }
+
+    @Test
+    fun testP1AbVoiceTestVsLiveGameplayEndToEndWithLocalServer() = runBlocking {
+        val validToken = "ab-test-token"
+        val requestedRefs = mutableListOf<String>()
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        httpServer = server
+        val port = server.address.port
+
+        server.createContext("/v1/health") { exchange ->
+            val json = """
+                {
+                  "status": "ok",
+                  "engine": "chatterbox_multilingual_v3_hi",
+                  "model_id": "ResembleAI/Chatterbox-Multilingual-hi",
+                  "device": "cuda",
+                  "model_loaded": true,
+                  "sample_rate": 24000,
+                  "reference_voice_files_count": 2,
+                  "unique_reference_voices_sha256_count": 2,
+                  "conditionals_cached_count": 2
+                }
+            """.trimIndent().toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, json.size.toLong())
+            exchange.responseBody.use { it.write(json) }
+        }
+
+        server.createContext("/v1/synthesize") { exchange ->
+            val bodyStr = exchange.requestBody.bufferedReader(Charsets.UTF_8).readText()
+            val refMatch = Regex(""""reference_voice_id"\s*:\s*"([^"]+)"""").find(bodyStr)
+            val refId = refMatch?.groupValues?.get(1).orEmpty()
+            synchronized(requestedRefs) {
+                requestedRefs.add(refId)
+            }
+            val isFemale = refId.contains("jenny")
+            val freq = if (isFemale) 330.0 else 140.0
+            val numSamples = 2400
+            val pcmBytes = ByteArray(numSamples * 2)
+            val pb = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until numSamples) {
+                val sample = (sin(2.0 * Math.PI * freq * i / 24000) * (if (isFemale) 9000.0 else 6500.0)).toInt().toShort()
+                pb.putShort(sample)
+            }
+            val out = ByteArrayOutputStream(44 + pcmBytes.size)
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray(Charsets.US_ASCII))
+            header.putInt(36 + pcmBytes.size)
+            header.put("WAVE".toByteArray(Charsets.US_ASCII))
+            header.put("fmt ".toByteArray(Charsets.US_ASCII))
+            header.putInt(16)
+            header.putShort(1)
+            header.putShort(1)
+            header.putInt(24000)
+            header.putInt(48000)
+            header.putShort(2)
+            header.putShort(16)
+            header.put("data".toByteArray(Charsets.US_ASCII))
+            header.putInt(pcmBytes.size)
+            out.write(header.array())
+            out.write(pcmBytes)
+            val wavBytes = out.toByteArray()
+
+            exchange.responseHeaders.add("Content-Type", "audio/wav")
+            exchange.responseHeaders.add("X-GameVox-Inference-Ms", "95")
+            exchange.sendResponseHeaders(200, wavBytes.size.toLong())
+            exchange.responseBody.use { it.write(wavBytes) }
+        }
+        server.start()
+
+        com.example.data.TranslatorStateRepository.updateChatterboxServerConfig(
+            context = context,
+            serverUrl = "http://127.0.0.1:$port",
+            authToken = validToken
+        )
+        com.example.data.TranslatorStateRepository.updateFreeVoiceBackend(
+            context = context,
+            backend = FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER
+        )
+
+        val exportDir = File(context.cacheDir, "ab_live_server_test_${System.currentTimeMillis()}").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+
+        val report = com.example.engine.CharacterVoiceRouter.runFullAnonAndJennyComparison(
+            context = context,
+            hindiSentence = "मैं तुम्हारी रक्षा करूँगा, कृपया मुझे मत छोड़ो!",
+            outputDir = exportDir,
+            gameNamespace = "default_game"
+        )
+
+        assertTrue("Expected A/B comparison to PASS with live Chatterbox server: ${report.summaryReport}", report.overallPassed)
+        assertEquals("PASSED_NEURAL_SPEECH", report.verificationStatus)
+        assertEquals("NONE", report.anonComparison.previewErrorStatus)
+        assertEquals("NONE", report.anonComparison.liveErrorStatus)
+        assertEquals("NONE", report.jennyComparison.previewErrorStatus)
+        assertEquals("NONE", report.jennyComparison.liveErrorStatus)
+        assertTrue(report.anonComparison.speakerIdOrReferenceWav.contains("SID #5"))
+        assertTrue(report.anonComparison.speakerIdOrReferenceWav.contains("anon_male_ref.wav"))
+        assertTrue(report.jennyComparison.speakerIdOrReferenceWav.contains("SID #1"))
+        assertTrue(report.jennyComparison.speakerIdOrReferenceWav.contains("jenny_female_ref.wav"))
+        assertTrue(requestedRefs.contains("anon_male_ref"))
+        assertTrue(requestedRefs.contains("jenny_female_ref"))
+    }
+
     private fun buildPcm16WavBytes(sampleRate: Int, durationMs: Int, silent: Boolean): ByteArray {
         val numSamples = (sampleRate * durationMs) / 1000
         val pcmBytes = ByteArray(numSamples * 2)

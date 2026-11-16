@@ -1,9 +1,13 @@
 package com.example.engine
 
+import com.example.data.CharacterVoiceAssignment
+import java.util.Locale
+
 /**
  * Filters OCR text inside the game subtitle region to strip HUD labels, health/ammo bars,
  * timers, FPS counters, button prompts, and unrelated non-dialogue UI noise while preserving
- * genuine English dialogue lines (and character name headers if present).
+ * genuine English dialogue lines and character name headers (including 1-word 3–4 letter
+ * ALL-CAPS speaker headers like `"ANON"`, `"IRA"`, `"KAAL"`, `"ALEX"`, `"MAYA"`, `"LEON"`).
  */
 object SubtitleTextFilter {
 
@@ -25,30 +29,45 @@ object SubtitleTextFilter {
         "tap to continue", "tap to skip", "click to continue", "press to skip"
     )
 
+    // Explicit short UI/HUD abbreviations that are NOT character names
+    private val UI_SHORT_HUD_ABBREVIATIONS = setOf(
+        "hud", "map", "fps", "ping", "hp", "mp", "sp", "xp", "ap", "ep", "gp",
+        "lv", "lvl", "atk", "def", "agi", "str", "int", "dex", "luk", "vit",
+        "sta", "ammo", "mag", "esc", "tab", "alt", "lmb", "rmb", "qte", "npc",
+        "pvp", "pve", "dlc", "afk"
+    )
+
     /**
-     * Filters OCR [rawText] line-by-line, returning clean dialogue text or `""` if the block
-     * contains only HUD/UI clutter.
+     * Filters OCR [rawText] line-by-line, returning clean dialogue text (with speaker headers
+     * intact before stripping/translation) or `""` if the block contains only HUD/UI clutter.
      */
     fun filterDialogueText(rawText: String): String {
         if (rawText.isBlank()) return ""
 
-        val keptLines = rawText
+        val normalizedLines = rawText
             .lines()
             .map { normalizeSpacing(it) }
-            .filter { line -> isLikelyDialogueOrSpeakerLine(line) }
+            .filter { it.isNotEmpty() }
+
+        val keptLines = normalizedLines.filterIndexed { index, line ->
+            val hasSubsequentDialogueLine = normalizedLines
+                .drop(index + 1)
+                .any { nextLine -> isLikelyDialogueOrSpeakerLine(nextLine, hasSubsequentLine = false) }
+            isLikelyDialogueOrSpeakerLine(line, hasSubsequentLine = hasSubsequentDialogueLine)
+        }
 
         return keptLines.joinToString("\n").trim()
     }
 
     /**
-     * Returns `true` if a single OCR line looks like part of game dialogue (or a speaker header
-     * followed by dialogue in the same block) rather than HUD / UI chrome.
+     * Returns `true` if a single OCR line looks like part of game dialogue or a character speaker header
+     * rather than HUD / UI chrome.
      */
-    fun isLikelyDialogueOrSpeakerLine(rawLine: String): Boolean {
+    fun isLikelyDialogueOrSpeakerLine(rawLine: String, hasSubsequentLine: Boolean = false): Boolean {
         val line = normalizeSpacing(rawLine)
         if (line.length < 2) return false
 
-        val lower = line.lowercase()
+        val lower = line.lowercase(Locale.ROOT)
         if (lower in UI_CONTROL_WORDS) return false
         if (PURE_NUMBER_OR_SYMBOL_REGEX.matches(line)) return false
         if (CLOCK_OR_TIMER_REGEX.matches(line)) return false
@@ -63,13 +82,29 @@ object SubtitleTextFilter {
         // Reject telemetry strings dominated by numbers (e.g. "v1.4.2 build 98324")
         if (digitCount > letterCount && letterCount < 5) return false
 
-        // Single tiny ALL-CAPS label without punctuation (like "HUD", "MAP", "OK") is usually UI,
-        // whereas "WAIT!" or "NO!" has punctuation and is dialogue.
+        // Always keep known character names and speaker headers (e.g., "ANON", "JENNY", "IRA", "KAAL", "[Anon]", "Jenny:")
+        val normalizedCandidate = CharacterVoiceAssignment.normalizeName(line)
+        if (SpeakerHeuristicEngine.isKnownCharacterOrSpeakerHeader(normalizedCandidate)) {
+            return true
+        }
+
+        // If this line sits above another dialogue line in a multi-line subtitle block and looks like a 1-3 word speaker header, keep it
         val words = line.split(" ").filter { it.isNotBlank() }
-        if (words.size == 1 &&
-            line.length <= 4 &&
+        if (hasSubsequentLine && words.size in 1..3 && line.length in 2..28 && normalizedCandidate !in UI_SHORT_HUD_ABBREVIATIONS) {
+            return true
+        }
+
+        // Reject explicit short HUD abbreviations like "HUD", "FPS", "MAP", "LVL" when standalone
+        if (words.size == 1 && normalizedCandidate in UI_SHORT_HUD_ABBREVIATIONS) {
+            return false
+        }
+
+        // Single 2-letter ALL-CAPS token without punctuation (like "OK", "UI") is usually UI chrome unless followed by dialogue
+        if (!hasSubsequentLine &&
+            words.size == 1 &&
+            line.length <= 2 &&
             line.all { !it.isLetter() || it.isUpperCase() } &&
-            !line.any { it == '!' || it == '?' || it == '.' }
+            !line.any { it == '!' || it == '?' || it == '.' || it == ':' }
         ) {
             return false
         }

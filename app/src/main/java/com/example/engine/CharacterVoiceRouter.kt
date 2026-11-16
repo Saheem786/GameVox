@@ -194,6 +194,11 @@ data class PreviewVsLiveCharacterComparison(
     val liveWavSha256: String = "",
     val referenceVoiceId: String = "",
     val referenceAudioSha256: String = "",
+    val speakerIdOrReferenceWav: String = "SID #$liveActualSid • $referenceVoiceId.wav",
+    val previewErrorStatus: String = "NONE",
+    val liveErrorStatus: String = "NONE",
+    val previewLatencyMs: Long = 0L,
+    val liveLatencyMs: Long = 0L,
     val verificationStatus: String = "NOT_TESTED_NO_MODEL",
     val liveCapturedViaMediaProjectionOcr: Boolean = false,
     val sidMatched: Boolean,
@@ -529,15 +534,42 @@ object CharacterVoiceRouter {
             }
         }
 
-        // 3. Delegate to SpeakerHeuristicEngine for multi-line headers (Line 1 name, Line 2 dialogue)
+        // 3. Multi-line subtitle header (Line 1 = character name header, Line 2..N = dialogue)
+        val nonBlankLines = trimmed.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (nonBlankLines.size >= 2) {
+            val headerLine = nonBlankLines.first()
+            val dialogueLines = nonBlankLines.drop(1).joinToString(" ").trim()
+            val cleanedHeader = headerLine.trim('[', ']', '<', '>', '(', ')', '{', '}', ':', '：', '-', '–', '—', ' ')
+            if (dialogueLines.isNotBlank() && isPlausibleSpeakerCandidate(cleanedHeader)) {
+                val (norm, wasCorrected) = normalizeAndCorrectSpeakerName(cleanedHeader, gameNamespace)
+                val knownProfile = VoiceProfileRepository.findExistingAssignment(norm, gameNamespace) != null
+                val knownCharacter = knownProfile || SpeakerHeuristicEngine.isKnownCharacterOrSpeakerHeader(norm)
+                val hasExplicitHeaderDelimiter = headerLine.endsWith(":") || headerLine.endsWith("-") ||
+                    (headerLine.startsWith("[") && headerLine.endsWith("]"))
+                val conf = when {
+                    knownProfile && !wasCorrected -> 0.92f
+                    knownCharacter && !wasCorrected -> 0.88f
+                    knownCharacter && wasCorrected -> 0.80f
+                    hasExplicitHeaderDelimiter -> 0.82f
+                    else -> 0.45f
+                }
+                if (conf >= MIN_CONFIDENT_SPEAKER_THRESHOLD) {
+                    val strippedBody = SpeakerHeuristicEngine.stripLeadingCharacterName(dialogueLines, cleanedHeader).trim()
+                        .ifBlank { dialogueLines }
+                    return SpeakerLabelParseOutcome(cleanedHeader, strippedBody, conf, "MULTILINE_SPEAKER_HEADER")
+                }
+            }
+        }
+
+        // 4. Delegate to SpeakerHeuristicEngine for inline character prefixes
         val parsed = SpeakerHeuristicEngine.extractCharacterTagAndDialogue(trimmed)
         if (parsed != null) {
             val rawTag = parsed.first.trim()
             val body = SpeakerHeuristicEngine.stripLeadingCharacterName(parsed.second, rawTag).trim()
                 .ifBlank { parsed.second.trim() }
             val (norm, wasCorrected) = normalizeAndCorrectSpeakerName(rawTag, gameNamespace)
-            val known = VoiceProfileRepository.findExistingAssignment(norm, gameNamespace) != null
-            // Line-1 header without explicit colon/brackets is only trusted (>= 0.60) if it matches a known character profile
+            val known = VoiceProfileRepository.findExistingAssignment(norm, gameNamespace) != null ||
+                SpeakerHeuristicEngine.isKnownCharacterOrSpeakerHeader(norm)
             val conf = when {
                 known && !wasCorrected -> 0.84f
                 known && wasCorrected -> 0.76f
@@ -987,17 +1019,26 @@ object CharacterVoiceRouter {
             hindiSentence
         }
 
+        val previewStartMs = System.currentTimeMillis()
         val previewRoute = routeCharacterPreview(
             context = context,
             assignment = assignment,
             hindiDialogue = effectiveSentence
         )
-        val liveRoute = capturedOcrRoute ?: routeLiveSubtitle(
+        // Exercise the exact live gameplay subtitle filter + speaker resolution + live route pipeline
+        val rawLiveSource = if (capturedOcrRoute != null && capturedOcrRoute.rawOcrText.isNotBlank()) {
+            capturedOcrRoute.rawOcrText
+        } else {
+            "${cleanTag.uppercase(Locale.ROOT)}\n$effectiveSentence"
+        }
+        val filteredLiveOcr = SubtitleTextFilter.filterDialogueText(rawLiveSource)
+            .ifBlank { "[$cleanTag]: $effectiveSentence" }
+        val liveRoute = routeLiveSubtitle(
             context = context,
-            rawOcrSubtitle = "[$cleanTag]: $effectiveSentence",
+            rawOcrSubtitle = filteredLiveOcr,
             translatedHindi = effectiveSentence,
             gameNamespace = cleanNs,
-            isFromMediaProjectionOcr = false
+            isFromMediaProjectionOcr = capturedOcrRoute != null
         )
 
         val previewWavFile = File(outputDir, "preview_${assignment.characterName}_sid${previewRoute.selectedSpeakerId}.wav")
@@ -1014,7 +1055,7 @@ object CharacterVoiceRouter {
             try {
                 ForegroundTtsManager.getInstance(context).neuralVoiceClient
             } catch (_: Throwable) {
-                null
+                NeuralVoiceClient()
             }
         }
 
@@ -1025,6 +1066,9 @@ object CharacterVoiceRouter {
             sherpaBackend = backend,
             neuralClient = activeNeuralClient
         )
+        val previewLatencyMs = (System.currentTimeMillis() - previewStartMs).coerceAtLeast(1L)
+
+        val liveStartMs = System.currentTimeMillis()
         val liveOutcome = synthesizeRouteToWav(
             context = context,
             route = liveRoute,
@@ -1032,6 +1076,7 @@ object CharacterVoiceRouter {
             sherpaBackend = backend,
             neuralClient = activeNeuralClient
         )
+        val liveLatencyMs = (System.currentTimeMillis() - liveStartMs).coerceAtLeast(1L)
 
         recordSpokenUtteranceAudit(
             routeDecision = previewRoute,
@@ -1080,11 +1125,11 @@ object CharacterVoiceRouter {
         val passed = verificationStatus == "PASSED_NEURAL_SPEECH"
         val note = when (verificationStatus) {
             "PASSED_NEURAL_SPEECH" ->
-                "PASS (Neural WAV Verified) • ${assignment.displayName} Preview & Live both used SID #${liveOutcome.actualSid} (${liveOutcome.engineUsed}, ${liveOutcome.sampleRate}Hz, RMS=${String.format(Locale.US, "%.4f", liveRmsVal)}, RefSHA=${assignment.referenceAudioSha256.take(8)})"
+                "PASS (Neural WAV Verified) • ${assignment.displayName} Preview (${previewLatencyMs}ms) & Live (${liveLatencyMs}ms) both used SID #${liveOutcome.actualSid} / ${assignment.referenceVoiceId}.wav (${liveOutcome.engineUsed}, ${liveOutcome.sampleRate}Hz, RMS=${String.format(Locale.US, "%.4f", liveRmsVal)})"
             "NOT_TESTED_NO_MODEL" ->
-                "NOT_TESTED_NO_MODEL • Routing matched (Preview SID=#${previewRoute.selectedSpeakerId}, Live SID=#${liveRoute.selectedSpeakerId}, ReqEngine=${liveRoute.requestedEngine}), but ${liveOutcome.errorReason}. No synthetic WAV generated."
+                "NOT_TESTED_NO_MODEL • Routing matched (Preview SID=#${previewRoute.selectedSpeakerId}, Live SID=#${liveRoute.selectedSpeakerId}, Ref=${assignment.referenceVoiceId}.wav, ReqEngine=${liveRoute.requestedEngine}, Err=${liveOutcome.errorCategoryCode}), but ${liveOutcome.errorReason}. No synthetic WAV generated."
             else ->
-                "FAIL • Preview(req=${previewRoute.selectedSpeakerId}, act=${previewOutcome.actualSid}, eng=${previewOutcome.engineUsed}) vs Live(req=${liveRoute.selectedSpeakerId}, act=${liveOutcome.actualSid}, eng=${liveOutcome.engineUsed})"
+                "FAIL • Preview(req=${previewRoute.selectedSpeakerId}, act=${previewOutcome.actualSid}, eng=${previewOutcome.engineUsed}, err=${previewOutcome.errorCategoryCode}) vs Live(req=${liveRoute.selectedSpeakerId}, act=${liveOutcome.actualSid}, eng=${liveOutcome.engineUsed}, err=${liveOutcome.errorCategoryCode})"
         }
 
         return PreviewVsLiveCharacterComparison(
@@ -1110,6 +1155,11 @@ object CharacterVoiceRouter {
             liveWavSha256 = liveOutcome.wavSha256,
             referenceVoiceId = assignment.referenceVoiceId,
             referenceAudioSha256 = assignment.referenceAudioSha256,
+            speakerIdOrReferenceWav = "SID #${liveOutcome.actualSid} • ${assignment.referenceVoiceId}.wav",
+            previewErrorStatus = previewOutcome.errorCategoryCode,
+            liveErrorStatus = liveOutcome.errorCategoryCode,
+            previewLatencyMs = previewLatencyMs,
+            liveLatencyMs = liveLatencyMs,
             verificationStatus = verificationStatus,
             liveCapturedViaMediaProjectionOcr = liveRoute.isFromRealMediaProjectionOcr,
             sidMatched = sidMatched,
@@ -1212,6 +1262,7 @@ object CharacterVoiceRouter {
         val engineUsed: String,
         val isRealNeuralAudio: Boolean,
         val wavSha256: String,
+        val errorCategoryCode: String = "NONE",
         val errorReason: String
     )
 
@@ -1257,33 +1308,39 @@ object CharacterVoiceRouter {
             )
             var serverOutcome: WavSynthOutcome? = null
             var serverErr = "Chatterbox server unreachable"
+            var serverErrCode = "SERVER_UNREACHABLE"
             runBlocking {
-                neuralClient.synthesizeToWavFile(
+                val res = neuralClient.synthesizeHindiWav(
                     rawBaseUrl = state.chatterboxServerUrl,
                     authToken = state.chatterboxAuthToken,
-                    request = req,
-                    outputWavFile = outputWavFile,
-                    onSuccess = { outcome ->
+                    request = req
+                )
+                when (res) {
+                    is com.example.service.NeuralSynthesisOutcome.Success -> {
+                        outputWavFile.parentFile?.mkdirs()
+                        outputWavFile.writeBytes(res.rawWavBytes)
                         serverOutcome = WavSynthOutcome(
                             actualSid = requestedSid,
-                            sampleRate = outcome.parsedWav.sampleRate,
-                            waveformRms = outcome.parsedWav.waveformRms,
-                            durationMs = outcome.parsedWav.durationMs,
+                            sampleRate = res.parsedWav.sampleRate,
+                            waveformRms = res.parsedWav.waveformRms,
+                            durationMs = res.parsedWav.durationMs,
                             engineUsed = "CHATTERBOX_LOCAL_SERVER",
                             isRealNeuralAudio = true,
                             wavSha256 = computeFileSha256(outputWavFile),
+                            errorCategoryCode = "NONE",
                             errorReason = ""
                         )
-                    },
-                    onError = { err ->
-                        serverErr = err
                     }
-                )
+                    is com.example.service.NeuralSynthesisOutcome.Error -> {
+                        serverErr = res.reason
+                        serverErrCode = res.errorCategory.code
+                    }
+                }
             }
             if (serverOutcome != null) {
                 return serverOutcome!!
             }
-            // If server failed and Supertonic is not ready, return NOT_TESTED_NO_MODEL
+            // If server failed and Supertonic is not ready, return NOT_TESTED_NO_MODEL with exact errorCategoryCode
             if (sherpaBackend == null || !SupertonicModelManager.isModelReady(context)) {
                 return WavSynthOutcome(
                     actualSid = requestedSid,
@@ -1293,7 +1350,8 @@ object CharacterVoiceRouter {
                     engineUsed = "NOT_TESTED_NO_MODEL",
                     isRealNeuralAudio = false,
                     wavSha256 = "",
-                    errorReason = "Local Chatterbox server unavailable ($serverErr) and Supertonic ONNX model not installed"
+                    errorCategoryCode = serverErrCode,
+                    errorReason = "[$serverErrCode] Local Chatterbox server unavailable ($serverErr) and Supertonic ONNX model not installed"
                 )
             }
         }
@@ -1323,6 +1381,7 @@ object CharacterVoiceRouter {
                         engineUsed = "SHERPA_DIRECT",
                         isRealNeuralAudio = true,
                         wavSha256 = computeFileSha256(outputWavFile),
+                        errorCategoryCode = "NONE",
                         errorReason = ""
                     )
                 } else {
@@ -1335,6 +1394,7 @@ object CharacterVoiceRouter {
                         engineUsed = "NOT_TESTED_NO_MODEL",
                         isRealNeuralAudio = false,
                         wavSha256 = "",
+                        errorCategoryCode = "INFERENCE_FAILED",
                         errorReason = "Sherpa native synthesis produced no valid non-silent audio"
                     )
                 }
@@ -1348,6 +1408,7 @@ object CharacterVoiceRouter {
                     engineUsed = "NOT_TESTED_NO_MODEL",
                     isRealNeuralAudio = false,
                     wavSha256 = "",
+                    errorCategoryCode = "INFERENCE_FAILED",
                     errorReason = "Sherpa native synthesis exception: ${t.message}"
                 )
             }
@@ -1362,6 +1423,7 @@ object CharacterVoiceRouter {
             engineUsed = "NOT_TESTED_NO_MODEL",
             isRealNeuralAudio = false,
             wavSha256 = "",
+            errorCategoryCode = "MODEL_UNAVAILABLE",
             errorReason = "Supertonic ONNX model not installed on device and local Chatterbox server not connected"
         )
     }

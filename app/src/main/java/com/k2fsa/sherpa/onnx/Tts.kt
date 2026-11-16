@@ -152,16 +152,19 @@ internal class NativeAudioCallbackBridge(
  * Official Sherpa-ONNX v2.0.1 Kotlin API for OfflineTts.
  * Zero silent fallback stubs: requires native JNI library and valid native model pointer (ptr != 0L).
  */
-class OfflineTts(
-    assetManager: AssetManager? = null,
-    var config: OfflineTtsConfig,
-) {
-    private var ptr: Long
+open class OfflineTts {
+    var config: OfflineTtsConfig
+    private var ptr: Long = 0L
+    private var isNativeAllocated: Boolean = false
 
-    val nativeHandle: Long
+    open val nativeHandle: Long
         get() = ptr
 
-    init {
+    constructor(
+        assetManager: AssetManager? = null,
+        config: OfflineTtsConfig,
+    ) {
+        this.config = config
         ensureNativeLibraryLoaded()
         check(isNativeLibraryLoaded) {
             "OfflineTts Sherpa-ONNX native JNI library (libsherpa-onnx-jni.so) is not loaded: ${jniLoadError ?: "unknown error"}"
@@ -174,25 +177,35 @@ class OfflineTts(
         require(ptr != 0L) {
             "Invalid OfflineTtsConfig: failed to create native OfflineTts"
         }
+        isNativeAllocated = true
     }
 
-    fun sampleRate(): Int {
+    protected constructor(
+        config: OfflineTtsConfig,
+        customHandleForTesting: Long
+    ) {
+        this.config = config
+        this.ptr = customHandleForTesting
+        this.isNativeAllocated = false
+    }
+
+    open fun sampleRate(): Int {
         check(ptr != 0L) { "OfflineTts native instance has been released (ptr == 0)" }
         return getSampleRate(ptr)
     }
 
-    fun numSpeakers(): Int {
+    open fun numSpeakers(): Int {
         check(ptr != 0L) { "OfflineTts native instance has been released (ptr == 0)" }
         return getNumSpeakers(ptr)
     }
 
     // Language/voice of the model, e.g., "en-us". Empty if not available.
-    fun lang(): String {
+    open fun lang(): String {
         check(ptr != 0L) { "OfflineTts native instance has been released (ptr == 0)" }
         return getLang(ptr)
     }
 
-    fun generate(
+    open fun generate(
         text: String,
         sid: Int = 0,
         speed: Float = 1.0f
@@ -201,7 +214,7 @@ class OfflineTts(
         return generateImpl(ptr, text = text, sid = sid, speed = speed)
     }
 
-    fun generateWithCallback(
+    open fun generateWithCallback(
         text: String,
         sid: Int = 0,
         speed: Float = 1.0f,
@@ -217,7 +230,7 @@ class OfflineTts(
         )
     }
 
-    fun generateWithConfig(
+    open fun generateWithConfig(
         text: String,
         config: GenerationConfig
     ): GeneratedAudio {
@@ -225,7 +238,7 @@ class OfflineTts(
         return generateWithConfigImpl(ptr, text, config, null)
     }
 
-    fun generateWithConfigAndCallback(
+    open fun generateWithConfigAndCallback(
         text: String,
         config: GenerationConfig,
         callback: (samples: FloatArray) -> Int
@@ -248,24 +261,29 @@ class OfflineTts(
             require(ptr != 0L) {
                 "Invalid OfflineTtsConfig: failed to create native OfflineTts"
             }
+            isNativeAllocated = true
         }
     }
 
-    fun free() {
+    open fun free() {
         if (ptr != 0L) {
-            delete(ptr)
+            if (isNativeAllocated) {
+                delete(ptr)
+            }
             ptr = 0
+            isNativeAllocated = false
         }
     }
 
     protected fun finalize() {
-        if (ptr != 0L) {
+        if (ptr != 0L && isNativeAllocated) {
             delete(ptr)
             ptr = 0
+            isNativeAllocated = false
         }
     }
 
-    fun release() = free()
+    open fun release() = free()
 
     private external fun newFromAsset(
         assetManager: AssetManager,

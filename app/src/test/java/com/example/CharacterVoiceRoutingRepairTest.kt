@@ -442,6 +442,83 @@ class CharacterVoiceRoutingRepairTest {
         assertEquals(3, newUniqueCount)
     }
 
+    @Test
+    fun `9_multiline_all_caps_speaker_headers_unknown_gender_and_manual_per_game_character_selection`() {
+        // 9a. Multi-line ALL-CAPS 3-4 letter character headers (ANON, IRA, KAAL, JENNY) must NOT be stripped by SubtitleTextFilter
+        val filteredAnon = com.example.engine.SubtitleTextFilter.filterDialogueText("ANON\nI will protect you.")
+        assertTrue("SubtitleTextFilter must preserve ANON header, got: $filteredAnon", filteredAnon.startsWith("ANON\n"))
+
+        val anonDecision = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = filteredAnon,
+            translatedHindi = "मैं तुम्हारी रक्षा करूँगा।"
+        )
+        assertEquals("anon", anonDecision.normalizedCharacterName)
+        assertEquals(5, anonDecision.selectedSpeakerId)
+        assertEquals("anon_male_ref", anonDecision.characterAssignment.referenceVoiceId)
+        assertTrue("Multi-line header ANON must have confidence >= 0.85, got ${anonDecision.speakerConfidence}", anonDecision.speakerConfidence >= 0.85f)
+        assertEquals("I will protect you.", anonDecision.strippedEnglishDialogue)
+
+        val filteredIra = com.example.engine.SubtitleTextFilter.filterDialogueText("IRA\nStay behind me, enemies ahead!")
+        val iraDecision = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = filteredIra,
+            translatedHindi = "मेरे पीछे रहो, आगे दुश्मन हैं!"
+        )
+        assertEquals("ira", iraDecision.normalizedCharacterName)
+        assertEquals(2, iraDecision.selectedSpeakerId)
+        assertEquals("jenny_female_ref", iraDecision.characterAssignment.referenceVoiceId)
+
+        // 9b. Unlabeled speaker must show "Unknown" and SpeakerGender.UNKNOWN (never pretending to know gender)
+        val unlabeledDecision = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = "Where did everyone go?",
+            translatedHindi = "सब कहाँ चले गए?"
+        )
+        assertEquals("unknown", unlabeledDecision.normalizedCharacterName)
+        assertEquals("Unknown", unlabeledDecision.characterAssignment.displayName)
+        assertTrue(unlabeledDecision.characterAssignment.isUnknownOrNeutral)
+        assertFalse("Unknown speaker must NOT claim isFemale", unlabeledDecision.characterAssignment.isFemale)
+        assertFalse("Unknown speaker must NOT claim isMale", unlabeledDecision.characterAssignment.isMale)
+        assertEquals(SpeakerGender.UNKNOWN, unlabeledDecision.voiceProfile.gender)
+
+        // 9c. Manual active character selection from floating menu saves per game and subsequent recognized character switches voices
+        VoiceProfileRepository.setGameNamespace(context, "genshin_hi")
+        val selectedJenny = VoiceProfileRepository.selectActiveCharacterForGame(
+            context = context,
+            characterNameOrNull = "jenny",
+            gameNamespace = "genshin_hi"
+        )
+        assertNotNull(selectedJenny)
+        assertEquals("jenny", VoiceProfileRepository.getUnlabeledSubtitleManualOverride("genshin_hi")?.characterName)
+
+        // Unlabeled line in genshin_hi now routes to manually selected Jenny (Female, SID 1)
+        val manualUnlabeled = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = "Let's check the northern ruins.",
+            translatedHindi = "चलो उत्तरी खंडहरों की जाँच करते हैं।",
+            gameNamespace = "genshin_hi"
+        )
+        assertEquals("jenny", manualUnlabeled.normalizedCharacterName)
+        assertEquals(1, manualUnlabeled.selectedSpeakerId)
+        assertEquals("jenny_female_ref", manualUnlabeled.characterAssignment.referenceVoiceId)
+
+        // Subsequent recognized character ("ANON\nWatch out!") switches voices to Anon (Male, SID 5)
+        val subsequentRecognizedAnon = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = com.example.engine.SubtitleTextFilter.filterDialogueText("ANON\nWatch out for the trap!"),
+            translatedHindi = "जाल से सावधान रहो!",
+            gameNamespace = "genshin_hi"
+        )
+        assertEquals("anon", subsequentRecognizedAnon.normalizedCharacterName)
+        assertEquals(5, subsequentRecognizedAnon.selectedSpeakerId)
+        assertEquals("anon_male_ref", subsequentRecognizedAnon.characterAssignment.referenceVoiceId)
+
+        // Reset override
+        VoiceProfileRepository.selectActiveCharacterForGame(context, null, "genshin_hi")
+        VoiceProfileRepository.setGameNamespace(context, "default_game")
+    }
+
     private fun writeValidTestPcmWav(target: File) {
         val sampleRate = 16000
         val numSamples = 1600

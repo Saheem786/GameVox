@@ -56,6 +56,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -71,6 +72,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -89,9 +91,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.CharacterVoiceAssignment
 import com.example.data.SpeakerGender
 import com.example.data.SpeakerRole
+import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
 import com.example.service.ForegroundTtsManager
+import com.example.service.SupertonicModelManager
+import com.example.service.SupertonicModelState
+import com.k2fsa.sherpa.onnx.OfflineTts
 import java.util.Locale
 import kotlinx.coroutines.launch
 
@@ -151,6 +157,20 @@ fun VoiceManagerScreen(
     val unlabeledOverrideChar by VoiceProfileRepository.unlabeledOverrideCharName.collectAsStateWithLifecycle()
     val voices by VoiceProfileRepository.voices.collectAsStateWithLifecycle()
     val selectedVoiceId by VoiceProfileRepository.selectedVoiceId.collectAsStateWithLifecycle()
+    val appState by TranslatorStateRepository.state.collectAsStateWithLifecycle()
+    val supertonicModelState by SupertonicModelManager.modelState.collectAsStateWithLifecycle()
+    var integrityReport by remember(supertonicModelState) {
+        mutableStateOf(SupertonicModelManager.verifyModelIntegrity(context))
+    }
+
+    LaunchedEffect(Unit) {
+        integrityReport = SupertonicModelManager.verifyModelIntegrity(context)
+        if (integrityReport.allValid && supertonicModelState !is SupertonicModelState.Ready) {
+            ForegroundTtsManager.getInstance(context).runSupertonicReadinessCheck { _, _ ->
+                integrityReport = SupertonicModelManager.verifyModelIntegrity(context)
+            }
+        }
+    }
 
     var characterToChangeSid by remember { mutableStateOf<CharacterVoiceAssignment?>(null) }
     var characterToRename by remember { mutableStateOf<CharacterVoiceAssignment?>(null) }
@@ -321,64 +341,6 @@ fun VoiceManagerScreen(
                         val uniqueSummary = remember(characterAssignments) {
                             VoiceProfileRepository.getUniqueReferenceVoiceSummary()
                         }
-                        Card(
-                            shape = RoundedCornerShape(14.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 6.dp)
-                                .testTag("voice_library_honest_disclosure_card")
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Text(
-                                    text = "${uniqueSummary.second} Saved Character Profiles • ${uniqueSummary.first} Unique Acoustic Reference WAV Identities",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    text = "Bundled reference audio includes 2 distinct WAVs (anon_male_ref.wav & jenny_female_ref.wav). Profiles sharing a reference WAV share its base vocal timbre unless you import a consented/licensed .wav sample in Configure Voice.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Text(
-                                    text = "Unlabeled Subtitle Handling (No Speaker Tag in OCR):",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    FilterChip(
-                                        selected = unlabeledOverrideChar == null,
-                                        onClick = {
-                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, null)
-                                        },
-                                        label = { Text("Unknown Speaker (Neutral SID #2)", style = MaterialTheme.typography.labelSmall) },
-                                        modifier = Modifier.testTag("unlabeled_mode_unknown")
-                                    )
-                                    FilterChip(
-                                        selected = unlabeledOverrideChar == "anon",
-                                        onClick = {
-                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "anon")
-                                        },
-                                        label = { Text("Override: Anon", style = MaterialTheme.typography.labelSmall) },
-                                        modifier = Modifier.testTag("unlabeled_mode_anon")
-                                    )
-                                    FilterChip(
-                                        selected = unlabeledOverrideChar == "jenny",
-                                        onClick = {
-                                            VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "jenny")
-                                        },
-                                        label = { Text("Override: Jenny", style = MaterialTheme.typography.labelSmall) },
-                                        modifier = Modifier.testTag("unlabeled_mode_jenny")
-                                    )
-                                }
-                            }
-                        }
 
                         // Search bar
                         OutlinedTextField(
@@ -403,7 +365,7 @@ fun VoiceManagerScreen(
                                 .testTag("character_search_input")
                         )
 
-                        // Character Cards List
+                        // Character Cards List with Supertonic 3 Model Readiness & Disclosure at top
                         LazyColumn(
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -411,6 +373,130 @@ fun VoiceManagerScreen(
                                 .fillMaxSize()
                                 .testTag("character_assignment_list")
                         ) {
+                            item(key = "supertonic_model_readiness_card") {
+                                SupertonicModelReadinessCard(
+                                    modelState = supertonicModelState,
+                                    integrityReport = integrityReport,
+                                    voiceEngineWarningMessage = appState.voiceEngineWarningMessage,
+                                    activeBackendType = appState.voiceBackendType,
+                                    onDownloadVerifyAndInit = {
+                                        ForegroundTtsManager.getInstance(context).downloadVerifyAndInitializeSupertonic(
+                                            requireWifi = false,
+                                            onComplete = { ok, finalState ->
+                                                integrityReport = SupertonicModelManager.verifyModelIntegrity(context)
+                                                coroutineScope.launch {
+                                                    val msg = when (finalState) {
+                                                        is SupertonicModelState.Ready ->
+                                                            "Supertonic 3 READY: ${finalState.readinessSummary}"
+                                                        is SupertonicModelState.Error ->
+                                                            "Supertonic 3 Error: ${finalState.errorMessage}"
+                                                        else ->
+                                                            if (ok) "Supertonic 3 initialized" else "Supertonic 3 not ready"
+                                                    }
+                                                    snackbarHostState.showSnackbar(msg)
+                                                }
+                                            }
+                                        )
+                                    },
+                                    onRunReadinessCheck = {
+                                        ForegroundTtsManager.getInstance(context).runSupertonicReadinessCheck { ok, finalState ->
+                                            integrityReport = SupertonicModelManager.verifyModelIntegrity(context)
+                                            coroutineScope.launch {
+                                                val msg = when (finalState) {
+                                                    is SupertonicModelState.Ready ->
+                                                        "Readiness Verified: ${finalState.readinessSummary}"
+                                                    is SupertonicModelState.Error ->
+                                                        "Readiness Failed: ${finalState.errorMessage}"
+                                                    else ->
+                                                        if (ok) "Supertonic 3 ready" else "Supertonic 3 files not downloaded yet"
+                                                }
+                                                snackbarHostState.showSnackbar(msg)
+                                            }
+                                        }
+                                    },
+                                    onTestAnonAndJenny = {
+                                        val anon = VoiceProfileRepository.getAssignmentForCharacter("anon", context)
+                                        val jenny = VoiceProfileRepository.getAssignmentForCharacter("jenny", context)
+                                        val ttsMgr = ForegroundTtsManager.getInstance(context)
+                                        ttsMgr.synthesizeCharacterPreview(
+                                            assignment = anon,
+                                            hindiText = "नमस्ते, मैं अनॉन हूँ। मैं तुम्हारी रक्षा करूँगा।"
+                                        ) { _, anonStatus, _ ->
+                                            ttsMgr.synthesizeCharacterPreview(
+                                                assignment = jenny,
+                                                hindiText = "कृपया मुझे मत छोड़ो! सावधान रहो।"
+                                            ) { _, jennyStatus, _ ->
+                                                coroutineScope.launch {
+                                                    snackbarHostState.showSnackbar(
+                                                        "Anon (SID #${anon.speakerId}): $anonStatus | Jenny (SID #${jenny.speakerId}): $jennyStatus"
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+
+                            item(key = "voice_library_honest_disclosure_card") {
+                                Card(
+                                    shape = RoundedCornerShape(14.dp),
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("voice_library_honest_disclosure_card")
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "${uniqueSummary.second} Saved Character Profiles • ${uniqueSummary.first} Unique Acoustic Reference WAV Identities",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            text = "Bundled reference audio includes 2 distinct WAVs (anon_male_ref.wav & jenny_female_ref.wav). Profiles sharing a reference WAV share its base vocal timbre unless you import a consented/licensed .wav sample in Configure Voice.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = "Unlabeled Subtitle Handling (No Speaker Tag in OCR):",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            FilterChip(
+                                                selected = unlabeledOverrideChar == null,
+                                                onClick = {
+                                                    VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, null)
+                                                },
+                                                label = { Text("Unknown Speaker (Neutral SID #2)", style = MaterialTheme.typography.labelSmall) },
+                                                modifier = Modifier.testTag("unlabeled_mode_unknown")
+                                            )
+                                            FilterChip(
+                                                selected = unlabeledOverrideChar == "anon",
+                                                onClick = {
+                                                    VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "anon")
+                                                },
+                                                label = { Text("Override: Anon", style = MaterialTheme.typography.labelSmall) },
+                                                modifier = Modifier.testTag("unlabeled_mode_anon")
+                                            )
+                                            FilterChip(
+                                                selected = unlabeledOverrideChar == "jenny",
+                                                onClick = {
+                                                    VoiceProfileRepository.setUnlabeledSubtitleManualOverride(context, "jenny")
+                                                },
+                                                label = { Text("Override: Jenny", style = MaterialTheme.typography.labelSmall) },
+                                                modifier = Modifier.testTag("unlabeled_mode_jenny")
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
                             items(filteredCharacters, key = { it.characterName }) { charItem ->
                                 val isCurrentlyActive = activeCharacterAssignment?.characterName == charItem.characterName
                                 val sharingDisclosure = remember(charItem, characterAssignments) {
@@ -1534,3 +1620,346 @@ private fun VoiceMatrixCard(
         }
     }
 }
+
+@Composable
+private fun SupertonicModelReadinessCard(
+    modelState: SupertonicModelState,
+    integrityReport: SupertonicModelManager.ModelIntegrityReport,
+    voiceEngineWarningMessage: String,
+    activeBackendType: String,
+    onDownloadVerifyAndInit: () -> Unit,
+    onRunReadinessCheck: () -> Unit,
+    onTestAnonAndJenny: () -> Unit
+) {
+    val context = LocalContext.current
+    val modelDirPath = remember(context) {
+        SupertonicModelManager.getModelDirectory(context).absolutePath
+    }
+    val isReady = modelState is SupertonicModelState.Ready && modelState.nativeInferenceVerified
+    val isBusy = modelState is SupertonicModelState.Downloading ||
+        modelState is SupertonicModelState.VerifyingSha256 ||
+        modelState is SupertonicModelState.InitializingNative
+    val isSingleVoiceFallbackActive = !isReady ||
+        activeBackendType.startsWith("SYSTEM_FALLBACK_SINGLE_VOICE") ||
+        voiceEngineWarningMessage.isNotBlank()
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isReady) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+            }
+        ),
+        border = BorderStroke(
+            width = 1.5.dp,
+            color = if (isReady) {
+                MaterialTheme.colorScheme.primary
+            } else if (modelState is SupertonicModelState.Error) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.outlineVariant
+            }
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("supertonic_model_readiness_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Supertonic 3 Hindi Neural TTS Model",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "10 On-Device Neural Speakers • Anon (SID #5) & Jenny (SID #1)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                val (badgeText, badgeContainer, badgeContent) = when (modelState) {
+                    is SupertonicModelState.Ready -> Triple(
+                        "READY (NATIVE VERIFIED)",
+                        MaterialTheme.colorScheme.primary,
+                        MaterialTheme.colorScheme.onPrimary
+                    )
+                    is SupertonicModelState.Downloading -> Triple(
+                        "DOWNLOADING ${(modelState.progressFraction * 100).toInt()}%",
+                        MaterialTheme.colorScheme.tertiary,
+                        MaterialTheme.colorScheme.onTertiary
+                    )
+                    is SupertonicModelState.VerifyingSha256 -> Triple(
+                        "VERIFYING SHA-256",
+                        MaterialTheme.colorScheme.tertiary,
+                        MaterialTheme.colorScheme.onTertiary
+                    )
+                    is SupertonicModelState.InitializingNative -> Triple(
+                        "PROBING NATIVE TTS",
+                        MaterialTheme.colorScheme.tertiary,
+                        MaterialTheme.colorScheme.onTertiary
+                    )
+                    is SupertonicModelState.Error -> Triple(
+                        "ERROR / NOT READY",
+                        MaterialTheme.colorScheme.error,
+                        MaterialTheme.colorScheme.onError
+                    )
+                    else -> Triple(
+                        "NOT DOWNLOADED",
+                        MaterialTheme.colorScheme.errorContainer,
+                        MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = badgeContainer,
+                    modifier = Modifier.testTag("supertonic_readiness_status_badge")
+                ) {
+                    Text(
+                        text = badgeText,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = badgeContent,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            // Explicit Warning Banner when SYSTEM_FALLBACK_SINGLE_VOICE is used
+            if (isSingleVoiceFallbackActive) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("system_fallback_single_voice_warning_banner")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "⚠ SYSTEM_FALLBACK_SINGLE_VOICE WARNING",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Text(
+                            text = voiceEngineWarningMessage.ifBlank {
+                                "Supertonic 3 neural model is not ready in $modelDirPath. Anon (SID #5) and Jenny (SID #1) will use Android's single-voice fallback and sound identical during live gameplay until you download, SHA-256 verify, and initialize Supertonic 3 below."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                }
+            }
+
+            // Progress telemetry during Download / SHA-256 / Native Initialization
+            when (modelState) {
+                is SupertonicModelState.Downloading -> {
+                    val mbDone = String.format(Locale.US, "%.1f", modelState.bytesDownloaded / 1_000_000.0)
+                    val mbTotal = String.format(Locale.US, "%.1f", modelState.totalBytes / 1_000_000.0)
+                    val pct = (modelState.progressFraction * 100f).toInt().coerceIn(0, 100)
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("supertonic_download_progress_section")
+                    ) {
+                        LinearProgressIndicator(
+                            progress = { modelState.progressFraction.coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                        )
+                        Text(
+                            text = "Downloading ${modelState.currentFileName} (${modelState.currentFileIndex}/${modelState.totalFilesCount}) • $mbDone / $mbTotal MB ($pct%)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+                is SupertonicModelState.VerifyingSha256 -> {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("supertonic_sha256_progress_section")
+                    ) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                        )
+                        Text(
+                            text = "Verifying SHA-256 hash: ${modelState.currentFileName} (${modelState.verifiedFilesCount + 1}/${modelState.totalFilesCount})...",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+                is SupertonicModelState.InitializingNative -> {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("supertonic_native_init_progress_section")
+                    ) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                        )
+                        Text(
+                            text = modelState.stepDescription,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+                is SupertonicModelState.Error -> {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("supertonic_exact_error_box")
+                    ) {
+                        Text(
+                            text = "Exact Error: ${modelState.errorMessage}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+                is SupertonicModelState.Ready -> {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("supertonic_ready_summary_box")
+                    ) {
+                        Text(
+                            text = modelState.readinessSummary.ifBlank {
+                                "All 7 model files SHA-256 verified (${modelState.totalSizeBytes / 1_000_000} MB) & native Hindi inference verified for Anon (SID #5) and Jenny (SID #1)."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+                else -> {}
+            }
+
+            // Diagnostic details row
+            Text(
+                text = "Directory: $modelDirPath\nSHA-256 Verified Files: ${integrityReport.verifiedFilesCount} / ${integrityReport.totalFilesCount} • JNI: ${OfflineTts.jniStatusSummary}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("supertonic_diagnostic_details_text")
+            )
+
+            // Action Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onDownloadVerifyAndInit,
+                    enabled = !isBusy,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1.3f)
+                        .testTag("supertonic_download_verify_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Download and Verify Supertonic 3",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = when {
+                            isReady -> "Re-Verify Model"
+                            integrityReport.verifiedFilesCount in 1 until integrityReport.totalFilesCount ->
+                                "Resume Download (${integrityReport.verifiedFilesCount}/7)"
+                            modelState is SupertonicModelState.Error ->
+                                "Retry Download & Verify"
+                            else ->
+                                "Download & Verify (~145 MB)"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onRunReadinessCheck,
+                    enabled = !isBusy,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("supertonic_verify_readiness_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = "Run Readiness Check",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Readiness Check",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
+
+            OutlinedButton(
+                onClick = onTestAnonAndJenny,
+                enabled = !isBusy,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("supertonic_test_anon_jenny_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.PlayArrow,
+                    contentDescription = "Test Anon and Jenny Voices",
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Test Both Characters: Anon (Male SID #5) & Jenny (Female SID #1)",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+

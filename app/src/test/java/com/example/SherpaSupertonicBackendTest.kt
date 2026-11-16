@@ -2,14 +2,24 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.TranslatorStateRepository
+import com.example.data.VoiceProfileRepository
+import com.example.engine.CanonicalVoiceBackend
+import com.example.engine.CharacterVoiceRouter
+import com.example.service.ForegroundTtsManager
+import com.example.service.FreeVoiceBackend
 import com.example.service.SherpaSupertonicBackend
 import com.example.service.SupertonicModelManager
 import com.example.service.SupertonicModelState
+import com.k2fsa.sherpa.onnx.GeneratedAudio
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.sun.net.httpserver.HttpServer
 import java.io.File
 import java.io.RandomAccessFile
+import java.net.InetSocketAddress
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.zip.ZipFile
 import kotlin.math.sin
 import kotlinx.coroutines.runBlocking
@@ -35,11 +45,17 @@ class SherpaSupertonicBackendTest {
     fun setup() {
         context = ApplicationProvider.getApplicationContext()
         SupertonicModelManager.overrideModelDirectory = null
+        SupertonicModelManager.overrideBaseDownloadUrl = null
+        SupertonicModelManager.overrideBackendFactoryForTest = null
+        SupertonicModelManager.clearNativeVerificationState()
     }
 
     @After
     fun tearDown() {
         SupertonicModelManager.overrideModelDirectory = null
+        SupertonicModelManager.overrideBaseDownloadUrl = null
+        SupertonicModelManager.overrideBackendFactoryForTest = null
+        SupertonicModelManager.clearNativeVerificationState()
     }
 
     @Test
@@ -359,5 +375,222 @@ class SherpaSupertonicBackendTest {
         val backend = SherpaSupertonicBackend(context)
         backend.stop()
         backend.release()
+    }
+
+    private class FakeTestOfflineTts(
+        config: OfflineTtsConfig = OfflineTtsConfig(),
+        private val shouldReturnSilence: Boolean = false,
+        private val shouldThrowOnInference: Boolean = false,
+        val recordedSids: MutableList<Int> = CopyOnWriteArrayList()
+    ) : OfflineTts(config, customHandleForTesting = 0x7F001122L) {
+
+        override fun sampleRate(): Int = 44100
+
+        override fun numSpeakers(): Int = 10
+
+        override fun generateWithConfig(text: String, config: GenerationConfig): GeneratedAudio {
+            if (shouldThrowOnInference) {
+                throw IllegalStateException("Simulated native ONNX runtime inference failure for sid=${config.sid}")
+            }
+            recordedSids.add(config.sid)
+            val freq = if (config.sid == 5) 140.0 else if (config.sid == 1) 235.0 else (150.0 + config.sid * 15.0)
+            val samples = if (shouldReturnSilence) {
+                FloatArray(22050) { 0f }
+            } else {
+                FloatArray(22050) { i ->
+                    (0.28 * sin(2.0 * Math.PI * freq * i / 44100.0)).toFloat()
+                }
+            }
+            return GeneratedAudio(samples = samples, sampleRate = 44100)
+        }
+
+        override fun generateWithConfigAndCallback(
+            text: String,
+            config: GenerationConfig,
+            callback: (samples: FloatArray) -> Int
+        ): GeneratedAudio {
+            val generated = generateWithConfig(text, config)
+            callback(generated.samples)
+            return generated
+        }
+    }
+
+    @Test
+    fun testModelNotMarkedReadyWhenFilesValidButNativeInferenceFailsOrSilent() {
+        val realModelDir = File("/tmp/supertonic_test")
+        if (!realModelDir.exists() || !SupertonicModelManager.REQUIRED_FILES.all { File(realModelDir, it).exists() }) {
+            return
+        }
+
+        SupertonicModelManager.overrideModelDirectory = realModelDir
+        assertTrue(
+            "All 7 model files on disk must pass SHA-256 verification",
+            SupertonicModelManager.areModelFilesVerifiedOnDisk(context)
+        )
+
+        // 1. Native inference throws -> MUST NOT mark model Ready
+        val throwingBackend = SherpaSupertonicBackend(context) { cfg ->
+            FakeTestOfflineTts(cfg, shouldThrowOnInference = true)
+        }
+        val readyWhenThrowing = SupertonicModelManager.verifyAndInitializeReadiness(context, throwingBackend)
+        assertFalse("Model must NOT be marked ready when native inference throws", readyWhenThrowing)
+        assertFalse(SupertonicModelManager.isModelReady(context))
+        val errState1 = SupertonicModelManager.modelState.value
+        assertTrue("State must be Error when native inference throws, got $errState1", errState1 is SupertonicModelState.Error)
+        assertTrue((errState1 as SupertonicModelState.Error).errorMessage.contains("Native inference"))
+
+        // 2. Native inference returns silent PCM -> MUST NOT mark model Ready
+        val silentBackend = SherpaSupertonicBackend(context) { cfg ->
+            FakeTestOfflineTts(cfg, shouldReturnSilence = true)
+        }
+        val readyWhenSilent = SupertonicModelManager.verifyAndInitializeReadiness(context, silentBackend)
+        assertFalse("Model must NOT be marked ready when native inference returns silent audio", readyWhenSilent)
+        assertFalse(SupertonicModelManager.isModelReady(context))
+        val errState2 = SupertonicModelManager.modelState.value
+        assertTrue("State must be Error when native inference is silent, got $errState2", errState2 is SupertonicModelState.Error)
+
+        // 3. Native inference succeeds for both Anon (SID #5) and Jenny (SID #1) -> Marked Ready!
+        val recordedSids = CopyOnWriteArrayList<Int>()
+        val validBackend = SherpaSupertonicBackend(context) { cfg ->
+            FakeTestOfflineTts(cfg, recordedSids = recordedSids)
+        }
+        val readyWhenValid = SupertonicModelManager.verifyAndInitializeReadiness(context, validBackend)
+        assertTrue("Model must be marked Ready after both SID 5 and SID 1 native inference succeed", readyWhenValid)
+        assertTrue(SupertonicModelManager.isModelReady(context))
+        assertTrue("Readiness probe must test Male SID #5", recordedSids.contains(5))
+        assertTrue("Readiness probe must test Female SID #1", recordedSids.contains(1))
+        val readyState = SupertonicModelManager.modelState.value
+        assertTrue(readyState is SupertonicModelState.Ready)
+        assertTrue((readyState as SupertonicModelState.Ready).nativeInferenceVerified)
+        assertTrue(readyState.sid5Rms > 0.1f)
+        assertTrue(readyState.sid1Rms > 0.1f)
+    }
+
+    @Test
+    fun testHttp307RelativeRedirectAndExactDownloadErrorReporting() = runBlocking {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        val redirectPayload = "verified-redirect-payload".toByteArray()
+
+        // Endpoint 1: Returns HTTP 307 Temporary Redirect with a RELATIVE Location header (like HuggingFace)
+        server.createContext("/resolve/main/tts.json") { exchange ->
+            exchange.responseHeaders.add("Location", "/api/resolve-cache/models/tts.json")
+            exchange.sendResponseHeaders(307, -1)
+            exchange.close()
+        }
+        server.createContext("/api/resolve-cache/models/tts.json") { exchange ->
+            exchange.sendResponseHeaders(200, redirectPayload.size.toLong())
+            exchange.responseBody.use { it.write(redirectPayload) }
+        }
+        // Endpoint 2: Returns HTTP 503 Service Unavailable for duration_predictor.int8.onnx
+        server.createContext("/resolve/main/duration_predictor.int8.onnx") { exchange ->
+            exchange.sendResponseHeaders(503, -1)
+            exchange.close()
+        }
+        server.start()
+
+        val tempDownloadDir = File(context.cacheDir, "redirect_download_test")
+        tempDownloadDir.deleteRecursively()
+
+        try {
+            // Test A: Verify openConnectionFollowingRedirects resolves HTTP 307 + relative Location header
+            val initialUrl = java.net.URL("http://127.0.0.1:$port/resolve/main/tts.json")
+            val (conn, finalUrl) = SupertonicModelManager.openConnectionFollowingRedirects(initialUrl)
+            assertEquals(200, conn.responseCode)
+            assertTrue(finalUrl.path.endsWith("/api/resolve-cache/models/tts.json"))
+            val bodyBytes = conn.inputStream.use { it.readBytes() }
+            conn.disconnect()
+            assertEquals("verified-redirect-payload", String(bodyBytes))
+
+            // Test B: Verify downloadModel surfaces exact HTTP 503 error and file name
+            SupertonicModelManager.overrideModelDirectory = tempDownloadDir
+            SupertonicModelManager.overrideBaseDownloadUrl = "http://127.0.0.1:$port/resolve/main/"
+            val downloadOk = SupertonicModelManager.downloadModel(context, requireWifi = false)
+            assertFalse("Download must fail when server returns HTTP 503", downloadOk)
+            val stateAfter503 = SupertonicModelManager.modelState.value
+            assertTrue("State must be Error after HTTP 503, got: $stateAfter503", stateAfter503 is SupertonicModelState.Error)
+            val errMsg = (stateAfter503 as SupertonicModelState.Error).errorMessage
+            assertTrue("Error message must include file name and HTTP 503, got: $errMsg", errMsg.contains("duration_predictor.int8.onnx") && errMsg.contains("503"))
+        } finally {
+            server.stop(0)
+            tempDownloadDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testLiveGameSpeechUsesResolvedAnonSid5AndJennySid1AndWarnsOnSingleVoiceFallback() = runBlocking {
+        TranslatorStateRepository.loadPreferences(context)
+        VoiceProfileRepository.initialize(context)
+        VoiceProfileRepository.setGameNamespace(context, "default_game")
+        VoiceProfileRepository.restoreAllCharacterDefaults(context)
+
+        // 1. Verify live OCR route decisions resolve Anon -> SID 5 and Jenny -> SID 1
+        val anonRoute = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = "[Anon]: Stand back, I will handle this!",
+            translatedHindi = "पीछे हटो, मैं इसे संभाल लूँगा!"
+        )
+        val jennyRoute = CharacterVoiceRouter.routeLiveSubtitle(
+            context = context,
+            rawOcrSubtitle = "[Jenny]: Be careful out there!",
+            translatedHindi = "वहाँ सावधान रहना!"
+        )
+        assertEquals(5, anonRoute.selectedSpeakerId)
+        assertEquals(1, jennyRoute.selectedSpeakerId)
+
+        // 2. Verify SherpaSupertonicBackend receives exact resolved SIDs (5 and 1) during synthesis
+        val synthesizedSids = CopyOnWriteArrayList<Int>()
+        val backend = SherpaSupertonicBackend(context) { cfg ->
+            FakeTestOfflineTts(cfg, recordedSids = synthesizedSids)
+        }
+        assertTrue(backend.initialize())
+        synthesizedSids.clear()
+
+        val anonSynthOk = backend.synthesizeAndPlay(
+            text = anonRoute.hindiDialogue,
+            sid = anonRoute.selectedSpeakerId,
+            speed = anonRoute.characterAssignment.speed,
+            pitch = anonRoute.characterAssignment.pitch,
+            epoch = 101L
+        )
+        val jennySynthOk = backend.synthesizeAndPlay(
+            text = jennyRoute.hindiDialogue,
+            sid = jennyRoute.selectedSpeakerId,
+            speed = jennyRoute.characterAssignment.speed,
+            pitch = jennyRoute.characterAssignment.pitch,
+            epoch = 102L
+        )
+        assertTrue(anonSynthOk)
+        assertTrue(jennySynthOk)
+        assertEquals(listOf(5, 1), synthesizedSids.toList())
+        backend.release()
+
+        // 3. When Supertonic model is NOT installed and live speech falls back to SYSTEM_FALLBACK_SINGLE_VOICE,
+        //    verify an explicit warning is emitted to TranslatorStateRepository.state.value.voiceEngineWarningMessage
+        SupertonicModelManager.uninstallModel(context)
+        TranslatorStateRepository.clearVoiceEngineWarning()
+        TranslatorStateRepository.setFreeVoiceBackend(context, FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT)
+
+        val ttsManager = ForegroundTtsManager.getInstance(context)
+        ttsManager.speakNonBlocking(
+            text = anonRoute.hindiDialogue,
+            voiceProfile = anonRoute.voiceProfile,
+            sourceEnglishText = anonRoute.strippedEnglishDialogue,
+            characterAssignment = anonRoute.characterAssignment,
+            routeDecision = anonRoute
+        )
+
+        // Wait briefly for the async SHERPA_DIRECT -> triggerSingleSystemFallback dispatch
+        var waitMs = 0
+        while (TranslatorStateRepository.state.value.voiceEngineWarningMessage.isBlank() && waitMs < 1500) {
+            kotlinx.coroutines.delay(50)
+            waitMs += 50
+        }
+
+        val warning = TranslatorStateRepository.state.value.voiceEngineWarningMessage
+        assertTrue(
+            "Expected explicit SYSTEM_FALLBACK_SINGLE_VOICE warning when Supertonic 3 model is missing, got: '$warning'",
+            warning.contains("SYSTEM_FALLBACK_SINGLE_VOICE") || warning.contains("Supertonic 3")
+        )
     }
 }

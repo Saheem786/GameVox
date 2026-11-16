@@ -374,6 +374,7 @@ object EmotionSpeechEngine {
                 val p = when (gender) {
                     SpeakerGender.FEMALE_18 -> (baseGenderPitch * 1.07f).coerceIn(1.20f, 1.38f)
                     SpeakerGender.MALE_18 -> (baseGenderPitch * 1.25f).coerceIn(1.10f, 1.24f)
+                    SpeakerGender.UNKNOWN -> (baseGenderPitch * 1.08f).coerceIn(0.95f, 1.18f)
                 }
                 val r = (baseGenderRate * 1.10f).coerceIn(1.08f, 1.25f)
                 Triple(p, r, 1.0f)
@@ -395,6 +396,7 @@ object EmotionSpeechEngine {
                 val p = when (gender) {
                     SpeakerGender.FEMALE_18 -> (baseGenderPitch * 0.74f).coerceIn(0.80f, 0.94f)
                     SpeakerGender.MALE_18 -> (baseGenderPitch * 0.84f).coerceIn(0.70f, 0.82f)
+                    SpeakerGender.UNKNOWN -> (baseGenderPitch * 0.88f).coerceIn(0.82f, 0.96f)
                 }
                 val r = (baseGenderRate * 0.80f).coerceIn(0.74f, 0.86f)
                 Triple(p, r, 0.90f)
@@ -404,6 +406,7 @@ object EmotionSpeechEngine {
                 val p = when (gender) {
                     SpeakerGender.FEMALE_18 -> 0.96f
                     SpeakerGender.MALE_18 -> 0.82f
+                    SpeakerGender.UNKNOWN -> 0.92f
                 }
                 Triple(p, 0.72f, 0.35f)
             }
@@ -462,6 +465,7 @@ object EmotionSpeechEngine {
             SpeechEmotion.NEUTRAL -> when (gender) {
                 SpeakerGender.FEMALE_18 -> "+14%"
                 SpeakerGender.MALE_18 -> "-8%"
+                SpeakerGender.UNKNOWN -> "+0%"
             }
         }
 

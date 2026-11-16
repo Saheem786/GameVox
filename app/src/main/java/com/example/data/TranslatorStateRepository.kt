@@ -254,7 +254,9 @@ data class TranslatorAppState(
     val chatterboxConditionalsCachedCount: Int = 0,
     val chatterboxPingRttMs: Long = 0L,
     val isTestingChatterboxConnection: Boolean = false,
+    val chatterboxErrorCategory: String = "NONE",
     val chatterboxServerStatusText: String = "Not tested — enter Windows PC local IP (e.g. http://192.168.1.100:8765) & tap Test",
+    val voiceEngineWarningMessage: String = "",
     val isRunningTtsBenchmark: Boolean = false,
     val isRealHardwareBenchmark: Boolean = false,
     val ttsBenchmarkSummary: String = "Not run yet — tap Run TTS Benchmark on an Android device",
@@ -859,7 +861,9 @@ object TranslatorStateRepository {
         uniqueVoicesSha256Count: Int? = null,
         conditionalsCachedCount: Int? = null,
         pingRttMs: Long? = null,
-        isTesting: Boolean = false
+        isTesting: Boolean = false,
+        errorCategory: String? = null,
+        warningMessage: String? = null
     ) {
         _state.update {
             it.copy(
@@ -874,9 +878,36 @@ object TranslatorStateRepository {
                 chatterboxUniqueVoicesSha256Count = uniqueVoicesSha256Count ?: it.chatterboxUniqueVoicesSha256Count,
                 chatterboxConditionalsCachedCount = conditionalsCachedCount ?: it.chatterboxConditionalsCachedCount,
                 chatterboxPingRttMs = pingRttMs ?: it.chatterboxPingRttMs,
-                isTestingChatterboxConnection = isTesting
+                isTestingChatterboxConnection = isTesting,
+                chatterboxErrorCategory = errorCategory ?: if (reachable && modelLoaded) "NONE" else it.chatterboxErrorCategory,
+                voiceEngineWarningMessage = warningMessage ?: if (reachable && modelLoaded) "" else it.voiceEngineWarningMessage
             )
         }
+    }
+
+    fun updateVoiceEngineWarning(
+        warningMessage: String,
+        errorCategory: String? = null
+    ) {
+        _state.update {
+            it.copy(
+                voiceEngineWarningMessage = warningMessage,
+                chatterboxErrorCategory = errorCategory ?: it.chatterboxErrorCategory
+            )
+        }
+    }
+
+    fun clearVoiceEngineWarning() {
+        _state.update {
+            it.copy(
+                voiceEngineWarningMessage = "",
+                chatterboxErrorCategory = "NONE"
+            )
+        }
+    }
+
+    fun setFreeVoiceBackend(context: Context, backend: com.example.service.FreeVoiceBackend) {
+        updateFreeVoiceBackend(context, backend)
     }
 
     fun updateDiagnosisMetrics(

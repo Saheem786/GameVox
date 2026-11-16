@@ -202,7 +202,19 @@ fun DubbingModeSwitchCard(
                             "SYSTEM_FALLBACK_SINGLE_VOICE (${state.activeTtsEngineLabel})"
                         }
                         Text(
-                            text = "Honest Backend Notice: PC Chatterbox server is not connected right now. Actual audio uses $actualActiveFallback until the PC server is reachable.",
+                            text = "⚠ Honest Backend Notice: PC Chatterbox server is not connected right now. Actual audio uses $actualActiveFallback until the PC server is reachable.",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else if (!supertonicReady && currentBackend != FreeVoiceBackend.PAUSE_DUBBING) {
+                        val fallbackLabel = if (state.supportsDistinctGenderVoices) {
+                            "SYSTEM_FALLBACK (${state.activeTtsEngineLabel})"
+                        } else {
+                            "SYSTEM_FALLBACK_SINGLE_VOICE (${state.activeTtsEngineLabel} — 1 single voice)"
+                        }
+                        Text(
+                            text = "⚠ Single-Voice Fallback Warning: Supertonic 3 model assets are not ready yet. Live speech uses $fallbackLabel until you download & verify Supertonic 3 in Voice Manager.",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.error

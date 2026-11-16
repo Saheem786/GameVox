@@ -537,7 +537,8 @@ class ImageProcessor(
     ): List<DetectedOverlayBlock> {
         if (visionText.textBlocks.isEmpty()) return emptyList()
 
-        val subtitleZoneTopThreshold = (frameHeight * 0.15f).toInt()
+        // Allow speaker headers near the top of the captured subtitle frame while still flagging bottom-85% blocks
+        val subtitleZoneTopThreshold = (frameHeight * 0.08f).toInt()
 
         return visionText.textBlocks
             .sortedWith(
@@ -555,7 +556,8 @@ class ImageProcessor(
                     null
                 } else {
                     val box = block.boundingBox
-                    val isSubtitleOverlay = box == null || box.centerY() >= subtitleZoneTopThreshold
+                    val isKnownHeader = SpeakerHeuristicEngine.isKnownCharacterOrSpeakerHeader(cleanedBlockText)
+                    val isSubtitleOverlay = isKnownHeader || box == null || box.centerY() >= subtitleZoneTopThreshold
                     DetectedOverlayBlock(
                         text = cleanedBlockText,
                         boundingBox = box,

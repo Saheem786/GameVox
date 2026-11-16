@@ -376,12 +376,12 @@ class GoogleCloudTtsService(
         return if (normalizedLang.equals("hi-IN", ignoreCase = true)) {
             when (gender) {
                 SpeakerGender.FEMALE_18 -> listOf("hi-IN-Neural2-A", "hi-IN-Neural2-D", "hi-IN-Wavenet-A")
-                SpeakerGender.MALE_18 -> listOf("hi-IN-Neural2-B", "hi-IN-Neural2-C", "hi-IN-Wavenet-B")
+                SpeakerGender.MALE_18, SpeakerGender.UNKNOWN -> listOf("hi-IN-Neural2-B", "hi-IN-Neural2-C", "hi-IN-Wavenet-B")
             }
         } else {
             when (gender) {
                 SpeakerGender.FEMALE_18 -> listOf("$normalizedLang-Neural2-A", "$normalizedLang-Wavenet-A")
-                SpeakerGender.MALE_18 -> listOf("$normalizedLang-Neural2-B", "$normalizedLang-Wavenet-B")
+                SpeakerGender.MALE_18, SpeakerGender.UNKNOWN -> listOf("$normalizedLang-Neural2-B", "$normalizedLang-Wavenet-B")
             }
         }
     }

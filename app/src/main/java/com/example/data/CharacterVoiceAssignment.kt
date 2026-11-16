@@ -39,8 +39,19 @@ data class CharacterVoiceAssignment(
     val cfgWeight: Float = 0.40f,
     val speakerConsentConfirmed: Boolean = true
 ) {
+    val isUnknownOrNeutral: Boolean
+        get() = characterName.equals(UNKNOWN_SPEAKER_NAME, ignoreCase = true) ||
+            voicePresentation.equals("unknown", ignoreCase = true) ||
+            voicePresentation.equals("neutral", ignoreCase = true)
+
     val isFemale: Boolean
-        get() = voicePresentation.equals("female", ignoreCase = true) || speakerId in 0..4
+        get() = !isUnknownOrNeutral && (
+            voicePresentation.equals("female", ignoreCase = true) ||
+                (!voicePresentation.equals("male", ignoreCase = true) && speakerId in 0..4)
+        )
+
+    val isMale: Boolean
+        get() = !isUnknownOrNeutral && !isFemale
 
     val isUserOverridden: Boolean
         get() = isUserOverride
@@ -60,21 +71,21 @@ data class CharacterVoiceAssignment(
         /**
          * Explicit Unknown/Unlabeled speaker profile used when OCR text has no speaker label
          * or low label confidence and the user has not configured a manual unlabeled override.
-         * Prevents silently attributing unlabeled alternating lines to Anon (Male Lead).
+         * Shows "Unknown" rather than pretending to know the gender or silently reusing Anon.
          */
         val UNKNOWN_SPEAKER_PRESET = CharacterVoiceAssignment(
             characterName = UNKNOWN_SPEAKER_NAME,
-            displayName = "Unknown Speaker (Unlabeled)",
+            displayName = "Unknown",
             gameNamespace = DEFAULT_GAME_NAMESPACE,
             speakerId = 2,
             speed = 1.00f,
             pitch = 1.00f,
             isUserOverride = false,
-            characterRoleNote = "Unlabeled Subtitle Fallback • Neutral Narrator (sid: 2)",
+            characterRoleNote = "Unknown Speaker • Unlabeled Subtitle (sid: 2)",
             referenceVoiceId = DEFAULT_FEMALE_REF_ID,
             referenceAudioSha256 = JENNY_FEMALE_REF_SHA256,
-            voicePresentation = "neutral",
-            vocalStyleDescription = "Neutral Unlabeled Line Fallback (Manual override available)",
+            voicePresentation = "unknown",
+            vocalStyleDescription = "Unknown Speaker (Unlabeled Subtitle • Select character manually in Floating Menu)",
             voiceEngine = "follow_global",
             defaultEmotion = "neutral",
             exaggeration = 0.40f,

@@ -121,6 +121,18 @@ class SherpaSupertonicBackend(
         private set
 
     @Volatile
+    var isNativeInferenceVerified: Boolean = false
+        private set
+
+    @Volatile
+    var lastNativeProbeSid5Rms: Float = 0.0f
+        private set
+
+    @Volatile
+    var lastNativeProbeSid1Rms: Float = 0.0f
+        private set
+
+    @Volatile
     private var cachedSampleRate: Int = 0
 
     @Volatile
@@ -155,10 +167,10 @@ class SherpaSupertonicBackend(
     )
 
     val isHardwareExecution: Boolean
-        get() = isReady && OfflineTts.isNativeLibraryLoaded && (offlineTts?.nativeHandle ?: 0L) != 0L
+        get() = isReady && isNativeInferenceVerified && OfflineTts.isNativeLibraryLoaded && (offlineTts?.nativeHandle ?: 0L) != 0L
 
     val isModelRuntimeInitialized: Boolean
-        get() = isReady && offlineTts != null && (offlineTts?.nativeHandle ?: 0L) != 0L
+        get() = isReady && isNativeInferenceVerified && offlineTts != null && (offlineTts?.nativeHandle ?: 0L) != 0L
 
     override val currentBackendLabel: String
         get() = if (isModelRuntimeInitialized) {
@@ -174,48 +186,117 @@ class SherpaSupertonicBackend(
         get() = if (cachedNumSpeakers > 0) cachedNumSpeakers else MAX_SUPERTONIC_SPEAKERS
 
     /**
+     * Runs a fast Hindi native inference readiness check on [tts] for both Male (`Anon`, SID #5)
+     * and Female (`Jenny`, SID #1), ensuring non-silent PCM synthesis succeeds before marking ready.
+     */
+    private fun verifyNativeInferenceReadinessOnTts(tts: OfflineTts): Pair<Float, Float> {
+        val availableSpeakers = tts.numSpeakers().coerceAtLeast(1)
+        val probeSidMale = 5.coerceIn(0, availableSpeakers - 1)
+        val probeSidFemale = 1.coerceIn(0, availableSpeakers - 1)
+        val probeSteps = configuredNumSteps.coerceIn(2, 5)
+        val probeText = "नमस्ते"
+
+        val maleConfig = GenerationConfig(
+            silenceScale = 0.2f,
+            speed = 1.0f,
+            sid = probeSidMale,
+            numSteps = probeSteps,
+            extra = mapOf("lang" to "hi")
+        )
+        val maleAudio = tts.generateWithConfig(probeText, maleConfig)
+        val maleRms = computeWaveformRms(maleAudio.samples)
+        check(maleAudio.samples.isNotEmpty() && maleRms >= MIN_NON_SILENT_RMS) {
+            "Native Hindi inference probe failed for Male SID #$probeSidMale (samples=${maleAudio.samples.size}, rms=$maleRms)"
+        }
+
+        val femaleConfig = GenerationConfig(
+            silenceScale = 0.2f,
+            speed = 1.0f,
+            sid = probeSidFemale,
+            numSteps = probeSteps,
+            extra = mapOf("lang" to "hi")
+        )
+        val femaleAudio = tts.generateWithConfig(probeText, femaleConfig)
+        val femaleRms = computeWaveformRms(femaleAudio.samples)
+        check(femaleAudio.samples.isNotEmpty() && femaleRms >= MIN_NON_SILENT_RMS) {
+            "Native Hindi inference probe failed for Female SID #$probeSidFemale (samples=${femaleAudio.samples.size}, rms=$femaleRms)"
+        }
+
+        return maleRms to femaleRms
+    }
+
+    /**
      * Initializes the in-process [OfflineTts] engine using on-device Supertonic 3 model files.
-     * Validates SHA-256 model integrity, native JNI handle (ptr != 0L), real sample rate, and speaker count.
+     * Validates SHA-256 model integrity, native JNI handle (ptr != 0L), real sample rate, speaker count,
+     * AND runs a real Hindi native inference check for Male (SID #5) and Female (SID #1) before marking ready.
      */
     fun initialize(): Boolean {
         val initStartMs = (System.nanoTime() / 1_000_000L)
 
         if (offlineTtsFactory != null) {
+            var createdTts: OfflineTts? = null
             return try {
                 val tts = offlineTtsFactory.invoke(OfflineTtsConfig())
+                createdTts = tts
                 val handle = tts.nativeHandle
                 val rate = tts.sampleRate()
                 val speakers = tts.numSpeakers()
                 check(handle != 0L && rate > 0 && speakers > 0) {
                     "Invalid OfflineTts instance (handle=$handle, rate=$rate, speakers=$speakers)"
                 }
+                val (sid5Rms, sid1Rms) = verifyNativeInferenceReadinessOnTts(tts)
                 offlineTts = tts
                 cachedSampleRate = rate
                 cachedNumSpeakers = speakers
+                lastNativeProbeSid5Rms = sid5Rms
+                lastNativeProbeSid1Rms = sid1Rms
+                lastWaveformRms = sid5Rms
                 lastNativeInitLatencyMs = ((System.nanoTime() / 1_000_000L) - initStartMs).coerceAtLeast(1L)
+                isNativeInferenceVerified = true
                 isReady = true
                 initializationError = null
                 com.example.data.VoiceProfileRepository.updateAvailableSpeakerCount(speakers)
+                if (SupertonicModelManager.areModelFilesVerifiedOnDisk(context)) {
+                    SupertonicModelManager.markNativeInferenceVerified(
+                        context = context,
+                        sampleRate = rate,
+                        numSpeakers = speakers,
+                        sid5Rms = sid5Rms,
+                        sid1Rms = sid1Rms,
+                        initLatencyMs = lastNativeInitLatencyMs
+                    )
+                }
                 true
             } catch (t: Throwable) {
+                try {
+                    createdTts?.release()
+                } catch (_: Throwable) {
+                }
                 offlineTts = null
+                isNativeInferenceVerified = false
                 isReady = false
                 initializationError = t.localizedMessage ?: t.javaClass.simpleName
+                if (SupertonicModelManager.areModelFilesVerifiedOnDisk(context)) {
+                    SupertonicModelManager.markNativeInferenceFailed(context, initializationError!!)
+                }
                 false
             }
         }
 
         val modelDir = SupertonicModelManager.getModelDirectory(context)
-        val modelState = SupertonicModelManager.checkStatus(context)
-        if (modelState !is SupertonicModelState.Ready) {
+        val integrity = SupertonicModelManager.verifyModelIntegrity(context)
+        if (!integrity.allValid) {
+            isNativeInferenceVerified = false
             isReady = false
-            initializationError = when (modelState) {
-                is SupertonicModelState.Error -> modelState.errorMessage
-                else -> "Verified Supertonic 3 model assets not found in ${modelDir.absolutePath}"
+            initializationError = if (!modelDir.exists() || integrity.verifiedFilesCount == 0) {
+                "Verified Supertonic 3 model assets not found in ${modelDir.absolutePath}"
+            } else {
+                "Supertonic 3 SHA-256 verification failed (${integrity.verifiedFilesCount}/${integrity.totalFilesCount} valid): ${integrity.mismatchedFiles.joinToString(", ")}"
             }
             return false
         }
 
+        var createdTts: OfflineTts? = null
         return try {
             val supertonicConfig = OfflineTtsSupertonicModelConfig(
                 durationPredictor = File(modelDir, "duration_predictor.int8.onnx").absolutePath,
@@ -237,6 +318,7 @@ class SherpaSupertonicBackend(
             )
 
             val tts = OfflineTts(assetManager = null, config = ttsConfig)
+            createdTts = tts
             val handle = tts.nativeHandle
             val rate = tts.sampleRate()
             val speakers = tts.numSpeakers()
@@ -245,12 +327,28 @@ class SherpaSupertonicBackend(
                 "Native OfflineTts validation failed (ptr=$handle, rate=$rate, speakers=$speakers)"
             }
 
+            // Mandatory native Hindi inference verification for Anon (SID #5) and Jenny (SID #1)
+            val (sid5Rms, sid1Rms) = verifyNativeInferenceReadinessOnTts(tts)
+
             offlineTts = tts
             cachedSampleRate = rate
             cachedNumSpeakers = speakers
+            lastNativeProbeSid5Rms = sid5Rms
+            lastNativeProbeSid1Rms = sid1Rms
+            lastWaveformRms = sid5Rms
             lastNativeInitLatencyMs = ((System.nanoTime() / 1_000_000L) - initStartMs).coerceAtLeast(1L)
+            isNativeInferenceVerified = true
             isReady = true
             initializationError = null
+
+            SupertonicModelManager.markNativeInferenceVerified(
+                context = context,
+                sampleRate = rate,
+                numSpeakers = speakers,
+                sid5Rms = sid5Rms,
+                sid1Rms = sid1Rms,
+                initLatencyMs = lastNativeInitLatencyMs
+            )
 
             com.example.data.VoiceProfileRepository.updateAvailableSpeakerCount(speakers)
             com.example.data.TranslatorStateRepository.updateTtsLatencyBenchmarks(
@@ -267,13 +365,19 @@ class SherpaSupertonicBackend(
                 configuredSteps = configuredNumSteps,
                 lastError = ""
             )
-            Log.i(TAG, "Initialized Sherpa-ONNX Supertonic 3 in ${lastNativeInitLatencyMs}ms. Speakers: $speakers, Rate: ${rate}Hz")
+            Log.i(TAG, "Initialized & native-verified Sherpa-ONNX Supertonic 3 in ${lastNativeInitLatencyMs}ms. Speakers: $speakers, Rate: ${rate}Hz, SID5 RMS=$sid5Rms, SID1 RMS=$sid1Rms")
             true
         } catch (t: Throwable) {
-            Log.w(TAG, "Failed to initialize native OfflineTts", t)
+            Log.w(TAG, "Failed to initialize or verify native OfflineTts", t)
+            try {
+                createdTts?.release()
+            } catch (_: Throwable) {
+            }
             offlineTts = null
+            isNativeInferenceVerified = false
             isReady = false
             initializationError = t.localizedMessage ?: t.javaClass.simpleName
+            SupertonicModelManager.markNativeInferenceFailed(context, initializationError!!)
             com.example.data.TranslatorStateRepository.updateVoiceEngineDiagnostics(
                 backendType = "SYSTEM_FALLBACK",
                 modelLoaded = false,
@@ -679,6 +783,7 @@ class SherpaSupertonicBackend(
         } finally {
             offlineTts = null
             isReady = false
+            isNativeInferenceVerified = false
             cachedSampleRate = 0
             cachedNumSpeakers = 0
         }

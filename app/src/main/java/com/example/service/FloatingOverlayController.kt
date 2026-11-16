@@ -1009,15 +1009,45 @@ class FloatingOverlayController(
                 text = "Live Route: ${currentState.lastRoutingDebugSummary}"
                 setTextColor(Color.parseColor("#A7F3D0"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setPadding(0, 0, 0, dpToPx(8))
+                setPadding(0, 0, 0, dpToPx(6))
             }
             sheetCard.addView(routingDebugTv)
 
-            // P0: Change Current Character Voice Quick Panel
-            val activeCharAssignment = VoiceProfileRepository.activeCharacterAssignment.value
-                ?: VoiceProfileRepository.characterAssignments.value.first()
+            // Explicit Warning Banner when engine cannot provide separate voices or Chatterbox server failed
+            val warningBannerTv = TextView(context).apply {
+                val warnText = currentState.voiceEngineWarningMessage.ifBlank {
+                    if (!currentState.supportsDistinctGenderVoices &&
+                        currentState.freeVoiceBackend == FreeVoiceBackend.ANDROID_USER_SELECTED
+                    ) {
+                        "WARNING: ${currentState.activeTtsEngineLabel} only provides 1 voice (SYSTEM_FALLBACK_SINGLE_VOICE). Switch to Human Voice (Chatterbox) or Fast Offline (Supertonic 3) for separate Male & Female voices."
+                    } else {
+                        ""
+                    }
+                }
+                visibility = if (warnText.isNotBlank()) View.VISIBLE else View.GONE
+                text = warnText
+                setTextColor(Color.parseColor("#FEF08A"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
+                background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(Color.parseColor("#451A03"))
+                    setStroke(dpToPx(1), Color.parseColor("#F59E0B"))
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dpToPx(8) }
+            }
+            sheetCard.addView(warningBannerTv)
+
+            // P0: Active Character Selection (Saved Per Game) & Voice Override Quick Panel
+            val activeGameNs = VoiceProfileRepository.getActiveGameNamespace()
+            val currentManualOverride = VoiceProfileRepository.unlabeledOverrideCharName.value
+            var activeCharAssignment = VoiceProfileRepository.activeCharacterAssignment.value
+                ?: VoiceProfileRepository.getUnknownSpeakerAssignment(activeGameNs)
             var currentPreviewSid = activeCharAssignment.speakerId
-            val charDisplayName = activeCharAssignment.displayName
+            var charDisplayName = activeCharAssignment.displayName
 
             val voiceBox = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1034,33 +1064,113 @@ class FloatingOverlayController(
             }
 
             val voiceHeaderTv = TextView(context).apply {
-                text = "Change Current Character Voice"
+                text = "Active Character & Voice (Saved for Game: $activeGameNs)"
                 setTextColor(Color.parseColor("#A5B4FC"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             }
             voiceBox.addView(voiceHeaderTv)
 
             val charNameTv = TextView(context).apply {
-                text = "Character: $charDisplayName (Supertonic 3 • sid: 0..9)"
+                val genderTag = when {
+                    activeCharAssignment.isUnknownOrNeutral -> "Unknown (Unverified Gender)"
+                    activeCharAssignment.isFemale -> "Female"
+                    else -> "Male"
+                }
+                text = "Active: $charDisplayName • $genderTag • SID #$currentPreviewSid • Ref: ${activeCharAssignment.referenceVoiceId}.wav"
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                setPadding(0, dpToPx(2), 0, dpToPx(8))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setPadding(0, dpToPx(2), 0, dpToPx(6))
             }
             voiceBox.addView(charNameTv)
 
             val speakerLabels = listOf(
-                "Sid 0: Anon (Male Lead)",
-                "Sid 1: Jenny (Female Lead)",
-                "Sid 2: Alex (Scout)",
-                "Sid 3: Ira (AI Narrator)",
-                "Sid 4: Guard (Sentinel)",
-                "Sid 5: Sarah (Commander)",
-                "Sid 6: Kaal (Boss / Villain)",
-                "Sid 7: Priya (Princess)",
-                "Sid 8: Vikram (Veteran)",
-                "Sid 9: Oracle (Mystic)"
+                "Sid 0: F1 Priya (Female)",
+                "Sid 1: F2 Jenny (Female Lead)",
+                "Sid 2: F3 Ira (Female AI)",
+                "Sid 3: F4 Sarah (Female Cmdr)",
+                "Sid 4: F5 Oracle (Female Mystic)",
+                "Sid 5: M1 Anon (Male Lead)",
+                "Sid 6: M2 Alex (Male Scout)",
+                "Sid 7: M3 Kaal (Male Boss)",
+                "Sid 8: M4 Vikram (Male Veteran)",
+                "Sid 9: M5 Guard (Male Sentinel)"
             )
+
+            lateinit var sidLabelTv: TextView
+            lateinit var refreshGenderButtons: (SpeakerGender) -> Unit
+
+            // Horizontal Quick Character Selector Chips (Saved Per Game)
+            val charSelectScroll = HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                setPadding(0, 0, 0, dpToPx(8))
+            }
+            val charSelectRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            val quickCharacters = listOf(
+                null to "Auto (Unknown if unlabeled)",
+                "anon" to "Anon (Male • SID #5)",
+                "jenny" to "Jenny (Female • SID #1)",
+                "kaal" to "Kaal (Male • SID #7)",
+                "ira" to "Ira (Female • SID #2)",
+                "alex" to "Alex (Male • SID #6)",
+                "sarah" to "Sarah (Female • SID #3)"
+            )
+            val charChipButtons = mutableListOf<Pair<String?, Button>>()
+
+            fun refreshCharacterChipSelection(selectedCharNorm: String?) {
+                val genderTag = when {
+                    activeCharAssignment.isUnknownOrNeutral -> "Unknown"
+                    activeCharAssignment.isFemale -> "Female"
+                    else -> "Male"
+                }
+                charNameTv.text = "Active: ${activeCharAssignment.displayName} • $genderTag • SID #$currentPreviewSid • Ref: ${activeCharAssignment.referenceVoiceId}.wav"
+                sidLabelTv.text = speakerLabels.getOrElse(currentPreviewSid) { "Sid $currentPreviewSid" }
+                charChipButtons.forEach { (chipKey, btn) ->
+                    val isSelected = chipKey == selectedCharNorm
+                    btn.setTextColor(if (isSelected) Color.parseColor("#0F172A") else Color.WHITE)
+                    btn.background = GradientDrawable().apply {
+                        cornerRadius = dpToPx(12).toFloat()
+                        setColor(if (isSelected) Color.parseColor("#10B981") else Color.parseColor("#334155"))
+                    }
+                }
+            }
+
+            quickCharacters.forEach { (charKey, label) ->
+                val chipBtn = Button(context).apply {
+                    text = label
+                    isAllCaps = false
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        dpToPx(32)
+                    ).apply { marginEnd = dpToPx(6) }
+                    setPadding(dpToPx(10), 0, dpToPx(10), 0)
+                    setOnClickListener {
+                        val updatedChar = VoiceProfileRepository.selectActiveCharacterForGame(
+                            context = context,
+                            characterNameOrNull = charKey,
+                            gameNamespace = activeGameNs
+                        )
+                        activeCharAssignment = updatedChar
+                        currentPreviewSid = updatedChar.speakerId
+                        charDisplayName = updatedChar.displayName
+                        refreshCharacterChipSelection(charKey)
+                        val newGender = when {
+                            updatedChar.isUnknownOrNeutral -> SpeakerGender.UNKNOWN
+                            updatedChar.isFemale -> SpeakerGender.FEMALE_18
+                            else -> SpeakerGender.MALE_18
+                        }
+                        refreshGenderButtons(newGender)
+                        onRefreshTtsCheck()
+                    }
+                }
+                charChipButtons.add(charKey to chipBtn)
+                charSelectRow.addView(chipBtn)
+            }
+            charSelectScroll.addView(charSelectRow)
+            voiceBox.addView(charSelectScroll)
 
             val cyclerRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1071,7 +1181,7 @@ class FloatingOverlayController(
                 layoutParams = lp
             }
 
-            val sidLabelTv = TextView(context).apply {
+            sidLabelTv = TextView(context).apply {
                 text = speakerLabels.getOrElse(currentPreviewSid) { "Sid $currentPreviewSid" }
                 setTextColor(Color.parseColor("#38BDF8"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
@@ -1135,23 +1245,25 @@ class FloatingOverlayController(
                     marginEnd = dpToPx(6)
                 }
                 setOnClickListener {
-                    val previewProfile = VoiceProfile(
-                        id = "preview_sid_$currentPreviewSid",
-                        name = "Supertonic Sid #$currentPreviewSid",
-                        description = "Preview",
-                        pitch = 1.0f,
-                        speechRate = 1.0f,
-                        engineVoiceIndex = currentPreviewSid
+                    val isFemSid = currentPreviewSid in 0..4
+                    val previewAssignment = activeCharAssignment.copy(
+                        speakerId = currentPreviewSid,
+                        referenceVoiceId = if (isFemSid) {
+                            com.example.data.CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+                        } else {
+                            com.example.data.CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+                        },
+                        voicePresentation = if (isFemSid) "female" else "male"
                     )
                     ForegroundTtsManager.getInstance(context).speakNonBlocking(
                         text = "नमस्ते, मैं $charDisplayName की आवाज़ हूँ।",
-                        voiceProfile = previewProfile
+                        characterAssignment = previewAssignment
                     )
                 }
             }
 
             val saveOverrideBtn = Button(context).apply {
-                text = "✓ Always Use"
+                text = "✓ Save for Game"
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.WHITE)
@@ -1163,14 +1275,28 @@ class FloatingOverlayController(
                     marginStart = dpToPx(6)
                 }
                 setOnClickListener {
-                    VoiceProfileRepository.setUserOverrideForCharacter(
+                    val isFemSid = currentPreviewSid in 0..4
+                    val targetCharName = activeCharAssignment.characterName.takeIf {
+                        it != com.example.data.CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME
+                    } ?: if (isFemSid) "jenny" else "anon"
+                    val updated = VoiceProfileRepository.setUserOverrideForCharacter(
                         context = context,
-                        characterName = activeCharAssignment.characterName,
+                        characterName = targetCharName,
                         sid = currentPreviewSid,
-                        displayName = charDisplayName
+                        displayName = if (activeCharAssignment.isUnknownOrNeutral) null else charDisplayName,
+                        referenceVoiceId = if (isFemSid) {
+                            com.example.data.CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+                        } else {
+                            com.example.data.CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+                        },
+                        voicePresentation = if (isFemSid) "female" else "male"
                     )
+                    VoiceProfileRepository.selectActiveCharacterForGame(context, updated.characterName, activeGameNs)
+                    activeCharAssignment = updated
+                    charDisplayName = updated.displayName
+                    refreshCharacterChipSelection(updated.characterName)
                     text = "Saved!"
-                    postDelayed({ text = "✓ Always Use" }, 2000L)
+                    postDelayed({ text = "✓ Save for Game" }, 2000L)
                 }
             }
 
@@ -1320,10 +1446,12 @@ class FloatingOverlayController(
             sheetCard.addView(modeRow)
             sheetCard.addView(modeNoteTv)
 
-            // Quick Female / Male Voice Switcher
-            val voices = VoiceProfileRepository.voices.value
-            val selectedId = VoiceProfileRepository.selectedVoiceId.value
-            val currentGender = voices.find { it.id == selectedId }?.gender ?: SpeakerGender.FEMALE_18
+            // Quick Female / Male Voice Switcher (Synchronized with Jenny Female SID #1 & Anon Male SID #5 for Live Gameplay)
+            val currentGender = when {
+                activeCharAssignment.isUnknownOrNeutral -> SpeakerGender.UNKNOWN
+                activeCharAssignment.isFemale -> SpeakerGender.FEMALE_18
+                else -> SpeakerGender.MALE_18
+            }
 
             val voiceRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1333,7 +1461,7 @@ class FloatingOverlayController(
             lateinit var femaleVoiceBtn: Button
             lateinit var maleVoiceBtn: Button
 
-            fun refreshGenderButtons(gender: SpeakerGender) {
+            refreshGenderButtons = { gender: SpeakerGender ->
                 femaleVoiceBtn.background = GradientDrawable().apply {
                     cornerRadius = dpToPx(10).toFloat()
                     setColor(
@@ -1355,31 +1483,36 @@ class FloatingOverlayController(
             }
 
             femaleVoiceBtn = Button(context).apply {
-                text = "Female Voice"
+                text = "Female Voice (Jenny • SID #1)"
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginEnd = dpToPx(6) }
                 setOnClickListener {
-                    voices.firstOrNull { it.gender == SpeakerGender.FEMALE_18 }?.let {
-                        VoiceProfileRepository.selectVoice(context, it)
-                        onRefreshTtsCheck()
-                        refreshGenderButtons(SpeakerGender.FEMALE_18)
-                    }
+                    val jennyChar = VoiceProfileRepository.selectActiveCharacterForGame(context, "jenny", activeGameNs)
+                    activeCharAssignment = jennyChar
+                    currentPreviewSid = jennyChar.speakerId
+                    charDisplayName = jennyChar.displayName
+                    refreshCharacterChipSelection("jenny")
+                    refreshGenderButtons(SpeakerGender.FEMALE_18)
+                    onRefreshTtsCheck()
                 }
             }
             maleVoiceBtn = Button(context).apply {
-                text = "Male Voice"
+                text = "Male Voice (Anon • SID #5)"
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 layoutParams = LinearLayout.LayoutParams(0, dpToPx(38), 1f).apply { marginStart = dpToPx(6) }
                 setOnClickListener {
-                    voices.firstOrNull { it.gender == SpeakerGender.MALE_18 }?.let {
-                        VoiceProfileRepository.selectVoice(context, it)
-                        onRefreshTtsCheck()
-                        refreshGenderButtons(SpeakerGender.MALE_18)
-                    }
+                    val anonChar = VoiceProfileRepository.selectActiveCharacterForGame(context, "anon", activeGameNs)
+                    activeCharAssignment = anonChar
+                    currentPreviewSid = anonChar.speakerId
+                    charDisplayName = anonChar.displayName
+                    refreshCharacterChipSelection("anon")
+                    refreshGenderButtons(SpeakerGender.MALE_18)
+                    onRefreshTtsCheck()
                 }
             }
+            refreshCharacterChipSelection(currentManualOverride)
             refreshGenderButtons(currentGender)
             voiceRow.addView(femaleVoiceBtn)
             voiceRow.addView(maleVoiceBtn)

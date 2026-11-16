@@ -233,20 +233,55 @@ object SpeakerHeuristicEngine {
     }
 
     /**
-     * Determines whether the character is Female (`SpeakerGender.FEMALE_18`, e.g. `'Jenny'`)
-     * or Male (`SpeakerGender.MALE_18`, e.g. `'Anon'`) using saved profiles, user overrides,
-     * and explicit character/title tables — NEVER guessing gender from unknown name suffixes alone.
+     * Returns true if [rawCandidate] matches a known character name, saved character profile,
+     * or explicit bracketed/colon speaker header so OCR text filters never strip short names
+     * like `"ANON"`, `"IRA"`, `"KAAL"`, `"ALEX"`, `"MAYA"`, `"LEON"`, or `"JENNY"`.
+     */
+    fun isKnownCharacterOrSpeakerHeader(rawCandidate: String): Boolean {
+        val trimmed = rawCandidate.trim()
+        if (trimmed.length < 2) return false
+        if (BRACKET_TAG_REGEX.matches(trimmed) || COLON_TAG_REGEX.matches(trimmed)) {
+            return true
+        }
+        val norm = normalizeSpeakerKey(trimmed)
+        if (norm.isBlank()) return false
+        val firstWord = norm.split(" ").firstOrNull().orEmpty()
+        if (FEMALE_CHARACTER_NAMES.contains(norm) ||
+            FEMALE_CHARACTER_NAMES.contains(firstWord) ||
+            MALE_CHARACTER_NAMES.contains(norm) ||
+            MALE_CHARACTER_NAMES.contains(firstWord) ||
+            KNOWN_SPEAKER_PREFIXES.any { it.equals(norm, ignoreCase = true) }
+        ) {
+            return true
+        }
+        return com.example.data.VoiceProfileRepository.findExistingAssignment(norm) != null
+    }
+
+    /**
+     * Determines whether the character is Female (`SpeakerGender.FEMALE_18`, e.g. `'Jenny'`),
+     * Male (`SpeakerGender.MALE_18`, e.g. `'Anon'`), or Unknown (`SpeakerGender.UNKNOWN`)
+     * using saved profiles, user overrides, and explicit character/title tables — NEVER guessing
+     * gender from unknown name suffixes alone or pretending to know the gender of Unknown speakers.
      */
     fun detectCharacterGender(speakerTag: String?, dialogue: String = ""): SpeakerGender {
         if (!speakerTag.isNullOrBlank()) {
             val normFull = normalizeSpeakerKey(speakerTag)
+            if (normFull == com.example.data.CharacterVoiceAssignment.UNKNOWN_SPEAKER_NAME ||
+                normFull == "unknown speaker"
+            ) {
+                return SpeakerGender.UNKNOWN
+            }
             val firstWord = normFull.split(" ").firstOrNull().orEmpty()
 
             // 1. Check saved character profiles & manual user assignments first
             val savedProfile = com.example.data.VoiceProfileRepository.findExistingAssignment(normFull)
                 ?: if (firstWord.isNotBlank()) com.example.data.VoiceProfileRepository.findExistingAssignment(firstWord) else null
             if (savedProfile != null) {
-                return if (savedProfile.isFemale) SpeakerGender.FEMALE_18 else SpeakerGender.MALE_18
+                return when {
+                    savedProfile.isUnknownOrNeutral -> SpeakerGender.UNKNOWN
+                    savedProfile.isFemale -> SpeakerGender.FEMALE_18
+                    else -> SpeakerGender.MALE_18
+                }
             }
 
             // 2. Check explicit known character name tables
@@ -276,11 +311,10 @@ object SpeakerHeuristicEngine {
             }
 
             // 4. Unknown speaker: do NOT guess gender from name suffixes (-a, -i, -y, etc.).
-            // Use saved manual overrides if present in memory, otherwise default deterministically until user assigns.
-            return dynamicTagGenderMemory[normFull] ?: SpeakerGender.MALE_18
+            return dynamicTagGenderMemory[normFull] ?: SpeakerGender.UNKNOWN
         }
 
-        return SpeakerGender.MALE_18
+        return SpeakerGender.UNKNOWN
     }
 
     /**
