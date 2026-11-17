@@ -209,6 +209,9 @@ class ScreenTranslatorService : Service() {
             onStartStopDubbingToggled = {
                 handleSingleTapStartStopDubbing()
             },
+            onSubtitleVisibilityToggled = { visible ->
+                TranslatorStateRepository.setSubtitleVisible(applicationContext, visible)
+            },
             onBoxVisibilityToggled = { visible ->
                 overlayController?.updateScanningState(TranslatorStateRepository.state.value.isCapturingOcr)
                 if (visible) {
@@ -375,8 +378,9 @@ class ScreenTranslatorService : Service() {
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = mediaProjection != null,
                 isProtectedScreen = false,
-                statusMessage = "Paused — tap floating icon to resume"
+                statusMessage = "Scanning OFF — tap floating icon to resume"
             )
+            overlayController?.showGestureFeedbackBadge("Scanning OFF")
             return
         }
 
@@ -385,8 +389,9 @@ class ScreenTranslatorService : Service() {
             TranslatorStateRepository.updateCaptureTelemetry(
                 hasActiveProjection = true,
                 isProtectedScreen = false,
-                statusMessage = "Live OCR dubbing active"
+                statusMessage = "Scanning ON — Live OCR dubbing active"
             )
+            overlayController?.showGestureFeedbackBadge("Scanning ON")
         } else {
             // Fresh per-session MediaProjection consent required before scanning
             requestFreshMediaProjectionConsent()

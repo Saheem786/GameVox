@@ -50,20 +50,19 @@ import kotlin.math.abs
  * Compact Floating Overlay Controller for GameVox:
  *
  * 1. **Compact Draggable Floating Bubble (`rootOverlayView`)**:
- *    - **Single Tap (`onSingleTapUp`)**: Starts or pauses live dubbing cleanly.
- *      (If no active MediaProjection session exists yet, the service prompts fresh screen capture consent.)
- *    - **Long Press (`onLongPress`)**: Opens a compact options card (subtitle region show/snap-bottom,
- *      captions toggle, Free On-Device vs Context-Aware AI mode, default Female/Male voice, volume, speed,
- *      language, and stop service).
- * 2. **Draggable & Resizable Subtitle Detection Region (`targetBoxView`)**:
- *    - Initially positioned near the **bottom of the screen** where game dialogue subtitles appear.
- *    - Supports unrestricted full-screen drag in both Portrait and Landscape plus a 48dp corner resize grip.
- * 3. **Clean Translated Hindi Caption Box (`translationBoxView`)**:
- *    - Displays only the translated modern Hindi caption floating neatly above the subtitle box.
+ *    - **Single Tap (`onSingleTapConfirmed`)**: Strictly toggles Live Scanning & Dubbing ON/OFF cleanly
+ *      without restarting an active MediaProjection session, showing a brief `"Scanning ON"` / `"Scanning OFF"` badge.
+ *    - **Double Tap (`onDoubleTap`)**: Strictly toggles GameVox Hindi Subtitle Overlay visibility
+ *      (`isSubtitleVisible`) while OCR, speaker detection, and dubbing continue uninterrupted.
+ *    - **Long Press (`onLongPress`)**: Opens quick options sheet (Quick character/voice, settings, stop).
+ *    - **Drag**: Dragging beyond `scaledTouchSlop` moves the bubble without firing tap, double-tap, or long-press.
+ * 2. **Draggable & Resizable Subtitle Detection Region (`targetBoxView`)**.
+ * 3. **Clean Hindi Translation Caption Box (`translationBoxView`)**: Detached & non-touch-blocking when hidden.
  */
 class FloatingOverlayController(
     private val context: Context,
     private val onStartStopDubbingToggled: () -> Unit = {},
+    private val onSubtitleVisibilityToggled: (Boolean) -> Unit = {},
     private val onBoxVisibilityToggled: (Boolean) -> Unit = {},
     private val onVoiceMuteToggled: (Boolean) -> Unit = {},
     private val onSnapTargetBoxBottom: () -> Unit = {},
@@ -101,6 +100,12 @@ class FloatingOverlayController(
     private var translationBoxView: TextView? = null
     private var translationBoxParams: WindowManager.LayoutParams? = null
     private var latestHindiOnlyText: String = ""
+
+    // 4. Compact Non-Touchable Gesture Feedback Pill ("Scanning ON/OFF", "Hindi Subtitles Hidden/Shown")
+    private var feedbackBannerView: TextView? = null
+    private var feedbackBannerParams: WindowManager.LayoutParams? = null
+    private val hideFeedbackRunnable = Runnable { hideGestureFeedbackBadge() }
+    private var bubbleTouchListenerRef: View.OnTouchListener? = null
 
     @Volatile
     private var latestCaptionSequenceId: Long = 0L
@@ -269,9 +274,9 @@ class FloatingOverlayController(
     }
 
     fun setSubtitleCaptionsVisibility(visible: Boolean) {
-        mainHandler.post {
-            isSubtitleVisible = visible
-            TranslatorStateRepository.setSubtitleVisible(context, visible)
+        isSubtitleVisible = visible
+        TranslatorStateRepository.setSubtitleVisible(context, visible)
+        val applyVisibility = {
             if (visible) {
                 showHindiTranslationBox()
             } else {
@@ -279,7 +284,122 @@ class FloatingOverlayController(
             }
             updateFloatingIconAppearance(TranslatorStateRepository.state.value.isCapturingOcr)
         }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyVisibility()
+        } else {
+            mainHandler.post(applyVisibility)
+        }
     }
+
+    fun showGestureFeedbackBadge(message: String) {
+        TranslatorStateRepository.updateGestureFeedback(message)
+        val displayAction = {
+            if (Settings.canDrawOverlays(context)) {
+                val (screenW, screenH) = getLiveScreenSize()
+                val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WindowManager.LayoutParams.TYPE_PHONE
+                }
+                val banner = feedbackBannerView ?: TextView(context).apply {
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    gravity = Gravity.CENTER
+                    setPadding(dpToPx(14), dpToPx(8), dpToPx(14), dpToPx(8))
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = dpToPx(18).toFloat()
+                        setColor(Color.argb(220, 15, 23, 42))
+                        setStroke(dpToPx(1), Color.parseColor("#38BDF8"))
+                    }
+                    isClickable = false
+                    isFocusable = false
+                    maxWidth = (screenW * 0.8f).toInt().coerceAtLeast(dpToPx(200))
+                }
+                banner.text = message
+                banner.visibility = View.VISIBLE
+                val bParams = feedbackBannerParams ?: WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    overlayType,
+                    createUnrestrictedOverlayFlags() or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    y = (overlayParams?.y ?: dpToPx(96)).coerceIn(dpToPx(24), (screenH - dpToPx(80)).coerceAtLeast(dpToPx(24)))
+                    applyCutoutModeIfSupported(this)
+                }
+                try {
+                    if (feedbackBannerView == null) {
+                        windowManager.addView(banner, bParams)
+                        feedbackBannerView = banner
+                        feedbackBannerParams = bParams
+                    } else {
+                        windowManager.updateViewLayout(banner, bParams)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            mainHandler.removeCallbacks(hideFeedbackRunnable)
+            mainHandler.postDelayed(hideFeedbackRunnable, 1800L)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            displayAction()
+        } else {
+            mainHandler.post { displayAction() }
+        }
+    }
+
+    private fun hideGestureFeedbackBadge() {
+        val view = feedbackBannerView ?: return
+        try {
+            windowManager.removeView(view)
+        } catch (_: Exception) {
+        } finally {
+            feedbackBannerView = null
+            feedbackBannerParams = null
+        }
+    }
+
+    fun handleBubbleSingleTapConfirmed() {
+        circularBubbleView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        onStartStopDubbingToggled()
+    }
+
+    fun handleBubbleDoubleTap() {
+        circularBubbleView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        val newVisible = !isSubtitleVisible
+        setSubtitleCaptionsVisibility(newVisible)
+        onSubtitleVisibilityToggled(newVisible)
+        showGestureFeedbackBadge(
+            if (newVisible) "Hindi Subtitles Shown" else "Hindi Subtitles Hidden"
+        )
+    }
+
+    fun dispatchBubbleTouchEventForTest(event: MotionEvent): Boolean {
+        val view = circularBubbleView ?: return false
+        return bubbleTouchListenerRef?.onTouch(view, event) ?: view.dispatchTouchEvent(event)
+    }
+
+    fun triggerBubbleSingleTapForTest() = handleBubbleSingleTapConfirmed()
+
+    fun triggerBubbleDoubleTapForTest() = handleBubbleDoubleTap()
+
+    fun isSubtitleViewAttachedAndVisible(): Boolean =
+        translationBoxView != null && translationBoxView?.visibility == View.VISIBLE && isSubtitleVisible
+
+    fun isSubtitleViewBlockingTouch(): Boolean {
+        val view = translationBoxView ?: return false
+        if (view.visibility != View.VISIBLE) return false
+        val flags = translationBoxParams?.flags ?: return false
+        return (flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0
+    }
+
+    fun getLastDisplayedSubtitleText(): String = latestHindiOnlyText
+
+    fun getCurrentFeedbackBannerText(): String? = feedbackBannerView?.text?.toString()
 
     fun setBoxesVisibility(visible: Boolean, notifyCallback: Boolean = false) {
         setScanBoxVisibility(visible, notifyCallback = notifyCallback)
@@ -444,32 +564,41 @@ class FloatingOverlayController(
         var initialTouchX = 0f
         var initialTouchY = 0f
         var isDragging = false
+        var hasDraggedInTouchSequence = false
 
-        // No OnDoubleTapListener so single tap fires immediately without 300ms delay!
-        val gestureDetector = GestureDetector(
-            context,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onDown(e: MotionEvent): Boolean = true
+        // Uses OnDoubleTapListener (onSingleTapConfirmed + onDoubleTap) + drag guard so:
+        // - Single tap waits cleanly for double-tap disambiguation and NEVER fires on double tap.
+        // - Double tap strictly toggles Hindi subtitle visibility without touching scanning/dubbing.
+        // - Dragging past touchSlop never triggers tap, double-tap, or long-press.
+        val gestureListener = object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
 
-                override fun onSingleTapUp(e: MotionEvent): Boolean {
-                    if (!isDragging) {
-                        bubbleFrame.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        onStartStopDubbingToggled()
-                    }
-                    return true
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if (!hasDraggedInTouchSequence) {
+                    handleBubbleSingleTapConfirmed()
                 }
+                return true
+            }
 
-                override fun onLongPress(e: MotionEvent) {
-                    if (!isDragging) {
-                        bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        showOverlaySettingsBottomSheet()
-                    }
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (!hasDraggedInTouchSequence) {
+                    handleBubbleDoubleTap()
                 }
-            },
-            mainHandler
-        )
+                return true
+            }
 
-        bubbleFrame.setOnTouchListener { _, event ->
+            override fun onLongPress(e: MotionEvent) {
+                if (!hasDraggedInTouchSequence) {
+                    bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    showOverlaySettingsBottomSheet()
+                }
+            }
+        }
+        val gestureDetector = GestureDetector(context, gestureListener, mainHandler).apply {
+            setOnDoubleTapListener(gestureListener)
+        }
+
+        val bubbleTouchListener = View.OnTouchListener { _, event ->
             gestureDetector.onTouchEvent(event)
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -478,6 +607,7 @@ class FloatingOverlayController(
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     isDragging = false
+                    hasDraggedInTouchSequence = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -485,6 +615,7 @@ class FloatingOverlayController(
                     val dy = (event.rawY - initialTouchY).toInt()
                     if (abs(dx) > touchSlop || abs(dy) > touchSlop) {
                         isDragging = true
+                        hasDraggedInTouchSequence = true
                     }
                     if (isDragging && rootOverlayView != null) {
                         val (liveW, liveH) = getLiveScreenSize()
@@ -506,6 +637,8 @@ class FloatingOverlayController(
                 else -> false
             }
         }
+        bubbleTouchListenerRef = bubbleTouchListener
+        bubbleFrame.setOnTouchListener(bubbleTouchListener)
 
         val added = try {
             windowManager.addView(bubbleFrame, params)
@@ -831,15 +964,26 @@ class FloatingOverlayController(
     }
 
     fun hideHindiTranslationBox() {
-        mainHandler.post {
-            val view = translationBoxView ?: return@post
-            try {
-                windowManager.removeView(view)
-            } catch (_: Exception) {
-            } finally {
-                translationBoxView = null
-                translationBoxParams = null
+        val doHide = {
+            val view = translationBoxView
+            if (view != null) {
+                view.visibility = View.GONE
+                translationBoxParams?.let { p ->
+                    p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                }
+                try {
+                    windowManager.removeView(view)
+                } catch (_: Exception) {
+                } finally {
+                    translationBoxView = null
+                    translationBoxParams = null
+                }
             }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doHide()
+        } else {
+            mainHandler.post(doHide)
         }
     }
 
@@ -934,25 +1078,30 @@ class FloatingOverlayController(
         sequenceId: Long = 0L,
         sessionEpoch: Long = 0L
     ) {
-        mainHandler.post {
+        val updateAction = {
             val isStale = sequenceId > 0L && (
                 sessionEpoch < latestCaptionSessionEpoch ||
                     (sessionEpoch == latestCaptionSessionEpoch && sequenceId < latestCaptionSequenceId)
                 )
-            if (isStale) return@post
-            if (sequenceId > 0L) {
-                latestCaptionSequenceId = maxOf(sequenceId, latestCaptionSequenceId)
-                latestCaptionSessionEpoch = maxOf(sessionEpoch, latestCaptionSessionEpoch)
-            }
-            val cleanHindi = hindiText.trim()
-            if (cleanHindi.isEmpty()) return@post
-            latestHindiOnlyText = cleanHindi
-            translationBoxView?.apply {
-                text = cleanHindi
-                if (visibility != View.VISIBLE && isSubtitleVisible) {
-                    visibility = View.VISIBLE
+            if (!isStale) {
+                if (sequenceId > 0L) {
+                    latestCaptionSequenceId = maxOf(sequenceId, latestCaptionSequenceId)
+                    latestCaptionSessionEpoch = maxOf(sessionEpoch, latestCaptionSessionEpoch)
+                }
+                val cleanHindi = hindiText.trim()
+                if (cleanHindi.isNotEmpty()) {
+                    latestHindiOnlyText = cleanHindi
+                    translationBoxView?.apply {
+                        text = cleanHindi
+                        visibility = if (isSubtitleVisible) View.VISIBLE else View.GONE
+                    }
                 }
             }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            updateAction()
+        } else {
+            mainHandler.post(updateAction)
         }
     }
 
@@ -1848,20 +1997,30 @@ class FloatingOverlayController(
     }
 
     fun destroyOverlay() {
+        mainHandler.removeCallbacks(hideFeedbackRunnable)
         dismissOverlaySettingsBottomSheet()
         hideDraggableTargetBox()
         hideHindiTranslationBox()
-        mainHandler.post {
-            val root = rootOverlayView ?: return@post
-            try {
-                windowManager.removeView(root)
-            } catch (_: Exception) {
-            } finally {
-                rootOverlayView = null
-                circularBubbleView = null
-                bubbleLabelView = null
-                bubbleStatusDot = null
+        val doDestroy = {
+            hideGestureFeedbackBadge()
+            val root = rootOverlayView
+            if (root != null) {
+                try {
+                    windowManager.removeView(root)
+                } catch (_: Exception) {
+                } finally {
+                    rootOverlayView = null
+                    circularBubbleView = null
+                    bubbleLabelView = null
+                    bubbleStatusDot = null
+                    bubbleTouchListenerRef = null
+                }
             }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doDestroy()
+        } else {
+            mainHandler.post(doDestroy)
         }
     }
 

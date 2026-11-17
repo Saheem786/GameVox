@@ -395,6 +395,8 @@ data class TranslatorAppState(
     val showSettingsBottomSheet: Boolean = false,
     val originalFramePreview: Bitmap? = null,
     val invertedFramePreview: Bitmap? = null,
+    val lastGestureFeedback: String = "",
+    val lastGestureFeedbackTimestampMs: Long = 0L,
     val history: List<SubtitleTranslationEntry> = emptyList()
 ) {
     fun savedKeyFor(provider: CloudTtsProvider): String = ""
@@ -785,6 +787,15 @@ object TranslatorStateRepository {
         _state.update {
             it.copy(
                 isSubtitleVisible = visible
+            )
+        }
+    }
+
+    fun updateGestureFeedback(message: String) {
+        _state.update {
+            it.copy(
+                lastGestureFeedback = message,
+                lastGestureFeedbackTimestampMs = System.currentTimeMillis()
             )
         }
     }

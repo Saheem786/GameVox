@@ -120,10 +120,13 @@ fun SettingsScreen(
     onInstallVoiceData: () -> Unit,
     onOpenDiagnosis: () -> Unit,
     onTranslationStyleChange: ((TranslationStyle) -> Unit)? = null,
-    onDubbingDeliveryModeChange: ((DubbingDeliveryMode) -> Unit)? = null
+    onDubbingDeliveryModeChange: ((DubbingDeliveryMode) -> Unit)? = null,
+    showTopBar: Boolean = false
 ) {
-    BackHandler {
-        onNavigateBack()
+    if (showTopBar) {
+        BackHandler {
+            onNavigateBack()
+        }
     }
 
     val context = LocalContext.current
@@ -175,42 +178,10 @@ fun SettingsScreen(
         )
     }
 
-    Scaffold(
-        contentWindowInsets = WindowInsets.safeDrawing,
-        containerColor = MaterialTheme.colorScheme.background,
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    titleContentColor = MaterialTheme.colorScheme.onBackground
-                ),
-                navigationIcon = {
-                    IconButton(
-                        onClick = onNavigateBack,
-                        modifier = Modifier.testTag("settings_back_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back to Home",
-                            tint = MaterialTheme.colorScheme.onBackground
-                        )
-                    }
-                },
-                title = {
-                    Text(
-                        text = "Settings",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            )
-        }
-    ) { innerPadding ->
+    val contentBody: @Composable (Modifier) -> Unit = { containerModifier ->
         Box(
-            modifier = Modifier
+            modifier = containerModifier
                 .fillMaxSize()
-                .padding(innerPadding)
                 .testTag("settings_screen"),
             contentAlignment = Alignment.TopCenter
         ) {
@@ -609,11 +580,7 @@ fun SettingsScreen(
                                         onClick = { onSelectFreeVoiceBackend(backend) },
                                         label = {
                                             Text(
-                                                text = if (backend == FreeVoiceBackend.ANDROID_USER_SELECTED) {
-                                                    "Android / Supertonic 3"
-                                                } else {
-                                                    "Kokoro-82M MediaPipe"
-                                                },
+                                                text = backend.displayLabel,
                                                 style = MaterialTheme.typography.labelMedium
                                             )
                                         },
@@ -766,7 +733,7 @@ fun SettingsScreen(
                                     Spacer(modifier = Modifier.width(12.dp))
                                     Column {
                                         Text(
-                                            text = "Voice Manager",
+                                            text = "Voice Library",
                                             style = MaterialTheme.typography.titleSmall,
                                             color = MaterialTheme.colorScheme.onSurface,
                                             fontWeight = FontWeight.SemiBold
@@ -780,7 +747,7 @@ fun SettingsScreen(
                                 }
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                    contentDescription = "Open Voice Manager",
+                                    contentDescription = "Open Voice Library",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
@@ -1271,6 +1238,45 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(16.dp))
             }
         }
+    }
+
+    if (showTopBar) {
+        Scaffold(
+            contentWindowInsets = WindowInsets.safeDrawing,
+            containerColor = MaterialTheme.colorScheme.background,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+            topBar = {
+                TopAppBar(
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        titleContentColor = MaterialTheme.colorScheme.onBackground
+                    ),
+                    navigationIcon = {
+                        IconButton(
+                            onClick = onNavigateBack,
+                            modifier = Modifier.testTag("settings_back_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back to Home",
+                                tint = MaterialTheme.colorScheme.onBackground
+                            )
+                        }
+                    },
+                    title = {
+                        Text(
+                            text = "Settings",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                )
+            }
+        ) { innerPadding ->
+            contentBody(Modifier.padding(innerPadding))
+        }
+    } else {
+        contentBody(Modifier)
     }
 }
 

@@ -37,7 +37,8 @@ data class CharacterVoiceAssignment(
     val defaultEmotion: String = "neutral",
     val exaggeration: Float = 0.50f,
     val cfgWeight: Float = 0.40f,
-    val speakerConsentConfirmed: Boolean = true
+    val speakerConsentConfirmed: Boolean = true,
+    val assignedVoiceId: String = ""
 ) {
     val isUnknownOrNeutral: Boolean
         get() = characterName.equals(UNKNOWN_SPEAKER_NAME, ignoreCase = true) ||
@@ -538,6 +539,9 @@ data class CharacterVoiceAssignment(
                     put("exaggeration", item.exaggeration.toDouble())
                     put("cfgWeight", item.cfgWeight.toDouble())
                     put("speakerConsentConfirmed", item.speakerConsentConfirmed)
+                    if (item.assignedVoiceId.isNotBlank()) {
+                        put("assignedVoiceId", item.assignedVoiceId)
+                    }
                 }
                 arr.put(obj)
             }
@@ -591,7 +595,8 @@ data class CharacterVoiceAssignment(
                             defaultEmotion = obj.optString("defaultEmotion", "neutral").ifBlank { "neutral" },
                             exaggeration = obj.optDouble("exaggeration", 0.50).toFloat().coerceIn(0.1f, 2.0f),
                             cfgWeight = obj.optDouble("cfgWeight", 0.40).toFloat().coerceIn(0.1f, 1.5f),
-                            speakerConsentConfirmed = obj.optBoolean("speakerConsentConfirmed", true)
+                            speakerConsentConfirmed = obj.optBoolean("speakerConsentConfirmed", true),
+                            assignedVoiceId = obj.optString("assignedVoiceId", "").trim()
                         )
                     )
                 }

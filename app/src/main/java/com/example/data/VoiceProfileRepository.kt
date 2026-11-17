@@ -81,7 +81,46 @@ enum class SpeakerRole(val code: String, val displayLabel: String, val badgeColo
 }
 
 /**
- * Represents a built-in or user-cloned Custom TTS Voice Profile stored locally on device.
+ * Category classification for voices in Voice Library.
+ */
+enum class VoiceCategory(val code: String, val displayLabel: String) {
+    DEFAULT_MALE("default_male", "Default Male"),
+    DEFAULT_FEMALE("default_female", "Default Female"),
+    IMPORTED("imported", "Imported"),
+    GENERATED_OFFLINE("generated_offline", "Generated (Offline)"),
+    GENERATED_ONLINE("generated_online", "Generated (Online)"),
+    CLONED("cloned", "Cloned Voice");
+
+    companion object {
+        fun fromCode(code: String?): VoiceCategory {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: IMPORTED
+        }
+    }
+}
+
+/**
+ * Result of inspecting an imported or recorded voice sample before saving/cloning.
+ */
+data class SampleAudioInspection(
+    val filePath: String,
+    val fileSizeBytes: Long,
+    val sampleRateHz: Int,
+    val channels: Int,
+    val bitsPerSample: Int,
+    val durationSeconds: Float,
+    val rmsEnergy: Float,
+    val clippingRatio: Float,
+    val sha256: String,
+    val isWavPcm: Boolean,
+    val qualityVerdict: String,
+    val qualityDetail: String,
+    val recommendedForCloning: Boolean,
+    val cloningBackendCompatible: Boolean,
+    val cloningCompatibilityNote: String
+)
+
+/**
+ * Represents a built-in, generated, imported, or cloned TTS Voice Profile stored locally on device.
  */
 data class VoiceProfile(
     val id: String,
@@ -97,7 +136,23 @@ data class VoiceProfile(
         SpeakerGender.MALE_18
     },
     val isCustomCloned: Boolean = false,
-    val sampleAudioPath: String? = null
+    val sampleAudioPath: String? = null,
+    val voiceCategory: VoiceCategory = if (isCustomCloned) {
+        VoiceCategory.IMPORTED
+    } else if (gender == SpeakerGender.FEMALE_18) {
+        VoiceCategory.DEFAULT_FEMALE
+    } else {
+        VoiceCategory.DEFAULT_MALE
+    },
+    val sourceModelInfo: String = if (isCustomCloned) {
+        "User Custom Audio Sample"
+    } else {
+        "Supertonic 3 Multilingual (SID #$engineVoiceIndex)"
+    },
+    val languageCode: String = "hi",
+    val styleTag: String = "Neutral",
+    val isSystemProtected: Boolean = !isCustomCloned,
+    val isNeuralCloned: Boolean = false
 )
 
 /**
@@ -137,47 +192,163 @@ object VoiceProfileRepository {
     private val defaultPresets = listOf(
         VoiceProfile(
             id = "preset_char_a_hero",
-            name = "Anon • 18yo Boy (Male Voice)",
-            description = "Natural 18-year-old young male TTS voice for Anon & male characters",
+            name = "M1 • Anon (Young Male Lead)",
+            description = "Natural young male TTS voice for Anon & male leads",
             pitch = SpeakerGender.MALE_18.defaultPitch18Yo,
             speechRate = SpeakerGender.MALE_18.defaultSpeechRate18Yo,
             engineVoiceIndex = 5,
             assignedRole = SpeakerRole.CHARACTER_A,
             gender = SpeakerGender.MALE_18,
-            isCustomCloned = false
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_MALE,
+            sourceModelInfo = "Supertonic 3 Neural • M1 (SID #5) / anon_male_ref.wav",
+            languageCode = "hi",
+            styleTag = "Heroic Conversational",
+            isSystemProtected = true
         ),
         VoiceProfile(
             id = "preset_char_b_companion",
-            name = "Jenny • 18yo Girl (Female Voice)",
-            description = "Bright, expressive 18-year-old young female TTS voice for Jenny & female characters",
+            name = "F2 • Jenny (Bright Female Lead)",
+            description = "Warm, bright female TTS voice for Jenny & companions",
             pitch = SpeakerGender.FEMALE_18.defaultPitch18Yo,
             speechRate = SpeakerGender.FEMALE_18.defaultSpeechRate18Yo,
             engineVoiceIndex = 1,
             assignedRole = SpeakerRole.CHARACTER_B,
             gender = SpeakerGender.FEMALE_18,
-            isCustomCloned = false
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_FEMALE,
+            sourceModelInfo = "Supertonic 3 Neural • F2 (SID #1) / jenny_female_ref.wav",
+            languageCode = "hi",
+            styleTag = "Expressive Warm",
+            isSystemProtected = true
         ),
         VoiceProfile(
             id = "preset_char_c_boss",
-            name = "Kaal • Male Boss Voice",
-            description = "Deep male voice for bosses, guards & villains",
+            name = "M3 • Kaal (Deep Male Villain)",
+            description = "Deep male voice for bosses, warlords & villains",
             pitch = 0.78f,
-            speechRate = 0.98f,
+            speechRate = 0.94f,
             engineVoiceIndex = 7,
             assignedRole = SpeakerRole.CHARACTER_C,
             gender = SpeakerGender.MALE_18,
-            isCustomCloned = false
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_MALE,
+            sourceModelInfo = "Supertonic 3 Neural • M3 (SID #7) / anon_male_ref.wav",
+            languageCode = "hi",
+            styleTag = "Commanding Intense",
+            isSystemProtected = true
         ),
         VoiceProfile(
             id = "preset_narrator_ai",
-            name = "Ira-AI • Female Narrator",
-            description = "Crisp young female voice for game terminals, quests & narration",
-            pitch = 1.15f,
+            name = "F3 • Ira-AI (Composed Narrator)",
+            description = "Crisp female voice for game terminals, quests & narration",
+            pitch = 1.12f,
             speechRate = 1.0f,
             engineVoiceIndex = 2,
             assignedRole = SpeakerRole.NARRATOR,
             gender = SpeakerGender.FEMALE_18,
-            isCustomCloned = false
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_FEMALE,
+            sourceModelInfo = "Supertonic 3 Neural • F3 (SID #2) / jenny_female_ref.wav",
+            languageCode = "hi",
+            styleTag = "Composed Analytical",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_f1_priya",
+            name = "F1 • Priya (Gentle Female)",
+            description = "Soft, melodic female timbre suited for empathetic & royal roles",
+            pitch = 1.18f,
+            speechRate = 0.98f,
+            engineVoiceIndex = 0,
+            assignedRole = SpeakerRole.CHARACTER_B,
+            gender = SpeakerGender.FEMALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_FEMALE,
+            sourceModelInfo = "Supertonic 3 Neural • F1 (SID #0) / jenny_female_ref.wav",
+            languageCode = "hi",
+            styleTag = "Gentle Melodic",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_f4_sarah",
+            name = "F4 • Sarah (Tactical Female)",
+            description = "Resolute tactical female commander voice with confident diction",
+            pitch = 1.06f,
+            speechRate = 0.96f,
+            engineVoiceIndex = 3,
+            assignedRole = SpeakerRole.CHARACTER_B,
+            gender = SpeakerGender.FEMALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_FEMALE,
+            sourceModelInfo = "Supertonic 3 Neural • F4 (SID #3) / jenny_female_ref.wav",
+            languageCode = "hi",
+            styleTag = "Tactical Authoritative",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_f5_oracle",
+            name = "F5 • Oracle (Ethereal Female)",
+            description = "Mystic, calm, resonant female timbre with measured pacing",
+            pitch = 1.12f,
+            speechRate = 0.90f,
+            engineVoiceIndex = 4,
+            assignedRole = SpeakerRole.NARRATOR,
+            gender = SpeakerGender.FEMALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_FEMALE,
+            sourceModelInfo = "Supertonic 3 Neural • F5 (SID #4) / jenny_female_ref.wav",
+            languageCode = "hi",
+            styleTag = "Mystic Calm",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_m2_alex",
+            name = "M2 • Alex (Energetic Male Scout)",
+            description = "Agile, upbeat young male voice for scouts & marksmen",
+            pitch = 1.00f,
+            speechRate = 1.06f,
+            engineVoiceIndex = 6,
+            assignedRole = SpeakerRole.CHARACTER_A,
+            gender = SpeakerGender.MALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_MALE,
+            sourceModelInfo = "Supertonic 3 Neural • M2 (SID #6) / anon_male_ref.wav",
+            languageCode = "hi",
+            styleTag = "Energetic Fast",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_m4_vikram",
+            name = "M4 • Vikram (Mature Male Veteran)",
+            description = "Grounded, seasoned battle veteran male voice",
+            pitch = 0.85f,
+            speechRate = 0.90f,
+            engineVoiceIndex = 8,
+            assignedRole = SpeakerRole.CHARACTER_C,
+            gender = SpeakerGender.MALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_MALE,
+            sourceModelInfo = "Supertonic 3 Neural • M4 (SID #8) / anon_male_ref.wav",
+            languageCode = "hi",
+            styleTag = "Mature Grounded",
+            isSystemProtected = true
+        ),
+        VoiceProfile(
+            id = "preset_m5_guard",
+            name = "M5 • Guard (Commanding Sentinel)",
+            description = "Heavy, urgent male voice for sentinels & announcers",
+            pitch = 0.82f,
+            speechRate = 0.94f,
+            engineVoiceIndex = 9,
+            assignedRole = SpeakerRole.CHARACTER_C,
+            gender = SpeakerGender.MALE_18,
+            isCustomCloned = false,
+            voiceCategory = VoiceCategory.DEFAULT_MALE,
+            sourceModelInfo = "Supertonic 3 Neural • M5 (SID #9) / anon_male_ref.wav",
+            languageCode = "hi",
+            styleTag = "Commanding Urgent",
+            isSystemProtected = true
         )
     )
 
@@ -298,16 +469,37 @@ object VoiceProfileRepository {
             if (loaded.isEmpty()) {
                 _voices.value = defaultPresets
                 _selectedVoiceId.value = defaultPresets.first().id
+                saveVoicesToDisk(context, defaultPresets, _selectedVoiceId.value)
             } else {
-                val updatedWithLatestPresets = loaded.map { existing ->
-                    val matchingPreset = defaultPresets.find { it.id == existing.id && !existing.isCustomCloned }
-                    matchingPreset ?: existing
+                // Preserve user custom voices AND any user-edited metadata/names on existing IDs,
+                // while upgrading default system source metadata and appending any missing default presets.
+                val loadedById = loaded.associateBy { it.id }
+                val mergedDefaults = defaultPresets.map { preset ->
+                    val existing = loadedById[preset.id]
+                    if (existing != null) {
+                        preset.copy(
+                            name = existing.name.ifBlank { preset.name },
+                            pitch = existing.pitch,
+                            speechRate = existing.speechRate,
+                            languageCode = existing.languageCode,
+                            styleTag = existing.styleTag,
+                            isSystemProtected = true
+                        )
+                    } else {
+                        preset
+                    }
                 }
-                _voices.value = updatedWithLatestPresets
-                _selectedVoiceId.value = if (updatedWithLatestPresets.any { it.id == selectedId }) {
+                val defaultIds = defaultPresets.map { it.id }.toSet()
+                val customAndUserVoices = loaded.filter { it.id !in defaultIds }
+                val finalVoices = mergedDefaults + customAndUserVoices
+                _voices.value = finalVoices
+                _selectedVoiceId.value = if (finalVoices.any { it.id == selectedId }) {
                     selectedId
                 } else {
-                    updatedWithLatestPresets.first().id
+                    finalVoices.first().id
+                }
+                if (finalVoices.size != loaded.size) {
+                    saveVoicesToDisk(context, finalVoices, _selectedVoiceId.value)
                 }
             }
         }
@@ -481,39 +673,212 @@ object VoiceProfileRepository {
             .apply()
     }
 
-    fun deleteVoice(context: Context, voiceId: String) {
+    fun renameVoice(
+        context: Context,
+        voiceId: String,
+        newName: String
+    ): VoiceProfile? {
+        val cleanName = newName.trim().ifBlank { return null }
         val currentList = _voices.value
-        if (currentList.size <= 1) return // Keep at least 1 voice available
+        val existing = currentList.find { it.id == voiceId } ?: return null
+        val renamed = existing.copy(name = cleanName)
+        val updated = currentList.map { if (it.id == voiceId) renamed else it }
+        _voices.value = updated
+        if (_selectedVoiceId.value == voiceId) {
+            _lastAssignedVoiceName.value = renamed.name
+        }
+        saveVoicesToDisk(context, updated, _selectedVoiceId.value)
+        return renamed
+    }
 
+    fun getCharactersAssignedToVoice(voiceId: String): List<CharacterVoiceAssignment> {
+        val voice = _voices.value.find { it.id == voiceId } ?: return emptyList()
+        val voiceSampleBase = voice.sampleAudioPath?.let { File(it).name }
+        return _characterAssignments.value.filter { charAssign ->
+            charAssign.assignedVoiceId == voiceId ||
+                (!voiceSampleBase.isNullOrBlank() && charAssign.referenceVoiceId == voiceSampleBase) ||
+                (!voice.isCustomCloned && charAssign.assignedVoiceId.isBlank() &&
+                    !charAssign.isUnknownOrNeutral && charAssign.speakerId == voice.engineVoiceIndex)
+        }
+    }
+
+    fun assignVoiceToCharacter(
+        context: Context,
+        voice: VoiceProfile,
+        rawCharacterName: String
+    ): CharacterVoiceAssignment {
+        val norm = CharacterVoiceAssignment.normalizeName(rawCharacterName).ifBlank { "anon" }
+        val existing = findExistingAssignment(norm, activeGameNamespace)
+            ?: getOrCreateAssignmentForCharacter(rawCharacterName, norm, activeGameNamespace, context)
+
+        val customSampleFile = voice.sampleAudioPath?.let { File(it) }?.takeIf { it.exists() && it.length() > 100L }
+        val customSha = customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
+        val resolvedRefId = when {
+            customSampleFile != null -> customSampleFile.nameWithoutExtension
+            voice.gender == SpeakerGender.FEMALE_18 -> CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+            else -> CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+        }
+        val resolvedSha = when {
+            customSha.isNotBlank() -> customSha
+            voice.gender == SpeakerGender.FEMALE_18 -> CharacterVoiceAssignment.JENNY_FEMALE_REF_SHA256
+            else -> CharacterVoiceAssignment.ANON_MALE_REF_SHA256
+        }
+        val presentation = when (voice.gender) {
+            SpeakerGender.FEMALE_18 -> "female"
+            SpeakerGender.MALE_18 -> "male"
+            SpeakerGender.UNKNOWN -> existing.voicePresentation
+        }
+        val updated = existing.copy(
+            speakerId = voice.engineVoiceIndex.coerceIn(0, 9),
+            speed = voice.speechRate.coerceIn(0.6f, 1.5f),
+            pitch = voice.pitch.coerceIn(0.6f, 1.5f),
+            referenceVoiceId = resolvedRefId,
+            referenceAudioSha256 = resolvedSha,
+            voicePresentation = presentation,
+            vocalStyleDescription = "${voice.name} • ${voice.sourceModelInfo}",
+            assignedVoiceId = voice.id,
+            isUserOverride = true,
+            lastDetectedTimestamp = System.currentTimeMillis()
+        )
+        return updateCharacterVoiceProfile(context, updated)
+    }
+
+    fun deleteVoiceSafely(
+        context: Context,
+        voiceId: String,
+        replacementVoiceId: String? = null
+    ): Result<Unit> {
+        val currentList = _voices.value
         val target = currentList.find { it.id == voiceId }
-        if (target?.sampleAudioPath != null) {
+            ?: return Result.failure(IllegalArgumentException("Voice not found."))
+        if (target.isSystemProtected) {
+            return Result.failure(IllegalStateException("Default system voice '${target.name}' is protected and cannot be deleted."))
+        }
+        if (currentList.size <= 1) {
+            return Result.failure(IllegalStateException("At least one voice must remain in Voice Library."))
+        }
+
+        val affectedChars = getCharactersAssignedToVoice(voiceId)
+        val affectedRoles = _roleVoiceAssignments.value.filterValues { it == voiceId }.keys
+        val replacement = replacementVoiceId?.let { rId ->
+            currentList.find { it.id == rId && it.id != voiceId }
+        }
+        if (affectedChars.isNotEmpty() && replacement == null) {
+            return Result.failure(
+                IllegalStateException(
+                    "Voice '${target.name}' is currently assigned to ${affectedChars.joinToString { it.displayName }}. Select a replacement voice first."
+                )
+            )
+        }
+
+        val fallbackReplacement = replacement
+            ?: currentList.firstOrNull { it.id != voiceId && it.gender == target.gender }
+            ?: currentList.first { it.id != voiceId }
+
+        if (affectedChars.isNotEmpty()) {
+            affectedChars.forEach { charAssign ->
+                assignVoiceToCharacter(context, fallbackReplacement, charAssign.characterName)
+            }
+        }
+        if (affectedRoles.isNotEmpty()) {
+            val updatedRoles = _roleVoiceAssignments.value.toMutableMap()
+            affectedRoles.forEach { role -> updatedRoles[role] = fallbackReplacement.id }
+            _roleVoiceAssignments.value = updatedRoles
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_ROLE_ASSIGNMENTS_JSON, serializeRoleAssignmentsJson(updatedRoles))
+                .apply()
+        }
+
+        val remaining = currentList.filterNot { it.id == voiceId }
+        val targetSample = target.sampleAudioPath
+        if (!targetSample.isNullOrBlank() && remaining.none { it.sampleAudioPath == targetSample }) {
             try {
-                File(target.sampleAudioPath).delete()
+                val f = File(targetSample)
+                if (f.exists() && f.absolutePath.contains("custom_voices")) {
+                    f.delete()
+                }
             } catch (_: Exception) {
             }
         }
 
-        val updated = currentList.filterNot { it.id == voiceId }
         val newSelectedId = if (_selectedVoiceId.value == voiceId) {
-            updated.first().id
+            fallbackReplacement.id
         } else {
             _selectedVoiceId.value
         }
-        _voices.value = updated
+        _voices.value = remaining
         _selectedVoiceId.value = newSelectedId
-        saveVoicesToDisk(context, updated, newSelectedId)
+        saveVoicesToDisk(context, remaining, newSelectedId)
+        return Result.success(Unit)
+    }
+
+    fun deleteVoice(context: Context, voiceId: String) {
+        val target = _voices.value.find { it.id == voiceId } ?: return
+        if (target.isSystemProtected) return
+        val replacement = _voices.value.firstOrNull { it.id != voiceId && it.gender == target.gender }
+            ?: _voices.value.firstOrNull { it.id != voiceId }
+        deleteVoiceSafely(context, voiceId, replacement?.id)
     }
 
     fun restoreDefaultVoices(context: Context) {
-        val customOnly = _voices.value.filter { it.isCustomCloned }
+        val customOnly = _voices.value.filter { !it.isSystemProtected }
         val merged = defaultPresets + customOnly
         _voices.value = merged
         saveVoicesToDisk(context, merged, _selectedVoiceId.value)
     }
 
+    fun addGeneratedOrImportedVoice(
+        context: Context,
+        name: String,
+        description: String,
+        gender: SpeakerGender,
+        pitch: Float = gender.defaultPitch18Yo,
+        speechRate: Float = gender.defaultSpeechRate18Yo,
+        engineVoiceIndex: Int = if (gender == SpeakerGender.FEMALE_18) 1 else 5,
+        voiceCategory: VoiceCategory,
+        sourceModelInfo: String,
+        languageCode: String = "hi",
+        styleTag: String = "Neutral",
+        sampleAudioPath: String? = null,
+        isNeuralCloned: Boolean = false,
+        selectImmediately: Boolean = true
+    ): VoiceProfile {
+        val cleanName = name.trim().ifEmpty { "Voice ${_voices.value.size + 1}" }
+        val role = if (gender == SpeakerGender.FEMALE_18) SpeakerRole.CHARACTER_B else SpeakerRole.CHARACTER_A
+        val newProfile = VoiceProfile(
+            id = "voice_${voiceCategory.code}_${System.currentTimeMillis()}",
+            name = cleanName,
+            description = description.ifBlank { sourceModelInfo },
+            pitch = pitch.coerceIn(0.45f, 1.75f),
+            speechRate = speechRate.coerceIn(0.55f, 1.65f),
+            engineVoiceIndex = engineVoiceIndex.coerceIn(0, 9),
+            assignedRole = role,
+            gender = gender,
+            isCustomCloned = true,
+            sampleAudioPath = sampleAudioPath,
+            voiceCategory = voiceCategory,
+            sourceModelInfo = sourceModelInfo,
+            languageCode = languageCode.trim().ifBlank { "hi" },
+            styleTag = styleTag.trim().ifBlank { "Neutral" },
+            isSystemProtected = false,
+            isNeuralCloned = isNeuralCloned
+        )
+        val updated = listOf(newProfile) + _voices.value
+        _voices.value = updated
+        if (selectImmediately) {
+            _selectedVoiceId.value = newProfile.id
+        }
+        saveVoicesToDisk(context, updated, _selectedVoiceId.value)
+        if (selectImmediately) {
+            selectVoice(context, newProfile)
+        }
+        return newProfile
+    }
+
     /**
      * Adds a user-recorded or imported voice-style preset derived from microphone F0/cadence analysis.
-     * Note: This is an acoustic pitch/rate preset, NOT true neural voice cloning.
+     * Note: This is an acoustic pitch/rate preset, NOT true neural voice cloning unless Chatterbox cloned it.
      */
     fun addCustomVoiceStylePreset(
         context: Context,
@@ -524,6 +889,11 @@ object VoiceProfileRepository {
         assignedRole: SpeakerRole,
         sampleAudioPath: String?
     ): VoiceProfile {
+        val inferredGender = if (assignedRole == SpeakerRole.CHARACTER_B || assignedRole == SpeakerRole.NARRATOR || pitch >= 1.12f) {
+            SpeakerGender.FEMALE_18
+        } else {
+            SpeakerGender.MALE_18
+        }
         val cleanName = name.trim().ifEmpty { "Voice Preset ${_voices.value.size + 1}" }
         val newProfile = VoiceProfile(
             id = "voice_preset_${System.currentTimeMillis()}",
@@ -531,10 +901,17 @@ object VoiceProfileRepository {
             description = description.ifBlank { "Acoustic Voice-Style Preset" },
             pitch = pitch.coerceIn(0.45f, 1.75f),
             speechRate = speechRate.coerceIn(0.55f, 1.65f),
-            engineVoiceIndex = (_voices.value.size) % 5,
+            engineVoiceIndex = if (inferredGender == SpeakerGender.FEMALE_18) 1 else 5,
             assignedRole = assignedRole,
+            gender = inferredGender,
             isCustomCloned = true,
-            sampleAudioPath = sampleAudioPath
+            sampleAudioPath = sampleAudioPath,
+            voiceCategory = VoiceCategory.IMPORTED,
+            sourceModelInfo = "Imported Sample + Acoustic Pitch/Rate Preset",
+            languageCode = "hi",
+            styleTag = "Custom Sample",
+            isSystemProtected = false,
+            isNeuralCloned = false
         )
         val updated = listOf(newProfile) + _voices.value
         _voices.value = updated
@@ -564,14 +941,127 @@ object VoiceProfileRepository {
     )
 
     /**
-     * Records a 3–5 second 16kHz Mono PCM audio sample from the device microphone,
+     * Inspects an audio sample file for duration (5-10s recommended for cloning), sample rate,
+     * RMS level, clipping ratio, SHA-256, and whether the Chatterbox neural cloning backend is available.
+     */
+    fun inspectAudioSample(file: File): SampleAudioInspection {
+        val state = TranslatorStateRepository.state.value
+        val cloningCompatible = state.chatterboxServerReachable && state.chatterboxModelLoaded
+        val cloningNote = if (cloningCompatible) {
+            "Chatterbox neural cloning backend ready (${state.chatterboxServerUrl})"
+        } else {
+            "Chatterbox server not connected — sample can be saved as Imported reference & acoustic preset, but true neural voice cloning requires connecting the Wi-Fi Chatterbox server."
+        }
+        if (!file.exists() || file.length() <= 44L) {
+            return SampleAudioInspection(
+                filePath = file.absolutePath,
+                fileSizeBytes = file.length(),
+                sampleRateHz = 0,
+                channels = 0,
+                bitsPerSample = 0,
+                durationSeconds = 0f,
+                rmsEnergy = 0f,
+                clippingRatio = 0f,
+                sha256 = "",
+                isWavPcm = false,
+                qualityVerdict = "Invalid / Missing Audio",
+                qualityDetail = "Audio file is missing or empty (${file.length()} bytes).",
+                recommendedForCloning = false,
+                cloningBackendCompatible = cloningCompatible,
+                cloningCompatibilityNote = cloningNote
+            )
+        }
+        val bytes = try {
+            file.readBytes()
+        } catch (_: Exception) {
+            ByteArray(0)
+        }
+        val sha = com.example.engine.CharacterVoiceRouter.computeFileSha256(file)
+        val isRiffWav = bytes.size >= 44 &&
+            String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+            String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE"
+        if (!isRiffWav) {
+            val approxSec = (file.length() / 16000f).coerceAtLeast(0.5f)
+            return SampleAudioInspection(
+                filePath = file.absolutePath,
+                fileSizeBytes = file.length(),
+                sampleRateHz = 0,
+                channels = 0,
+                bitsPerSample = 0,
+                durationSeconds = approxSec,
+                rmsEnergy = 0f,
+                clippingRatio = 0f,
+                sha256 = sha,
+                isWavPcm = false,
+                qualityVerdict = "Encoded Audio (${file.extension.uppercase(Locale.ROOT).ifBlank { "AUDIO" }})",
+                qualityDetail = "${file.length() / 1024} KB • Validated non-empty encoded audio file. WAV 16–24kHz PCM recommended for Chatterbox cloning.",
+                recommendedForCloning = file.length() >= 16_000L,
+                cloningBackendCompatible = cloningCompatible,
+                cloningCompatibilityNote = cloningNote
+            )
+        }
+
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val channels = bb.getShort(22).toInt().coerceAtLeast(1)
+        val sampleRate = bb.getInt(24).coerceAtLeast(8000)
+        val bitsPerSample = bb.getShort(34).toInt().coerceAtLeast(8)
+        val pcmByteCount = (bytes.size - 44).coerceAtLeast(0)
+        val bytesPerSample = (bitsPerSample / 8).coerceAtLeast(1)
+        val totalFrames = pcmByteCount / (channels * bytesPerSample)
+        val durationSec = totalFrames.toFloat() / sampleRate.toFloat()
+
+        var sumSq = 0.0
+        var clipped = 0L
+        var sampleCount = 0L
+        if (bitsPerSample == 16) {
+            var pos = 44
+            while (pos + 1 < bytes.size) {
+                val sample = ((bytes[pos + 1].toInt() shl 8) or (bytes[pos].toInt() and 0xFF)).toShort()
+                val norm = sample / 32768.0
+                sumSq += norm * norm
+                if (abs(sample.toInt()) >= 32400) clipped++
+                sampleCount++
+                pos += 2
+            }
+        }
+        val rms = if (sampleCount > 0) sqrt(sumSq / sampleCount).toFloat() else 0f
+        val clipRatio = if (sampleCount > 0) clipped.toFloat() / sampleCount.toFloat() else 0f
+        val verdict = when {
+            durationSec < 2.5f -> "Too Short (${String.format(Locale.US, "%.1fs", durationSec)})"
+            rms < 0.01f -> "Too Quiet / Silent"
+            clipRatio > 0.02f -> "Clipping Detected (${(clipRatio * 100).toInt()}%)"
+            durationSec in 4.5f..12.0f -> "Optimal Quality (${String.format(Locale.US, "%.1fs", durationSec)})"
+            else -> "Usable (${String.format(Locale.US, "%.1fs", durationSec)})"
+        }
+        val detail = "${sampleRate}Hz • ${channels}ch • ${String.format(Locale.US, "%.1fs", durationSec)} • RMS ${String.format(Locale.US, "%.3f", rms)}"
+        return SampleAudioInspection(
+            filePath = file.absolutePath,
+            fileSizeBytes = file.length(),
+            sampleRateHz = sampleRate,
+            channels = channels,
+            bitsPerSample = bitsPerSample,
+            durationSeconds = durationSec,
+            rmsEnergy = rms,
+            clippingRatio = clipRatio,
+            sha256 = sha,
+            isWavPcm = true,
+            qualityVerdict = verdict,
+            qualityDetail = detail,
+            recommendedForCloning = durationSec >= 3.0f && rms >= 0.01f && clipRatio <= 0.05f,
+            cloningBackendCompatible = cloningCompatible,
+            cloningCompatibilityNote = cloningNote
+        )
+    }
+
+    /**
+     * Records a 5–10 second (or 3–10s configurable) 16kHz Mono PCM audio sample from the microphone,
      * saves it as a `.wav` file in `filesDir/custom_voices/`, and extracts acoustic
-     * Fundamental Frequency ($F_0$) and energy cadence to clone the user's vocal profile.
+     * Fundamental Frequency ($F_0$) and energy cadence.
      */
     @SuppressLint("MissingPermission")
     suspend fun recordAndAnalyzeVoiceSample(
         context: Context,
-        durationSeconds: Int = 4,
+        durationSeconds: Int = 6,
         onProgressUpdate: (Float, Float) -> Unit
     ): ClonedAudioAnalysisResult = withContext(Dispatchers.IO) {
         val sampleRate = 16000
@@ -580,7 +1070,8 @@ object VoiceProfileRepository {
         val minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
             .coerceAtLeast(sampleRate / 5)
 
-        val totalSamplesTarget = sampleRate * durationSeconds.coerceIn(3, 5)
+        val clampedSeconds = durationSeconds.coerceIn(3, 10)
+        val totalSamplesTarget = sampleRate * clampedSeconds
         val collectedShorts = ShortArray(totalSamplesTarget)
         var collectedCount = 0
 
@@ -598,7 +1089,7 @@ object VoiceProfileRepository {
                 recorder.startRecording()
                 val readBuffer = ShortArray(1024)
                 val startMs = System.currentTimeMillis()
-                val totalDurationMs = durationSeconds * 1000L
+                val totalDurationMs = clampedSeconds * 1000L
 
                 while (isActive && collectedCount < totalSamplesTarget) {
                     val read = recorder.read(readBuffer, 0, readBuffer.size)
@@ -700,12 +1191,29 @@ object VoiceProfileRepository {
         val avgEnergy = if (bytesReadTotal > 0) (energySum.toFloat() / (bytesReadTotal / 2f)) else 40f
         val clonedRate = (0.85f + (avgEnergy / 128f) * 0.28f).coerceIn(0.80f, 1.25f)
 
+        var finalFile = destFile
+        if (destFile.exists() && destFile.length() > 12L) {
+            try {
+                val head = ByteArray(12)
+                destFile.inputStream().use { it.read(head) }
+                if (String(head, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+                    String(head, 8, 4, Charsets.US_ASCII) == "WAVE"
+                ) {
+                    val wavDest = File(voiceDir, destFile.nameWithoutExtension + ".wav")
+                    if (destFile.renameTo(wavDest)) {
+                        finalFile = wavDest
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
         ClonedAudioAnalysisResult(
-            savedAudioPath = if (destFile.exists() && destFile.length() > 0) destFile.absolutePath else null,
+            savedAudioPath = if (finalFile.exists() && finalFile.length() > 0) finalFile.absolutePath else null,
             estimatedFundamentalHz = estimatedHz,
             clonedPitch = clonedPitch,
             clonedSpeechRate = clonedRate,
-            acousticSummary = "Imported Audio Clone (${estimatedHz.toInt()} Hz • Pitch ${String.format(Locale.US, "%.2fx", clonedPitch)})"
+            acousticSummary = "Imported Audio (${estimatedHz.toInt()} Hz • Pitch ${String.format(Locale.US, "%.2fx", clonedPitch)})"
         )
     }
 
@@ -1396,6 +1904,12 @@ object VoiceProfileRepository {
                 put("assignedRole", v.assignedRole.code)
                 put("gender", v.gender.code)
                 put("isCustomCloned", v.isCustomCloned)
+                put("voiceCategory", v.voiceCategory.code)
+                put("sourceModelInfo", v.sourceModelInfo)
+                put("languageCode", v.languageCode)
+                put("styleTag", v.styleTag)
+                put("isSystemProtected", v.isSystemProtected)
+                put("isNeuralCloned", v.isNeuralCloned)
                 if (v.sampleAudioPath != null) {
                     put("sampleAudioPath", v.sampleAudioPath)
                 }
@@ -1422,6 +1936,14 @@ object VoiceProfileRepository {
                 } else {
                     SpeakerGender.MALE_18.code
                 }
+                val parsedGender = SpeakerGender.fromCode(obj.optString("gender", defaultGenderCode))
+                val isCustom = obj.optBoolean("isCustomCloned", false)
+                val sid = obj.optInt("engineVoiceIndex", i % 10).coerceIn(0, 9)
+                val defaultCategory = when {
+                    isCustom -> VoiceCategory.IMPORTED
+                    parsedGender == SpeakerGender.FEMALE_18 -> VoiceCategory.DEFAULT_FEMALE
+                    else -> VoiceCategory.DEFAULT_MALE
+                }
                 list.add(
                     VoiceProfile(
                         id = obj.optString("id", "voice_$i"),
@@ -1429,11 +1951,20 @@ object VoiceProfileRepository {
                         description = obj.optString("description", "Custom TTS Voice Profile"),
                         pitch = pitch,
                         speechRate = obj.optDouble("speechRate", 0.95).toFloat().coerceIn(0.4f, 1.8f),
-                        engineVoiceIndex = obj.optInt("engineVoiceIndex", i % 4),
+                        engineVoiceIndex = sid,
                         assignedRole = role,
-                        gender = SpeakerGender.fromCode(obj.optString("gender", defaultGenderCode)),
-                        isCustomCloned = obj.optBoolean("isCustomCloned", false),
-                        sampleAudioPath = obj.optString("sampleAudioPath", "").takeIf { it.isNotBlank() }
+                        gender = parsedGender,
+                        isCustomCloned = isCustom,
+                        sampleAudioPath = obj.optString("sampleAudioPath", "").takeIf { it.isNotBlank() },
+                        voiceCategory = obj.optString("voiceCategory", "").takeIf { it.isNotBlank() }
+                            ?.let { VoiceCategory.fromCode(it) } ?: defaultCategory,
+                        sourceModelInfo = obj.optString("sourceModelInfo", "").ifBlank {
+                            if (isCustom) "User Custom Audio Sample" else "Supertonic 3 Multilingual (SID #$sid)"
+                        },
+                        languageCode = obj.optString("languageCode", "hi").ifBlank { "hi" },
+                        styleTag = obj.optString("styleTag", "Neutral").ifBlank { "Neutral" },
+                        isSystemProtected = obj.optBoolean("isSystemProtected", !isCustom),
+                        isNeuralCloned = obj.optBoolean("isNeuralCloned", false)
                     )
                 )
             }
