@@ -65,6 +65,7 @@ fun VoiceSampleImportSection(
     selectedLanguage: String,
     selectedStyle: String,
     consentConfirmed: Boolean,
+    isChatterboxConnected: Boolean = false,
     onConsentChange: (Boolean) -> Unit,
     onSampleReadyForLibrary: (
         audioPath: String,
@@ -318,7 +319,7 @@ fun VoiceSampleImportSection(
                             samplePath,
                             inspected,
                             VoiceCategory.IMPORTED,
-                            "Imported Sample (${inspected.qualityVerdict}) • $selectedLanguage • $selectedStyle",
+                            "Acoustic Pitch/Rate Preset (${inspected.qualityVerdict}) • Not Neural Cloning",
                             latestAcousticPitch,
                             latestAcousticRate,
                             false
@@ -330,11 +331,15 @@ fun VoiceSampleImportSection(
                         .height(48.dp)
                         .testTag("save_imported_voice_button")
                 ) {
-                    Text("Prepare Imported")
+                    Text("Save Acoustic Preset")
                 }
 
                 Button(
                     onClick = {
+                        if (!isChatterboxConnected) {
+                            onShowMessage("Neural cloning requires a connected PC Chatterbox server (open Online tab -> Test Server first).")
+                            return@Button
+                        }
                         onSampleReadyForLibrary(
                             samplePath,
                             inspected,
@@ -345,7 +350,7 @@ fun VoiceSampleImportSection(
                             true
                         )
                     },
-                    enabled = consentConfirmed && inspected.cloningBackendCompatible,
+                    enabled = consentConfirmed && inspected.cloningBackendCompatible && isChatterboxConnected,
                     modifier = Modifier
                         .weight(1f)
                         .height(48.dp)
@@ -353,7 +358,7 @@ fun VoiceSampleImportSection(
                 ) {
                     Icon(Icons.Default.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Neural Clone")
+                    Text(if (isChatterboxConnected) "Neural Clone" else "Clone (Server Offline)")
                 }
             }
         }

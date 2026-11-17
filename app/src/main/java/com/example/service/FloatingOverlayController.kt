@@ -1210,8 +1210,11 @@ class FloatingOverlayController(
             sheetCard.addView(statusTv)
 
             val routingDebugTv = TextView(context).apply {
-                text = "Live Route: ${currentState.lastRoutingDebugSummary}"
-                setTextColor(Color.parseColor("#A7F3D0"))
+                val engineName = currentState.voiceBackendType.ifBlank { currentState.activeTtsEngineLabel }
+                val errNote = currentState.lastTtsError.ifBlank { currentState.lastPipelineError }
+                val errSuffix = if (errNote.isNotBlank()) "\nError (${currentState.chatterboxErrorCategory}): $errNote" else ""
+                text = "Engine: $engineName\nLive Route: ${currentState.lastRoutingDebugSummary}$errSuffix"
+                setTextColor(if (errNote.isNotBlank()) Color.parseColor("#FDE68A") else Color.parseColor("#A7F3D0"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 setPadding(0, 0, 0, dpToPx(6))
             }

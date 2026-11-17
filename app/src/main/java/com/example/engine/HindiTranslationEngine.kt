@@ -111,6 +111,36 @@ object HindiTranslationEngine {
             TranslationStyle.MODERN_HINDI to "टेंशन मत लो, मैं हूँ ना!",
             TranslationStyle.CASUAL_HINGLISH to "टेंशन मत लो ब्रो, मैं हूँ ना!",
             TranslationStyle.FORMAL_HINDI to "चिंता मत कीजिए, मैं आपके साथ हूँ।"
+        ),
+        "what the hell are you doing?" to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे यार, ये क्या कर रहे हो?",
+            TranslationStyle.CASUAL_HINGLISH to "अरे यार, ये क्या कर रहे हो ब्रो?",
+            TranslationStyle.FORMAL_HINDI to "अरे, यह आप क्या कर रहे हैं?"
+        ),
+        "what the hell are you doing" to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे यार, ये क्या कर रहे हो?",
+            TranslationStyle.CASUAL_HINGLISH to "अरे यार, ये क्या कर रहे हो ब्रो?",
+            TranslationStyle.FORMAL_HINDI to "अरे, यह आप क्या कर रहे हैं?"
+        ),
+        "come on! let's go!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "चलो यार, जल्दी चलते हैं!",
+            TranslationStyle.CASUAL_HINGLISH to "चलो ब्रो, जल्दी चलते हैं!",
+            TranslationStyle.FORMAL_HINDI to "चलिए, जल्दी चलते हैं!"
+        ),
+        "come on, let's go!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "चलो यार, जल्दी चलते हैं!",
+            TranslationStyle.CASUAL_HINGLISH to "चलो ब्रो, जल्दी चलते हैं!",
+            TranslationStyle.FORMAL_HINDI to "चलिए, जल्दी चलते हैं!"
+        ),
+        "come on let's go" to mapOf(
+            TranslationStyle.MODERN_HINDI to "चलो यार, जल्दी चलते हैं!",
+            TranslationStyle.CASUAL_HINGLISH to "चलो ब्रो, जल्दी चलते हैं!",
+            TranslationStyle.FORMAL_HINDI to "चलिए, जल्दी चलते हैं!"
+        ),
+        "come on! lets go!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "चलो यार, जल्दी चलते हैं!",
+            TranslationStyle.CASUAL_HINGLISH to "चलो ब्रो, जल्दी चलते हैं!",
+            TranslationStyle.FORMAL_HINDI to "चलिए, जल्दी चलते हैं!"
         )
     )
 
@@ -124,6 +154,12 @@ object HindiTranslationEngine {
             "hey, you are the one who started it!" to "अरे, शुरू तो तुमने किया था!",
             "i got your back." to "टेंशन मत लो, मैं हूँ ना!",
             "i got your back!" to "टेंशन मत लो, मैं हूँ ना!",
+            "what the hell are you doing?" to "अरे यार, ये क्या कर रहे हो?",
+            "what the hell are you doing" to "अरे यार, ये क्या कर रहे हो?",
+            "come on! let's go!" to "चलो यार, जल्दी चलते हैं!",
+            "come on, let's go!" to "चलो यार, जल्दी चलते हैं!",
+            "come on let's go" to "चलो यार, जल्दी चलते हैं!",
+            "come on! lets go!" to "चलो यार, जल्दी चलते हैं!",
             "are you kidding me?" to "मज़ाक कर रहे हो क्या?",
             "let's get moving!" to "चलो, जल्दी निकलते हैं!",
             "lets get moving!" to "चलो, जल्दी निकलते हैं!",

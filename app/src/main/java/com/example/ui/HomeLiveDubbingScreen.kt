@@ -78,6 +78,7 @@ fun HomeLiveDubbingScreen(
     state: TranslatorAppState,
     activeCharacter: CharacterVoiceAssignment?,
     activeVoice: VoiceProfile?,
+    activeGameNamespace: String = "default_game",
     hasOverlayPermission: Boolean,
     onToggleStartStopService: () -> Unit,
     onToggleFloatingScanning: () -> Unit,
@@ -371,7 +372,7 @@ fun HomeLiveDubbingScreen(
                             Spacer(modifier = Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Character: $activeCharName",
+                                    text = "Character: $activeCharName • Game: $activeGameNamespace",
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
@@ -615,15 +616,21 @@ fun HomeLiveDubbingScreen(
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column(modifier = Modifier.weight(1f)) {
+                            val readinessBadge = when {
+                                state.sherpaModelLoaded -> "Neural Offline Ready"
+                                state.chatterboxServerReachable && state.chatterboxModelLoaded -> "Chatterbox Neural Ready"
+                                state.voiceBackendType.contains("SYSTEM", ignoreCase = true) -> "System Fallback (1 Voice)"
+                                else -> "Checking Engine"
+                            }
                             Text(
-                                text = "Engine: ${state.voiceBackendType.ifBlank { state.activeTtsEngineLabel }}",
+                                text = "$readinessBadge • ${state.voiceBackendType.ifBlank { state.activeTtsEngineLabel }}",
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = state.captureStatusMessage.ifBlank { state.voiceDownloadMessage },
+                                text = state.lastTtsError.ifBlank { state.captureStatusMessage.ifBlank { state.voiceDownloadMessage } },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,

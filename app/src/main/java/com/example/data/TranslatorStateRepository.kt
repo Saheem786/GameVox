@@ -405,6 +405,9 @@ data class TranslatorAppState(
 object TranslatorStateRepository {
     private val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private const val PREFS_NAME = "gamevox_hindi_prefs"
+    private const val LEGACY_PREFS_NAME = "screen_translator_prefs"
+    private const val KEY_APP_SCHEMA_VERSION = "app_prefs_schema_version_int"
+    const val CURRENT_APP_SCHEMA_VERSION = 2
     private const val KEY_TARGET_LANG = "target_lang_code"
     private const val KEY_NETWORK_VOICE = "use_hq_network_voice"
     private const val KEY_SHOW_SCAN_BOX = "show_target_box_overlay"
@@ -435,7 +438,35 @@ object TranslatorStateRepository {
     @Volatile
     private var lastDialogChangeTimestamp: Long = 0L
 
+    private fun migrateV1PreferencesIfNeeded(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val currentVersion = prefs.getInt(KEY_APP_SCHEMA_VERSION, 1)
+        if (currentVersion >= CURRENT_APP_SCHEMA_VERSION) return
+
+        val legacyPrefs = context.getSharedPreferences(LEGACY_PREFS_NAME, Context.MODE_PRIVATE)
+        val legacyAll = legacyPrefs.all
+        val editor = prefs.edit()
+        for ((key, value) in legacyAll) {
+            if (!prefs.contains(key)) {
+                when (value) {
+                    is String -> editor.putString(key, value)
+                    is Boolean -> editor.putBoolean(key, value)
+                    is Int -> editor.putInt(key, value)
+                    is Long -> editor.putLong(key, value)
+                    is Float -> editor.putFloat(key, value)
+                    is Set<*> -> @Suppress("UNCHECKED_CAST") editor.putStringSet(key, value as Set<String>)
+                }
+            }
+        }
+        editor.putInt(KEY_APP_SCHEMA_VERSION, CURRENT_APP_SCHEMA_VERSION).apply()
+    }
+
+    fun getSchemaVersion(context: Context): Int =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_APP_SCHEMA_VERSION, 1)
+
     fun loadPreferences(context: Context) {
+        migrateV1PreferencesIfNeeded(context)
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val langCode = prefs.getString(KEY_TARGET_LANG, TargetLanguage.HINDI.code)
         val targetLang = TargetLanguage.fromCode(langCode)

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Settings
@@ -61,6 +62,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -82,6 +84,7 @@ import com.example.service.GameVoxAccessibilityService
 import com.example.service.KokoroMediaPipeTtsEngine
 import com.example.service.ScreenTranslatorService
 import com.example.ui.AbVoiceTestingScreen
+import com.example.ui.CharactersScreen
 import com.example.ui.DiagnosisScreen
 import com.example.ui.HomeLiveDubbingScreen
 import com.example.ui.SettingsScreen
@@ -96,8 +99,9 @@ enum class GameVoxMainTab(
     val testTag: String
 ) {
     HOME("Home", Icons.Default.Home, "nav_tab_home"),
-    VOICE_LIBRARY("Library", Icons.Default.LibraryMusic, "nav_tab_voice_library"),
+    VOICE_LIBRARY("Voices", Icons.Default.LibraryMusic, "nav_tab_voice_library"),
     VOICE_GENERATE("Generate", Icons.Default.AutoFixHigh, "nav_tab_voice_generate"),
+    CHARACTERS("Characters", Icons.Default.Groups, "nav_tab_characters"),
     SETTINGS("Settings", Icons.Default.Settings, "nav_tab_settings")
 }
 
@@ -156,6 +160,7 @@ fun GameVoxApp(
     val voices by VoiceProfileRepository.voices.collectAsStateWithLifecycle()
     val selectedVoiceId by VoiceProfileRepository.selectedVoiceId.collectAsStateWithLifecycle()
     val activeCharacter by VoiceProfileRepository.activeCharacterAssignment.collectAsStateWithLifecycle()
+    val activeGameNamespace by VoiceProfileRepository.activeGameNamespaceFlow.collectAsStateWithLifecycle()
 
     var currentTab by remember { mutableStateOf(GameVoxMainTab.HOME) }
     var secondaryRoute by remember { mutableStateOf(SecondaryRoute.NONE) }
@@ -340,6 +345,7 @@ fun GameVoxApp(
                 state = state,
                 activeCharacter = activeCharacter,
                 activeVoice = activeVoice,
+                activeGameNamespace = activeGameNamespace,
                 hasOverlayPermission = hasOverlayPermission,
                 onToggleStartStopService = {
                     if (state.isServiceRunning) {
@@ -433,6 +439,10 @@ fun GameVoxApp(
                 onSavedToLibrary = { currentTab = GameVoxMainTab.VOICE_LIBRARY }
             )
 
+            GameVoxMainTab.CHARACTERS -> CharactersScreen(
+                snackbarHostState = snackbarHostState
+            )
+
             GameVoxMainTab.SETTINGS -> SettingsScreen(
                 state = state,
                 activeVoiceSummary = activeVoiceSummary,
@@ -522,9 +532,10 @@ fun GameVoxApp(
                     title = {
                         Text(
                             text = when (currentTab) {
-                                GameVoxMainTab.HOME -> "GameVox"
+                                GameVoxMainTab.HOME -> "GameVox 2.0"
                                 GameVoxMainTab.VOICE_LIBRARY -> "Voice Library"
                                 GameVoxMainTab.VOICE_GENERATE -> "Voice Generate"
+                                GameVoxMainTab.CHARACTERS -> "Characters"
                                 GameVoxMainTab.SETTINGS -> "Settings"
                             },
                             style = MaterialTheme.typography.headlineSmall,
@@ -549,7 +560,15 @@ fun GameVoxApp(
                                 selected = currentTab == tab,
                                 onClick = { currentTab = tab },
                                 icon = { Icon(tab.icon, contentDescription = tab.label) },
-                                label = { Text(tab.label) },
+                                label = {
+                                    Text(
+                                        text = tab.label,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                },
                                 modifier = Modifier.testTag(tab.testTag)
                             )
                         }

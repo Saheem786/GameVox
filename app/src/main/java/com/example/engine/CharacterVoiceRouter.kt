@@ -305,6 +305,42 @@ object CharacterVoiceRouter {
         }
     }
 
+    fun removeOcrCharacterAlias(
+        ocrTypoName: String,
+        gameNamespace: String = VoiceProfileRepository.getActiveGameNamespace()
+    ) {
+        val cleanTypo = CharacterVoiceAssignment.normalizeName(ocrTypoName)
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { CharacterVoiceAssignment.DEFAULT_GAME_NAMESPACE }
+        perGameOcrAliasCorrections[cleanNs]?.remove(cleanTypo)
+    }
+
+    fun getOcrAliasesForGame(
+        gameNamespace: String = VoiceProfileRepository.getActiveGameNamespace()
+    ): Map<String, String> {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { CharacterVoiceAssignment.DEFAULT_GAME_NAMESPACE }
+        return perGameOcrAliasCorrections[cleanNs]?.toMap() ?: emptyMap()
+    }
+
+    fun exportOcrAliasesForPersistence(): Map<String, Map<String, String>> {
+        return perGameOcrAliasCorrections.entries.associate { (ns, map) ->
+            ns to map.toMap()
+        }
+    }
+
+    fun loadPersistedOcrAliases(saved: Map<String, Map<String, String>>) {
+        saved.forEach { (ns, aliases) ->
+            val cleanNs = ns.trim().lowercase(Locale.ROOT).ifBlank { CharacterVoiceAssignment.DEFAULT_GAME_NAMESPACE }
+            val targetMap = perGameOcrAliasCorrections.getOrPut(cleanNs) { ConcurrentHashMap() }
+            aliases.forEach { (typo, canonical) ->
+                val cleanTypo = CharacterVoiceAssignment.normalizeName(typo)
+                val cleanCanonical = CharacterVoiceAssignment.normalizeName(canonical)
+                if (cleanTypo.isNotBlank() && cleanCanonical.isNotBlank() && cleanTypo != cleanCanonical) {
+                    targetMap[cleanTypo] = cleanCanonical
+                }
+            }
+        }
+    }
+
     fun clearPerGameOcrAliases(gameNamespace: String? = null) {
         if (gameNamespace == null) {
             perGameOcrAliasCorrections.clear()

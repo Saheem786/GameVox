@@ -86,7 +86,8 @@ enum class VoiceLibraryFilter(val label: String) {
     DEFAULT_FEMALE("Default Female"),
     IMPORTED("Imported"),
     GENERATED("Generated"),
-    CLONED("Cloned")
+    CLONED("Cloned"),
+    HIDDEN("Hidden")
 }
 
 @Composable
@@ -131,13 +132,14 @@ fun VoiceLibraryScreen(
         val q = searchQuery.trim().lowercase(Locale.ROOT)
         voices.filter { v ->
             val matchesFilter = when (activeFilter) {
-                VoiceLibraryFilter.ALL -> true
-                VoiceLibraryFilter.DEFAULT_MALE -> v.voiceCategory == VoiceCategory.DEFAULT_MALE
-                VoiceLibraryFilter.DEFAULT_FEMALE -> v.voiceCategory == VoiceCategory.DEFAULT_FEMALE
-                VoiceLibraryFilter.IMPORTED -> v.voiceCategory == VoiceCategory.IMPORTED
-                VoiceLibraryFilter.GENERATED -> v.voiceCategory == VoiceCategory.GENERATED_OFFLINE ||
-                    v.voiceCategory == VoiceCategory.GENERATED_ONLINE
-                VoiceLibraryFilter.CLONED -> v.voiceCategory == VoiceCategory.CLONED
+                VoiceLibraryFilter.HIDDEN -> v.isHidden
+                VoiceLibraryFilter.ALL -> !v.isHidden
+                VoiceLibraryFilter.DEFAULT_MALE -> !v.isHidden && v.voiceCategory == VoiceCategory.DEFAULT_MALE
+                VoiceLibraryFilter.DEFAULT_FEMALE -> !v.isHidden && v.voiceCategory == VoiceCategory.DEFAULT_FEMALE
+                VoiceLibraryFilter.IMPORTED -> !v.isHidden && v.voiceCategory == VoiceCategory.IMPORTED
+                VoiceLibraryFilter.GENERATED -> !v.isHidden && (v.voiceCategory == VoiceCategory.GENERATED_OFFLINE ||
+                    v.voiceCategory == VoiceCategory.GENERATED_ONLINE)
+                VoiceLibraryFilter.CLONED -> !v.isHidden && v.voiceCategory == VoiceCategory.CLONED
             }
             val matchesQuery = q.isEmpty() ||
                 v.name.lowercase(Locale.ROOT).contains(q) ||
@@ -146,6 +148,8 @@ fun VoiceLibraryScreen(
             matchesFilter && matchesQuery
         }
     }
+    val visibleCount = remember(voices) { voices.count { !it.isHidden } }
+    val hiddenCount = remember(voices) { voices.count { it.isHidden } }
 
     voiceToRename?.let { target ->
         RenameVoiceDialog(
@@ -218,12 +222,12 @@ fun VoiceLibraryScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Voice Library (${voices.size})",
+                        text = "Voice Library ($visibleCount" + if (hiddenCount > 0) " • $hiddenCount hidden" else "" + ")",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Browse, preview, rename, delete & bind voices to characters",
+                        text = "${VoiceProfileRepository.getUniqueReferenceVoiceSummary().first} unique audio refs • preview, hide or assign",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -302,7 +306,9 @@ fun VoiceLibraryScreen(
             }
 
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("voice_library_lazy_list"),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -385,6 +391,24 @@ fun VoiceLibraryScreen(
                         onSelect = { onSelectVoice(voice) },
                         onRename = { voiceToRename = voice },
                         onAssignToCharacter = { voiceToAssign = voice },
+                        onToggleHide = {
+                            val targetHidden = !voice.isHidden
+                            VoiceProfileRepository.setVoiceHidden(context, voice.id, targetHidden).fold(
+                                onSuccess = {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            if (targetHidden) "Hidden \"${voice.name}\" (switch filter to Hidden to restore)"
+                                            else "Restored \"${voice.name}\" to Voice Library"
+                                        )
+                                    }
+                                },
+                                onFailure = { err ->
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(err.localizedMessage ?: "Cannot hide voice")
+                                    }
+                                }
+                            )
+                        },
                         onDelete = { voicePendingDeletion = voice }
                     )
                 }
@@ -407,6 +431,7 @@ private fun VoiceLibraryCard(
     onSelect: () -> Unit,
     onRename: () -> Unit,
     onAssignToCharacter: () -> Unit,
+    onToggleHide: () -> Unit,
     onDelete: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -503,19 +528,32 @@ private fun VoiceLibraryCard(
                             },
                             modifier = Modifier.testTag("menu_assign_${voice.id}")
                         )
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    text = if (voice.isSystemProtected) "Delete (Protected)" else "Delete",
-                                    color = if (voice.isSystemProtected) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
-                                )
-                            },
-                            onClick = {
-                                menuExpanded = false
-                                onDelete()
-                            },
-                            modifier = Modifier.testTag("menu_delete_${voice.id}")
-                        )
+                        if (voice.isSystemProtected) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(if (voice.isHidden) "Unhide / Restore Voice" else "Hide Voice")
+                                },
+                                onClick = {
+                                    menuExpanded = false
+                                    onToggleHide()
+                                },
+                                modifier = Modifier.testTag("menu_hide_${voice.id}")
+                            )
+                        } else {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Delete",
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                },
+                                onClick = {
+                                    menuExpanded = false
+                                    onDelete()
+                                },
+                                modifier = Modifier.testTag("menu_delete_${voice.id}")
+                            )
+                        }
                     }
                 }
             }

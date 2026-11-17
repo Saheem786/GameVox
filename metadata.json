@@ -1,6 +1,6 @@
 {
   "name": "GameVox",
-  "description": "Real-time floating game screen OCR subtitle reader, color-inversion preprocessor, English-to-Hindi ML Kit translator, and natural Hindi TTS voice synthesizer.",
+  "description": "GameVox 2.0 — AI Game Dubbing Pro: Real-time game screen OCR subtitle dubbing in natural Hindi, per-character multi-voice routing, Voice Library, Voice Generate, and Characters management.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

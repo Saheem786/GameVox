@@ -35,6 +35,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
@@ -119,6 +120,7 @@ fun VoiceGenerateScreen(
     var preparedCandidate by remember { mutableStateOf<PreparedVoiceCandidate?>(null) }
     var lastSavedVoice by remember { mutableStateOf<VoiceProfile?>(null) }
     var customAssignInput by remember { mutableStateOf("") }
+    var generatedPitch by remember { mutableFloatStateOf(1.0f) }
     var generatedRate by remember { mutableFloatStateOf(1.0f) }
 
     val ttsManager = remember { ForegroundTtsManager.getInstance(context) }
@@ -137,6 +139,35 @@ fun VoiceGenerateScreen(
                 .widthIn(max = 640.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            // Capability Integrity Guide: clearly separates existing selection, acoustic presets, neural cloning, TTS synthesis, and saving
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("voice_generate_capability_disclosure")
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "How Voice Generate Works (No Fake Cloning)",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "• Existing Voices: browse & pick in Voices tab.\n" +
+                            "• Modified Acoustic Preset (Offline): adjusts Pitch/Speed on Supertonic 3 / Android TTS (NOT neural cloning).\n" +
+                            "• Neural Voice Cloning (Import / Clone): requires your consented 5–10s WAV sample AND a connected PC Chatterbox server.\n" +
+                            "• Save New Voice: stores the verified audio/preset in your Voice Library.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
             // Section 0: Generation Mode Selector right at top
             Card(
                 shape = RoundedCornerShape(16.dp),
@@ -210,6 +241,7 @@ fun VoiceGenerateScreen(
                                 onClick = {
                                     selectedGender = gender
                                     selectedSid = if (gender == SpeakerGender.FEMALE_18) 1 else 5
+                                    generatedPitch = gender.defaultPitch18Yo
                                 },
                                 label = { Text(label) },
                                 modifier = Modifier.testTag("gen_gender_${gender.code}")
@@ -311,9 +343,44 @@ fun VoiceGenerateScreen(
                                             onClick = {
                                                 selectedSid = spec.sid
                                                 selectedGender = if (spec.gender == "Female") SpeakerGender.FEMALE_18 else SpeakerGender.MALE_18
+                                                generatedPitch = selectedGender.defaultPitch18Yo
                                             },
                                             label = { Text("${spec.code} (${spec.gender.take(1)})") },
                                             modifier = Modifier.testTag("gen_sid_${spec.sid}")
+                                        )
+                                    }
+                                }
+
+                                // Honest Acoustic Preset Tweaks (pitch/speed — explicitly not neural cloning)
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "Modified Acoustic Preset (Pitch & Speed Only — Not Cloning)",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = String.format(java.util.Locale.US, "Pitch: %.2fx   Speed: %.2fx", generatedPitch, generatedRate),
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Slider(
+                                            value = generatedPitch,
+                                            onValueChange = { generatedPitch = it },
+                                            valueRange = 0.7f..1.4f,
+                                            modifier = Modifier.testTag("gen_offline_pitch_slider")
+                                        )
+                                        Slider(
+                                            value = generatedRate,
+                                            onValueChange = { generatedRate = it },
+                                            valueRange = 0.7f..1.4f,
+                                            modifier = Modifier.testTag("gen_offline_rate_slider")
                                         )
                                     }
                                 }
@@ -334,7 +401,7 @@ fun VoiceGenerateScreen(
                                             verticalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
                                             Text(
-                                                text = "Supertonic 3 Hindi model is not initialized on device yet. Download & verify (~145 MB) to generate offline neural Hindi audio.",
+                                                text = "Supertonic 3 Hindi model (~145 MB) is missing/unverified on device. Download & verify first, or switch to Android System TTS.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onErrorContainer
                                             )
@@ -382,7 +449,6 @@ fun VoiceGenerateScreen(
                                         isSynthesizing = true
                                         val wavDir = File(context.filesDir, "custom_voices").apply { mkdirs() }
                                         val wavOut = File(wavDir, "gen_offline_${System.currentTimeMillis()}.wav")
-                                        val specTitle = SUPERTONIC_VOICE_SPECS.find { it.sid == selectedSid }?.title ?: "SID #$selectedSid"
                                         val engineStr = when (offlineModelId) {
                                             "supertonic_3" -> "sherpa_supertonic_3"
                                             "kokoro_82m" -> "kokoro_mediapipe"
@@ -393,7 +459,7 @@ fun VoiceGenerateScreen(
                                             displayName = effectiveName,
                                             speakerId = selectedSid.coerceIn(0, 9),
                                             speed = generatedRate,
-                                            pitch = selectedGender.defaultPitch18Yo,
+                                            pitch = generatedPitch,
                                             voicePresentation = if (selectedGender == SpeakerGender.FEMALE_18) "female" else "male",
                                             voiceEngine = engineStr
                                         )
@@ -410,11 +476,11 @@ fun VoiceGenerateScreen(
                                                     name = effectiveName,
                                                     gender = selectedGender,
                                                     category = VoiceCategory.GENERATED_OFFLINE,
-                                                    sourceModelInfo = "$engineSummary • $selectedStyle",
+                                                    sourceModelInfo = "$engineSummary • Acoustic Preset ($selectedStyle)",
                                                     languageCode = selectedLanguage,
                                                     styleTag = selectedStyle,
                                                     speakerId = selectedSid,
-                                                    pitch = selectedGender.defaultPitch18Yo,
+                                                    pitch = generatedPitch,
                                                     speechRate = generatedRate,
                                                     sampleAudioPath = wavOut.takeIf { it.exists() && it.length() > 100L }?.absolutePath,
                                                     isNeuralCloned = false,
@@ -585,6 +651,7 @@ fun VoiceGenerateScreen(
                                     selectedLanguage = selectedLanguage,
                                     selectedStyle = selectedStyle,
                                     consentConfirmed = consentConfirmed,
+                                    isChatterboxConnected = appState.chatterboxServerReachable && appState.chatterboxModelLoaded,
                                     onConsentChange = { consentConfirmed = it },
                                     onSampleReadyForLibrary = { audioPath, inspection, category, sourceInfo, estPitch, estRate, isNeuralCloned ->
                                         lastSavedVoice = null

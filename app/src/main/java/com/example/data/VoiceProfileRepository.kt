@@ -152,7 +152,8 @@ data class VoiceProfile(
     val languageCode: String = "hi",
     val styleTag: String = "Neutral",
     val isSystemProtected: Boolean = !isCustomCloned,
-    val isNeuralCloned: Boolean = false
+    val isNeuralCloned: Boolean = false,
+    val isHidden: Boolean = false
 )
 
 /**
@@ -181,6 +182,8 @@ data class ParsedDialogueLine(
 object VoiceProfileRepository {
     private const val TAG = "VoiceProfileRepo"
     private const val PREFS_NAME = "gamevox_multi_voice_prefs"
+    private const val KEY_SCHEMA_VERSION_INT = "repo_schema_version_int"
+    const val CURRENT_REPO_SCHEMA_VERSION = 2
     private const val KEY_VOICES_JSON = "saved_voice_profiles_json_v1"
     private const val KEY_SELECTED_VOICE_ID = "selected_primary_voice_id_v1"
     private const val KEY_MULTI_SPEAKER_ENABLED = "multi_speaker_enabled_v1"
@@ -188,6 +191,9 @@ object VoiceProfileRepository {
     private const val KEY_CUSTOM_TAG_BINDINGS_JSON = "custom_tag_voice_bindings_json_v1"
     private const val KEY_CHARACTER_ASSIGNMENTS_JSON = "character_voice_assignments_json_v2"
     private const val KEY_UNLABELED_OVERRIDE_CHAR = "unlabeled_subtitle_override_char_v1"
+    private const val KEY_OCR_ALIAS_CORRECTIONS_JSON = "ocr_alias_corrections_json_v2"
+    private const val KEY_KNOWN_GAME_NAMESPACES_JSON = "known_game_namespaces_json_v2"
+    private const val KEY_ACTIVE_GAME_NAMESPACE = "active_game_namespace_v2"
 
     private val defaultPresets = listOf(
         VoiceProfile(
@@ -400,6 +406,15 @@ object VoiceProfileRepository {
 
     private val unlabeledOverridesByGame = ConcurrentHashMap<String, String>()
 
+    private val _activeGameNamespaceFlow = MutableStateFlow("default_game")
+    val activeGameNamespaceFlow: StateFlow<String> = _activeGameNamespaceFlow.asStateFlow()
+
+    private val _knownGameNamespaces = MutableStateFlow(listOf("default_game"))
+    val knownGameNamespaces: StateFlow<List<String>> = _knownGameNamespaces.asStateFlow()
+
+    private val _ocrAliasesForActiveGame = MutableStateFlow<Map<String, String>>(emptyMap())
+    val ocrAliasesForActiveGame: StateFlow<Map<String, String>> = _ocrAliasesForActiveGame.asStateFlow()
+
     private var activeMediaPlayer: MediaPlayer? = null
     private var appContext: Context? = null
 
@@ -410,6 +425,10 @@ object VoiceProfileRepository {
     private var activeGameNamespace: String = "default_game"
 
     fun getActiveGameNamespace(): String = activeGameNamespace
+
+    fun getRepoSchemaVersion(context: Context): Int =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_SCHEMA_VERSION_INT, 1)
 
     fun updateAvailableSpeakerCount(count: Int) {
         if (count > 0) {
@@ -422,10 +441,20 @@ object VoiceProfileRepository {
 
     fun setGameNamespace(context: Context, namespace: String) {
         val clean = namespace.trim().lowercase(Locale.ROOT).ifBlank { "default_game" }
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (clean !in _knownGameNamespaces.value) {
+            val updatedNs = (_knownGameNamespaces.value + clean).distinct()
+            _knownGameNamespaces.value = updatedNs
+            prefs.edit()
+                .putString(KEY_KNOWN_GAME_NAMESPACES_JSON, JSONArray(updatedNs).toString())
+                .apply()
+        }
+        prefs.edit().putString(KEY_ACTIVE_GAME_NAMESPACE, clean).apply()
+
         if (activeGameNamespace != clean) {
             activeGameNamespace = clean
+            _activeGameNamespaceFlow.value = clean
             appContext = context.applicationContext
-            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val gameKey = "${KEY_CHARACTER_ASSIGNMENTS_JSON}_$clean"
             val rawAssignments = prefs.getString(gameKey, null)
                 ?: prefs.getString(KEY_CHARACTER_ASSIGNMENTS_JSON, null)
@@ -434,10 +463,10 @@ object VoiceProfileRepository {
                 if (loadedAssignments.isNotEmpty()) {
                     val merged = mutableMapOf<String, CharacterVoiceAssignment>()
                     for (preset in CharacterVoiceAssignment.DEFAULT_PRESETS) {
-                        merged[preset.characterName] = preset
+                        merged[preset.characterName] = preset.copy(gameNamespace = clean)
                     }
                     for (loaded in loadedAssignments) {
-                        merged[loaded.characterName] = loaded
+                        merged[loaded.characterName] = loaded.copy(gameNamespace = clean)
                     }
                     _characterAssignments.value = merged.values.toList()
                 }
@@ -448,6 +477,7 @@ object VoiceProfileRepository {
                 unlabeledOverridesByGame[clean] = savedOverride
             }
             _unlabeledOverrideCharName.value = unlabeledOverridesByGame[clean]
+            _ocrAliasesForActiveGame.value = com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(clean)
         }
     }
 
@@ -483,7 +513,8 @@ object VoiceProfileRepository {
                             speechRate = existing.speechRate,
                             languageCode = existing.languageCode,
                             styleTag = existing.styleTag,
-                            isSystemProtected = true
+                            isSystemProtected = true,
+                            isHidden = existing.isHidden
                         )
                     } else {
                         preset
@@ -496,13 +527,34 @@ object VoiceProfileRepository {
                 _selectedVoiceId.value = if (finalVoices.any { it.id == selectedId }) {
                     selectedId
                 } else {
-                    finalVoices.first().id
+                    finalVoices.firstOrNull { !it.isHidden }?.id ?: finalVoices.first().id
                 }
                 if (finalVoices.size != loaded.size) {
                     saveVoicesToDisk(context, finalVoices, _selectedVoiceId.value)
                 }
             }
         }
+
+        // Load known game namespaces and active game namespace safely
+        val savedNsRaw = prefs.getString(KEY_KNOWN_GAME_NAMESPACES_JSON, null)
+        val parsedNamespaces = if (!savedNsRaw.isNullOrBlank()) {
+            try {
+                val arr = JSONArray(savedNsRaw)
+                (0 until arr.length()).mapNotNull { idx ->
+                    arr.optString(idx, "").trim().lowercase(Locale.ROOT).takeIf { it.isNotBlank() }
+                }
+            } catch (_: Exception) {
+                listOf("default_game")
+            }
+        } else {
+            listOf("default_game")
+        }
+        val persistedActiveNs = prefs.getString(KEY_ACTIVE_GAME_NAMESPACE, "default_game")
+            ?.trim()?.lowercase(Locale.ROOT).orEmpty().ifBlank { "default_game" }
+        val allNamespaces = (listOf("default_game") + parsedNamespaces + persistedActiveNs).distinct()
+        _knownGameNamespaces.value = allNamespaces
+        activeGameNamespace = persistedActiveNs
+        _activeGameNamespaceFlow.value = persistedActiveNs
 
         // Load per-role voice selections and custom character tag bindings
         val rawRoles = prefs.getString(KEY_ROLE_ASSIGNMENTS_JSON, null)
@@ -517,8 +569,17 @@ object VoiceProfileRepository {
             _customTagVoiceBindings.value = parseCustomTagBindingsJson(rawTags)
         }
 
-        // Load 20+ persistent Character Voice Assignments
-        val rawAssignments = prefs.getString(KEY_CHARACTER_ASSIGNMENTS_JSON, null)
+        // Load persisted OCR character correction aliases into CharacterVoiceRouter
+        val rawAliases = prefs.getString(KEY_OCR_ALIAS_CORRECTIONS_JSON, null)
+        if (!rawAliases.isNullOrBlank()) {
+            com.example.engine.CharacterVoiceRouter.loadPersistedOcrAliases(parseOcrAliasesJson(rawAliases))
+        }
+        _ocrAliasesForActiveGame.value = com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(activeGameNamespace)
+
+        // Load persistent Character Voice Assignments for active game (preserving v1 global data safely)
+        val gameKey = "${KEY_CHARACTER_ASSIGNMENTS_JSON}_$activeGameNamespace"
+        val rawAssignments = prefs.getString(gameKey, null)
+            ?: prefs.getString(KEY_CHARACTER_ASSIGNMENTS_JSON, null)
         if (!rawAssignments.isNullOrBlank()) {
             val loadedAssignments = CharacterVoiceAssignment.parseList(rawAssignments)
             if (loadedAssignments.isNotEmpty()) {
@@ -545,6 +606,15 @@ object VoiceProfileRepository {
             unlabeledOverridesByGame[activeGameNamespace] = savedUnlabeledOverride
         }
         _unlabeledOverrideCharName.value = savedUnlabeledOverride
+
+        // Record idempotent v1 -> v2 schema migration completion without touching user files or preferences
+        if (prefs.getInt(KEY_SCHEMA_VERSION_INT, 1) < CURRENT_REPO_SCHEMA_VERSION) {
+            prefs.edit()
+                .putInt(KEY_SCHEMA_VERSION_INT, CURRENT_REPO_SCHEMA_VERSION)
+                .putString(KEY_KNOWN_GAME_NAMESPACES_JSON, JSONArray(allNamespaces).toString())
+                .putString(KEY_ACTIVE_GAME_NAMESPACE, activeGameNamespace)
+                .apply()
+        }
     }
 
     fun selectVoice(context: Context, voice: VoiceProfile) {
@@ -821,11 +891,180 @@ object VoiceProfileRepository {
         deleteVoiceSafely(context, voiceId, replacement?.id)
     }
 
+    /**
+     * Hides or unhides a voice profile in Voice Library (used instead of blocked deletion on
+     * system-protected built-in default voices). Never hides the last visible voice.
+     */
+    fun setVoiceHidden(
+        context: Context,
+        voiceId: String,
+        hidden: Boolean
+    ): Result<VoiceProfile> {
+        val currentList = _voices.value
+        val target = currentList.find { it.id == voiceId }
+            ?: return Result.failure(IllegalArgumentException("Voice not found."))
+        if (hidden) {
+            val remainingVisibleCount = currentList.count { it.id != voiceId && !it.isHidden }
+            if (remainingVisibleCount <= 0) {
+                return Result.failure(IllegalStateException("At least one visible voice must remain in Voice Library."))
+            }
+        }
+        val updatedProfile = target.copy(isHidden = hidden)
+        val updatedList = currentList.map { if (it.id == voiceId) updatedProfile else it }
+        var nextSelected = _selectedVoiceId.value
+        if (hidden && nextSelected == voiceId) {
+            nextSelected = updatedList.firstOrNull { !it.isHidden }?.id ?: nextSelected
+        }
+        _voices.value = updatedList
+        _selectedVoiceId.value = nextSelected
+        saveVoicesToDisk(context, updatedList, nextSelected)
+        return Result.success(updatedProfile)
+    }
+
     fun restoreDefaultVoices(context: Context) {
         val customOnly = _voices.value.filter { !it.isSystemProtected }
-        val merged = defaultPresets + customOnly
+        val merged = defaultPresets.map { it.copy(isHidden = false) } + customOnly
         _voices.value = merged
         saveVoicesToDisk(context, merged, _selectedVoiceId.value)
+    }
+
+    /**
+     * Adds or updates a character profile in the active game namespace and binds an optional Voice Library profile.
+     */
+    fun addOrUpdateCharacter(
+        context: Context,
+        displayName: String,
+        speakerId: Int,
+        voicePresentation: String,
+        voiceId: String? = null,
+        speed: Float = 1.0f,
+        pitch: Float = if (voicePresentation.equals("female", ignoreCase = true)) 1.04f else 0.96f,
+        voiceEngine: String = "auto",
+        gameNamespace: String = activeGameNamespace
+    ): CharacterVoiceAssignment {
+        val cleanDisplay = displayName.trim().ifBlank { "Character" }
+        val norm = CharacterVoiceAssignment.normalizeName(cleanDisplay).ifBlank { "character_${System.currentTimeMillis()}" }
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        val existing = findExistingAssignment(norm, cleanNs)
+        val isFemale = voicePresentation.equals("female", ignoreCase = true)
+        val libraryVoice = voiceId?.takeIf { it.isNotBlank() }?.let { id -> _voices.value.find { it.id == id } }
+        val resolvedSid = (libraryVoice?.engineVoiceIndex ?: speakerId).coerceIn(0, 9)
+        val customSampleFile = libraryVoice?.sampleAudioPath?.let { File(it) }?.takeIf { it.exists() && it.length() > 100L }
+        val customSha = customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
+        val refId = when {
+            customSampleFile != null -> customSampleFile.nameWithoutExtension
+            existing != null && libraryVoice == null -> existing.referenceVoiceId
+            isFemale -> CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+            else -> CharacterVoiceAssignment.DEFAULT_MALE_REF_ID
+        }
+        val refSha = when {
+            customSha.isNotBlank() -> customSha
+            existing != null && libraryVoice == null -> existing.referenceAudioSha256
+            isFemale -> CharacterVoiceAssignment.JENNY_FEMALE_REF_SHA256
+            else -> CharacterVoiceAssignment.ANON_MALE_REF_SHA256
+        }
+        val finalAssign = (existing ?: CharacterVoiceAssignment(
+            characterName = norm,
+            displayName = cleanDisplay,
+            speakerId = resolvedSid
+        )).copy(
+            characterName = norm,
+            displayName = cleanDisplay,
+            speakerId = resolvedSid,
+            voicePresentation = if (isFemale) "female" else if (voicePresentation.equals("male", ignoreCase = true)) "male" else "neutral",
+            speed = speed.coerceIn(0.6f, 1.5f),
+            pitch = pitch.coerceIn(0.6f, 1.5f),
+            referenceVoiceId = refId,
+            referenceAudioSha256 = refSha,
+            assignedVoiceId = libraryVoice?.id ?: existing?.assignedVoiceId.orEmpty(),
+            vocalStyleDescription = libraryVoice?.let { "${it.name} • ${it.sourceModelInfo}" }
+                ?: existing?.vocalStyleDescription.orEmpty().ifBlank { "Custom Game Character" },
+            voiceEngine = voiceEngine,
+            gameNamespace = cleanNs,
+            isUserOverride = true,
+            lastDetectedTimestamp = System.currentTimeMillis()
+        )
+        return updateCharacterVoiceProfile(context, finalAssign)
+    }
+
+    /**
+     * Saves an OCR misreading -> canonical character mapping both in [CharacterVoiceRouter] and persistently
+     * on disk so OCR character-name errors corrected in the Characters tab survive app restarts.
+     */
+    fun setOcrCharacterCorrection(
+        context: Context,
+        misreadOcrName: String,
+        canonicalCharacterName: String,
+        gameNamespace: String = activeGameNamespace
+    ): Boolean {
+        val cleanTypo = CharacterVoiceAssignment.normalizeName(misreadOcrName)
+        val cleanCanonical = CharacterVoiceAssignment.normalizeName(canonicalCharacterName)
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        if (cleanTypo.isBlank() || cleanCanonical.isBlank() || cleanTypo == cleanCanonical) return false
+        com.example.engine.CharacterVoiceRouter.registerOcrCharacterAlias(cleanTypo, cleanCanonical, cleanNs)
+        saveOcrAliasesToDisk(context)
+        if (cleanNs == activeGameNamespace) {
+            _ocrAliasesForActiveGame.value = com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(cleanNs)
+        }
+        return true
+    }
+
+    fun removeOcrCharacterCorrection(
+        context: Context,
+        misreadOcrName: String,
+        gameNamespace: String = activeGameNamespace
+    ) {
+        val cleanNs = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { activeGameNamespace }
+        com.example.engine.CharacterVoiceRouter.removeOcrCharacterAlias(misreadOcrName, cleanNs)
+        saveOcrAliasesToDisk(context)
+        if (cleanNs == activeGameNamespace) {
+            _ocrAliasesForActiveGame.value = com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(cleanNs)
+        }
+    }
+
+    fun getOcrCharacterCorrections(gameNamespace: String = activeGameNamespace): Map<String, String> {
+        return com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(gameNamespace)
+    }
+
+    private fun saveOcrAliasesToDisk(context: Context) {
+        val exported = com.example.engine.CharacterVoiceRouter.exportOcrAliasesForPersistence()
+        val root = JSONObject()
+        exported.forEach { (ns, map) ->
+            val inner = JSONObject()
+            map.forEach { (k, v) -> inner.put(k, v) }
+            root.put(ns, inner)
+        }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_OCR_ALIAS_CORRECTIONS_JSON, root.toString())
+            .apply()
+    }
+
+    private fun parseOcrAliasesJson(raw: String): Map<String, Map<String, String>> {
+        return try {
+            val root = JSONObject(raw)
+            val result = mutableMapOf<String, Map<String, String>>()
+            val nsKeys = root.keys()
+            while (nsKeys.hasNext()) {
+                val ns = nsKeys.next()
+                val innerObj = root.optJSONObject(ns) ?: continue
+                val aliasMap = mutableMapOf<String, String>()
+                val keys = innerObj.keys()
+                while (keys.hasNext()) {
+                    val typo = keys.next()
+                    val canonical = innerObj.optString(typo, "")
+                    if (typo.isNotBlank() && canonical.isNotBlank()) {
+                        aliasMap[typo] = canonical
+                    }
+                }
+                if (aliasMap.isNotEmpty()) {
+                    result[ns] = aliasMap
+                }
+            }
+            result
+        } catch (_: Exception) {
+            emptyMap()
+        }
     }
 
     fun addGeneratedOrImportedVoice(
@@ -1681,8 +1920,10 @@ object VoiceProfileRepository {
             isUserOverride = true
         )
 
-        // Register OCR typo alias so future scans of normOld automatically route to normNew
-        com.example.engine.CharacterVoiceRouter.registerOcrCharacterAlias(normOld, normNew)
+        // Register and persist OCR typo alias so future scans of normOld automatically route to normNew
+        com.example.engine.CharacterVoiceRouter.registerOcrCharacterAlias(normOld, normNew, activeGameNamespace)
+        saveOcrAliasesToDisk(context)
+        _ocrAliasesForActiveGame.value = com.example.engine.CharacterVoiceRouter.getOcrAliasesForGame(activeGameNamespace)
 
         val updatedList = currentList.filterNot { it.characterName == normOld || it.characterName == normNew } + renamed
         _characterAssignments.value = updatedList
@@ -1910,6 +2151,7 @@ object VoiceProfileRepository {
                 put("styleTag", v.styleTag)
                 put("isSystemProtected", v.isSystemProtected)
                 put("isNeuralCloned", v.isNeuralCloned)
+                put("isHidden", v.isHidden)
                 if (v.sampleAudioPath != null) {
                     put("sampleAudioPath", v.sampleAudioPath)
                 }
@@ -1964,7 +2206,8 @@ object VoiceProfileRepository {
                         languageCode = obj.optString("languageCode", "hi").ifBlank { "hi" },
                         styleTag = obj.optString("styleTag", "Neutral").ifBlank { "Neutral" },
                         isSystemProtected = obj.optBoolean("isSystemProtected", !isCustom),
-                        isNeuralCloned = obj.optBoolean("isNeuralCloned", false)
+                        isNeuralCloned = obj.optBoolean("isNeuralCloned", false),
+                        isHidden = obj.optBoolean("isHidden", false)
                     )
                 )
             }
