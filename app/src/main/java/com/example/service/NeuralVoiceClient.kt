@@ -145,6 +145,25 @@ sealed class NeuralSynthesisOutcome {
     }
 }
 
+sealed class ReferenceVoiceUploadOutcome {
+    data class Success(
+        val voiceId: String,
+        val sha256: String,
+        val sampleRate: Int,
+        val durationSeconds: Float,
+        val waveformRms: Float,
+        val trimmedSilenceMs: Long,
+        val qualityWarning: String,
+        val uploadLatencyMs: Long
+    ) : ReferenceVoiceUploadOutcome()
+
+    data class Error(
+        val httpStatus: Int,
+        val reason: String,
+        val errorCategory: NeuralServerErrorCategory
+    ) : ReferenceVoiceUploadOutcome()
+}
+
 /**
  * Local Wi-Fi HTTPS/HTTP client for the self-hosted Windows/Linux Python FastAPI Voice Server
  * powered by ResembleAI Chatterbox Multilingual V3 Dedicated Hindi (`ResembleAI/Chatterbox-Multilingual-hi`).
@@ -706,6 +725,104 @@ class NeuralVoiceClient(
                 conditionalsCachedCount = 0,
                 roundTripLatencyMs = rttMs,
                 errorMessage = formattedError,
+                errorCategory = category
+            )
+        }
+    }
+
+    /**
+     * Uploads a normalized reference voice clip (`.wav` / audio) to `POST /v1/voices/upload`
+     * with mandatory `speaker_consent_confirmed=true` and multipart/form-data payload.
+     */
+    suspend fun uploadReferenceVoice(
+        rawBaseUrl: String,
+        authToken: String,
+        voiceId: String,
+        audioFile: File,
+        speakerConsentConfirmed: Boolean
+    ): ReferenceVoiceUploadOutcome = withContext(Dispatchers.IO) {
+        if (!speakerConsentConfirmed) {
+            lastErrorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
+            return@withContext ReferenceVoiceUploadOutcome.Error(
+                httpStatus = 400,
+                reason = "Voice ownership or explicit speaker permission confirmation is required before uploading.",
+                errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
+            )
+        }
+        if (!audioFile.exists() || audioFile.length() < 256L) {
+            lastErrorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
+            return@withContext ReferenceVoiceUploadOutcome.Error(
+                httpStatus = 400,
+                reason = "Reference audio file is missing or too small (${audioFile.length()} bytes).",
+                errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED
+            )
+        }
+
+        val safeId = voiceId.trim().replace(Regex("[^a-zA-Z0-9_\\-]"), "_").ifBlank { "custom_ref" }
+        val baseUrl = normalizeBaseUrl(rawBaseUrl)
+        val boundary = "----GameVoxBoundary${UUID.randomUUID().toString().replace("-", "")}"
+        val startMs = SystemClock.elapsedRealtime()
+
+        try {
+            val fileBytes = audioFile.readBytes()
+            val bodyStream = ByteArrayOutputStream(fileBytes.size + 512)
+            val partHeader = buildString {
+                append("--").append(boundary).append("\r\n")
+                append("Content-Disposition: form-data; name=\"file\"; filename=\"").append(audioFile.name).append("\"\r\n")
+                append("Content-Type: audio/wav\r\n\r\n")
+            }
+            val partFooter = "\r\n--$boundary--\r\n"
+            bodyStream.write(partHeader.toByteArray(Charsets.UTF_8))
+            bodyStream.write(fileBytes)
+            bodyStream.write(partFooter.toByteArray(Charsets.UTF_8))
+
+            val encodedVoiceId = java.net.URLEncoder.encode(safeId, "UTF-8")
+            val targetUrl = URL("$baseUrl/v1/voices/upload?voice_id=$encodedVoiceId&speaker_consent_confirmed=true")
+            val response = executeHttpRequest(
+                url = targetUrl,
+                method = "POST",
+                authToken = authToken,
+                acceptHeader = "application/json",
+                contentType = "multipart/form-data; boundary=$boundary",
+                requestBody = bodyStream.toByteArray(),
+                connectTimeoutMs = connectTimeoutMs.coerceAtLeast(3500),
+                readTimeoutMs = readTimeoutMs.coerceAtLeast(15000)
+            )
+
+            val elapsed = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+            if (response.statusCode !in 200..299) {
+                val errDetail = response.bodyUtf8()
+                val category = when (response.statusCode) {
+                    401, 403 -> NeuralServerErrorCategory.AUTH_FAILED
+                    503 -> NeuralServerErrorCategory.MODEL_UNAVAILABLE
+                    else -> NeuralServerErrorCategory.INFERENCE_FAILED
+                }
+                lastErrorCategory = category
+                return@withContext ReferenceVoiceUploadOutcome.Error(
+                    httpStatus = response.statusCode,
+                    reason = "${category.displayTitle} (HTTP ${response.statusCode}: $errDetail)",
+                    errorCategory = category
+                )
+            }
+
+            val json = JSONObject(response.bodyUtf8())
+            lastErrorCategory = NeuralServerErrorCategory.NONE
+            ReferenceVoiceUploadOutcome.Success(
+                voiceId = json.optString("voice_id", safeId),
+                sha256 = json.optString("sha256", computeSha256Hex(fileBytes)),
+                sampleRate = json.optInt("sample_rate", 24000),
+                durationSeconds = json.optDouble("duration_seconds", 0.0).toFloat(),
+                waveformRms = json.optDouble("waveform_rms", 0.0).toFloat(),
+                trimmedSilenceMs = json.optLong("trimmed_silence_ms", 0L),
+                qualityWarning = json.optString("quality_warning", ""),
+                uploadLatencyMs = elapsed
+            )
+        } catch (e: Exception) {
+            val (category, formattedError) = classifyException(e, baseUrl)
+            lastErrorCategory = category
+            ReferenceVoiceUploadOutcome.Error(
+                httpStatus = -1,
+                reason = formattedError,
                 errorCategory = category
             )
         }

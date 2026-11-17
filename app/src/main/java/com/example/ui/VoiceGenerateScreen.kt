@@ -158,10 +158,10 @@ fun VoiceGenerateScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "• Existing Voices: browse & pick in Voices tab.\n" +
-                            "• Modified Acoustic Preset (Offline): adjusts Pitch/Speed on Supertonic 3 / Android TTS (NOT neural cloning).\n" +
-                            "• Neural Voice Cloning (Import / Clone): requires your consented 5–10s WAV sample AND a connected PC Chatterbox server.\n" +
-                            "• Save New Voice: stores the verified audio/preset in your Voice Library.",
+                        text = "• Existing Voices: browse & pick in Voice Library.\n" +
+                            "• Offline Acoustic Preset: adjusts Pitch/Speed on Supertonic 3 / Android TTS (NOT neural cloning).\n" +
+                            "• Online Chatterbox TTS: cloud-quality Hindi dubbing on your PC server.\n" +
+                            "• AI Voice Clone: ElevenLabs-style Hindi voice cloning via free ResembleAI/Chatterbox-Multilingual-hi.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -190,8 +190,11 @@ fun VoiceGenerateScreen(
                     )
                     Tab(
                         selected = modeTab == 2,
-                        onClick = { modeTab = 2 },
-                        text = { Text("Import / Clone", maxLines = 1) },
+                        onClick = {
+                            modeTab = 2
+                            preparedCandidate = null
+                        },
+                        text = { Text("AI Voice Clone", maxLines = 1) },
                         modifier = Modifier.testTag("gen_tab_import_clone")
                     )
                 }
@@ -282,7 +285,7 @@ fun VoiceGenerateScreen(
                     OutlinedTextField(
                         value = previewTextInput,
                         onValueChange = { previewTextInput = it },
-                        label = { Text("Preview Dialogue Text") },
+                        label = { Text(if (modeTab == 2) "Preview Text in Hindi" else "Preview Dialogue Text") },
                         maxLines = 3,
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
@@ -644,35 +647,26 @@ fun VoiceGenerateScreen(
                             }
 
                             else -> {
-                                // SAMPLE IMPORT / CLONE
-                                VoiceSampleImportSection(
+                                // AI VOICE CLONE (Chatterbox Multilingual V3 Hindi)
+                                AiVoiceCloneSection(
                                     voiceName = voiceNameInput,
+                                    previewHindiText = previewTextInput,
                                     selectedGender = selectedGender,
                                     selectedLanguage = selectedLanguage,
                                     selectedStyle = selectedStyle,
                                     consentConfirmed = consentConfirmed,
-                                    isChatterboxConnected = appState.chatterboxServerReachable && appState.chatterboxModelLoaded,
                                     onConsentChange = { consentConfirmed = it },
-                                    onSampleReadyForLibrary = { audioPath, inspection, category, sourceInfo, estPitch, estRate, isNeuralCloned ->
-                                        lastSavedVoice = null
-                                        val effectiveName = voiceNameInput.trim().ifBlank {
-                                            if (category == VoiceCategory.CLONED) "Cloned Voice" else "Imported Sample Voice"
-                                        }
-                                        preparedCandidate = PreparedVoiceCandidate(
-                                            name = effectiveName,
-                                            gender = selectedGender,
-                                            category = category,
-                                            sourceModelInfo = sourceInfo,
-                                            languageCode = selectedLanguage,
-                                            styleTag = selectedStyle,
-                                            speakerId = selectedSid,
-                                            pitch = estPitch,
-                                            speechRate = estRate,
-                                            sampleAudioPath = audioPath,
-                                            isNeuralCloned = isNeuralCloned,
-                                            previewText = previewTextInput.ifBlank { VOICE_PREVIEW_HINDI_SAMPLE }
-                                        )
-                                        statusMessage = "Ready to preview, save, or assign \"$effectiveName\" (${inspection.qualityVerdict})."
+                                    serverUrl = serverUrlInput,
+                                    serverToken = serverTokenInput,
+                                    onServerConfigChange = { url, token ->
+                                        serverUrlInput = url
+                                        serverTokenInput = token
+                                    },
+                                    isChatterboxConnected = appState.chatterboxServerReachable && appState.chatterboxModelLoaded,
+                                    chatterboxStatusText = appState.chatterboxServerStatusText,
+                                    onSavedToLibrary = { saved ->
+                                        lastSavedVoice = saved
+                                        onSavedToLibrary(saved)
                                     },
                                     onShowMessage = { msg ->
                                         statusMessage = msg
@@ -701,8 +695,9 @@ fun VoiceGenerateScreen(
                 }
             }
 
-            // Section 3: Post-Generation / Import Actions (Preview, Save to Library, Assign to Character)
-            preparedCandidate?.let { candidate ->
+            // Section 3: Post-Generation Actions (Offline & Online tabs; AI Voice Clone handles Save/Compare/Assign inline)
+            if (modeTab != 2) {
+                preparedCandidate?.let { candidate ->
                 Card(
                     shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f)),
@@ -841,6 +836,7 @@ fun VoiceGenerateScreen(
                         }
                     }
                 }
+            }
             }
 
             Spacer(modifier = Modifier.height(20.dp))

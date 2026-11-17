@@ -408,7 +408,42 @@ object CharacterVoiceRouter {
             )
         }
 
-        // 2. Explicit global user-selected dubbing mode on main screen / A/B lab
+        // 2. Explicit per-character user override (e.g., an assigned ElevenLabs-style cloned neural voice
+        //    locked to CHATTERBOX_LOCAL_SERVER) takes priority over the global default for that character
+        //    in BOTH previews and live OCR dubbing so cloned speakers never silently switch engines.
+        if (assignment != null && assignment.isUserOverride) {
+            when (assignment.voiceEngine.trim().lowercase(Locale.ROOT)) {
+                "chatterbox_local_server",
+                FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER.code -> {
+                    return CanonicalBackendSelection(
+                        canonicalBackend = CanonicalVoiceBackend.LOCAL_CHATTERBOX_SERVER,
+                        requestedEngineTag = CanonicalVoiceBackend.LOCAL_CHATTERBOX_SERVER.backendTag,
+                        readinessNote = if (state.chatterboxServerReachable && state.chatterboxModelLoaded) {
+                            "Per-character cloned voice override: Chatterbox Local Server ready"
+                        } else {
+                            "Per-character cloned voice override: Chatterbox Local Server required"
+                        }
+                    )
+                }
+                "supertonic_v3", "sherpa_direct",
+                FreeVoiceBackend.SHERPA_SUPERTONIC_DIRECT.code -> {
+                    return CanonicalBackendSelection(
+                        canonicalBackend = CanonicalVoiceBackend.SHERPA_SUPERTONIC_DIRECT,
+                        requestedEngineTag = CanonicalVoiceBackend.SHERPA_SUPERTONIC_DIRECT.backendTag,
+                        readinessNote = "Per-character user override: Supertonic 3 Direct"
+                    )
+                }
+                "system_tts", "android_system" -> {
+                    return CanonicalBackendSelection(
+                        canonicalBackend = CanonicalVoiceBackend.ANDROID_SYSTEM_TTS,
+                        requestedEngineTag = resolveSystemFallbackTag(state),
+                        readinessNote = "Per-character user override: Android System TTS"
+                    )
+                }
+            }
+        }
+
+        // 3. Explicit global user-selected dubbing mode on main screen / A/B lab
         when (state.freeVoiceBackend) {
             FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER -> {
                 return CanonicalBackendSelection(
@@ -440,35 +475,7 @@ object CharacterVoiceRouter {
                 )
             }
             FreeVoiceBackend.ANDROID_USER_SELECTED, FreeVoiceBackend.PAUSE_DUBBING -> {
-                // Fall through to per-character user override or readiness-based selection below
-            }
-        }
-
-        // 3. When global mode is ANDROID_USER_SELECTED (default on first run), check if the user
-        //    explicitly locked a per-character engine override on this character profile:
-        if (assignment != null && assignment.isUserOverride) {
-            when (assignment.voiceEngine.trim().lowercase(Locale.ROOT)) {
-                "chatterbox_local_server" -> {
-                    return CanonicalBackendSelection(
-                        canonicalBackend = CanonicalVoiceBackend.LOCAL_CHATTERBOX_SERVER,
-                        requestedEngineTag = CanonicalVoiceBackend.LOCAL_CHATTERBOX_SERVER.backendTag,
-                        readinessNote = "Per-character user override: Chatterbox Local Server"
-                    )
-                }
-                "supertonic_v3", "sherpa_direct" -> {
-                    return CanonicalBackendSelection(
-                        canonicalBackend = CanonicalVoiceBackend.SHERPA_SUPERTONIC_DIRECT,
-                        requestedEngineTag = CanonicalVoiceBackend.SHERPA_SUPERTONIC_DIRECT.backendTag,
-                        readinessNote = "Per-character user override: Supertonic 3 Direct"
-                    )
-                }
-                "system_tts", "android_system" -> {
-                    return CanonicalBackendSelection(
-                        canonicalBackend = CanonicalVoiceBackend.ANDROID_SYSTEM_TTS,
-                        requestedEngineTag = resolveSystemFallbackTag(state),
-                        readinessNote = "Per-character user override: Android System TTS"
-                    )
-                }
+                // Fall through to readiness-based selection below
             }
         }
 

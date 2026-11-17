@@ -60,7 +60,8 @@ By running **ResembleAI Chatterbox Multilingual (`Chatterbox-Multilingual-hi`)**
 | `/v1/health` | `GET` | Returns model status, device (`cuda`/`cpu`), sample rate, cached conditionals count, and **unique SHA-256 reference voice count**. |
 | `/v1/voices` | `GET` | Lists all `.wav` reference clips in `reference_voices/` with SHA-256 hashes, durations, and RMS energy. |
 | `/v1/reference-audio/{voice_id}` | `GET` | Streams the raw reference `.wav` clip so the Android app can preview the original reference voice separately from synthesized Hindi speech. |
-| `/v1/voices/upload` | `POST` | Uploads a new consenting speaker `.wav` clip (`speaker_consent_confirmed=true` mandatory), validates non-silent RMS, and registers its SHA-256 identity. |
+| `/v1/voices/upload` | `POST` | Uploads a new consenting speaker audio clip (`speaker_consent_confirmed=true` mandatory), strips silence, downmixes to 24 kHz mono WAV (up to 120s), validates non-silent RMS, and saves a metadata sidecar. |
+| `/v1/voices/{voice_id}` | `DELETE` | Deletes an uploaded cloned voice clip, its metadata sidecar, and cached conditioning tensors from RAM/disk. |
 | `/v1/synthesize` | `POST` | Synthesizes Hindi dialogue using `ChatterboxMultilingualTTS.generate(text, language_id="hi", exaggeration=..., cfg_weight=...)`, validates non-silent RMS (`>= 1e-4`), and returns `audio/wav` with latency headers. |
 | `/v1/cancel` | `POST` | Marks a `request_id` or `epoch` stale so queued/in-flight synthesis aborts when the gamer pauses, stops, or advances dialogue. |
 

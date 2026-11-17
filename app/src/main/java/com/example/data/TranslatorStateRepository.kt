@@ -526,7 +526,12 @@ object TranslatorStateRepository {
                 ttsVolume = volume,
                 invertColorsEnabled = invert,
                 captureIntervalMs = interval,
-                pronunciationGlossary = glossary
+                pronunciationGlossary = glossary,
+                chatterboxServerReachable = false,
+                chatterboxModelLoaded = false,
+                chatterboxServerStatusText = "Not tested",
+                chatterboxErrorCategory = "NONE",
+                voiceEngineWarningMessage = ""
             )
         }
     }

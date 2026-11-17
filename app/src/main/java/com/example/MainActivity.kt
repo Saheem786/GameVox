@@ -424,7 +424,7 @@ fun GameVoxApp(
             GameVoxMainTab.VOICE_LIBRARY -> VoiceLibraryScreen(
                 snackbarHostState = snackbarHostState,
                 onAddVoiceClick = { currentTab = GameVoxMainTab.VOICE_GENERATE },
-                onPlayVoicePreview = { profile -> localPipeline.previewVoiceProfile(profile) },
+                onPlayVoicePreview = { _ -> /* Handled canonically inside VoiceLibraryScreen */ },
                 onSelectVoice = { profile ->
                     VoiceProfileRepository.selectVoice(context, profile)
                     TranslatorStateRepository.updateTtsPitch(context, profile.pitch)

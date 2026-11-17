@@ -76,6 +76,28 @@ data class TtsVisualizerState(
 )
 
 /**
+ * Detailed outcome returned when generating a cloned Hindi preview via Chatterbox Multilingual V3.
+ */
+data class CloneGenerationResult(
+    val success: Boolean,
+    val outputWavPath: String = "",
+    val outputWavSha256: String = "",
+    val referenceVoiceId: String = "",
+    val referenceSha256: String = "",
+    val synthesizedRms: Float = Float.NaN,
+    val audioDurationMs: Long = 0L,
+    val conditioningLatencyMs: Long = 0L,
+    val conditioningCached: Boolean = false,
+    val inferenceLatencyMs: Long = 0L,
+    val totalRequestLatencyMs: Long = 0L,
+    val firstAudioMs: Long = 0L,
+    val deviceUsed: String = "",
+    val errorCategory: NeuralServerErrorCategory = NeuralServerErrorCategory.NONE,
+    val errorMessage: String = "",
+    val uploadSkippedCached: Boolean = false
+)
+
+/**
  * Dedicated TextToSpeech Initialization & Voice Pack Verification Service:
  *
  * 1. **High-Quality Network Voice Pack Inspection**:
@@ -201,6 +223,8 @@ class ForegroundTtsManager private constructor(context: Context) {
 
     @Volatile
     private var prewarmAttempted: Boolean = false
+
+    private val uploadedReferenceVoiceShaByEndpoint = ConcurrentHashMap<String, String>()
 
     /**
      * Callback invoked immediately when an utterance completes (`onDone`), used to drain the
@@ -1404,6 +1428,7 @@ class ForegroundTtsManager private constructor(context: Context) {
             val epoch = currentEpoch
             val utteranceId = effectiveRoute.utteranceId
             val fallbackDispatched = java.util.concurrent.atomic.AtomicBoolean(false)
+            val requireStrictClonedVoice = isExplicitClonedVoiceAssignment(activeAssignment, effectiveVoiceProfile)
 
             val spokenWithOverrides = if (activeAssignment.pronunciationOverrides.isNotEmpty()) {
                 com.example.engine.PronunciationGlossary.applyForSpeech(
@@ -1448,52 +1473,262 @@ class ForegroundTtsManager private constructor(context: Context) {
             )
 
             managerScope.launch(Dispatchers.Default) {
-                val success = neuralVoiceClient.synthesizeAndPlay(
+                val uploadCheck = ensureReferenceVoiceAvailableOnServer(
+                    assignment = activeAssignment,
                     rawBaseUrl = state.chatterboxServerUrl,
-                    authToken = state.chatterboxAuthToken,
-                    request = synthReq,
-                    onSynthesisTelemetry = { outcome ->
+                    authToken = state.chatterboxAuthToken
+                )
+                if (uploadCheck.isFailure) {
+                    val errMsg = uploadCheck.exceptionOrNull()?.localizedMessage ?: "Failed to upload reference voice"
+                    val errCat = neuralVoiceClient.lastErrorCategory.takeIf { it != NeuralServerErrorCategory.NONE }
+                        ?: NeuralServerErrorCategory.SERVER_UNREACHABLE
+                    val explicitWarn = "[${errCat.code}] $errMsg"
+                    TranslatorStateRepository.updateChatterboxServerStatus(
+                        reachable = errCat == NeuralServerErrorCategory.INFERENCE_FAILED || errCat == NeuralServerErrorCategory.MODEL_UNAVAILABLE,
+                        modelLoaded = errCat == NeuralServerErrorCategory.INFERENCE_FAILED,
+                        device = "error_${errCat.code.lowercase(Locale.ROOT)}",
+                        statusText = explicitWarn,
+                        errorCategory = errCat.code,
+                        warningMessage = "WARNING: Cloned neural voice error — $explicitWarn"
+                    )
+                    if (requireStrictClonedVoice) {
                         com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
                             routeDecision = effectiveRoute,
                             actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-                            actualBackend = "CHATTERBOX_LOCAL_SERVER",
+                            actualBackend = "CHATTERBOX_UNAVAILABLE",
                             jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                            modelLoaded = true,
-                            fallbackReason = "",
-                            audioDurationMs = outcome.parsedWav.durationMs,
-                            outputPcmRms = outcome.parsedWav.waveformRms
-                        )
-                        TranslatorStateRepository.updateChatterboxServerStatus(
-                            reachable = true,
-                            modelLoaded = true,
-                            device = outcome.deviceUsed,
-                            statusText = "Connected (${outcome.deviceUsed.uppercase(Locale.ROOT)}) • Infer ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", outcome.parsedWav.waveformRms)}",
-                            errorCategory = "NONE",
-                            warningMessage = ""
+                            modelLoaded = false,
+                            fallbackReason = explicitWarn,
+                            audioDurationMs = 0L,
+                            outputPcmRms = null
                         )
                         TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                            backendType = "CHATTERBOX_LOCAL_SERVER",
-                            modelLoaded = true,
-                            modelPath = "${state.chatterboxServerUrl} (${outcome.voiceId}.wav)",
-                            speakerCount = VoiceProfileRepository.getUniqueReferenceVoiceSummary().first,
+                            backendType = "CHATTERBOX_UNAVAILABLE (${errCat.code})",
+                            modelLoaded = false,
+                            modelPath = state.chatterboxServerUrl,
+                            speakerCount = sherpaEngine.numSpeakers,
                             selectedSid = effectiveRoute.selectedSpeakerId,
-                            modelVersion = "ResembleAI/Chatterbox-Multilingual-hi (${outcome.deviceUsed})",
+                            modelVersion = "ResembleAI/Chatterbox-Multilingual-hi",
                             jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
                             configuredSteps = sherpaEngine.configuredNumSteps,
-                            firstAudioLatencyMs = outcome.serverRequestLatencyMs,
-                            lastError = ""
+                            lastError = explicitWarn
                         )
                         TranslatorStateRepository.updateDiagnosisMetrics(
-                            serverRequestLatencyMs = outcome.serverRequestLatencyMs,
-                            serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
-                            conditioningLatencyMs = outcome.conditioningLatencyMs,
-                            conditioningCached = outcome.conditioningCached,
-                            ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
-                            lastSynthesizedVoiceSha256 = outcome.voiceSha256,
-                            lastSynthesizedRms = outcome.parsedWav.waveformRms,
-                            activeVoiceName = "Chatterbox V3 (${activeAssignment.displayName} • ${outcome.voiceId})"
+                            lastSynthesizedRms = Float.NaN,
+                            activeVoiceName = "CHATTERBOX_UNAVAILABLE: ${activeAssignment.displayName}"
                         )
-                    },
+                        if (_playbackEpoch.get() == epoch) {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                        }
+                        return@launch
+                    }
+                }
+
+                val handleServerFailure: (String) -> Unit = { err ->
+                    if (fallbackDispatched.compareAndSet(false, true)) {
+                        val errCat = neuralVoiceClient.lastErrorCategory
+                        val explicitWarn = "[${errCat.code}] ${errCat.displayTitle}: $err"
+                        Log.w(TAG, "Chatterbox local server error ($explicitWarn)")
+                        TranslatorStateRepository.updateChatterboxServerStatus(
+                            reachable = errCat == NeuralServerErrorCategory.MODEL_UNAVAILABLE || errCat == NeuralServerErrorCategory.INFERENCE_FAILED,
+                            modelLoaded = errCat == NeuralServerErrorCategory.INFERENCE_FAILED,
+                            device = "error_${errCat.code.lowercase(Locale.ROOT)}",
+                            statusText = explicitWarn,
+                            errorCategory = errCat.code,
+                            warningMessage = "WARNING: Human Voice server error — $explicitWarn"
+                        )
+                        if (_playbackEpoch.get() == epoch) {
+                            isSpeakingUtterance = false
+                            if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                            stopVisualizerSync()
+                            if (requireStrictClonedVoice) {
+                                // Strictly NEVER silently fall back to System TTS or Supertonic when an active cloned voice cannot reach Chatterbox!
+                                TranslatorStateRepository.updateVoiceEngineWarning(
+                                    "Cloned voice '${activeAssignment.displayName}' requires your Chatterbox server ($explicitWarn). Audio NOT faked with System TTS.",
+                                    errCat.code
+                                )
+                                com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                                    routeDecision = effectiveRoute,
+                                    actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
+                                    actualBackend = "CHATTERBOX_UNAVAILABLE",
+                                    jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                    modelLoaded = false,
+                                    fallbackReason = explicitWarn,
+                                    audioDurationMs = 0L,
+                                    outputPcmRms = null
+                                )
+                                TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                                    backendType = "CHATTERBOX_UNAVAILABLE (${errCat.code})",
+                                    modelLoaded = false,
+                                    modelPath = state.chatterboxServerUrl,
+                                    speakerCount = sherpaEngine.numSpeakers,
+                                    selectedSid = effectiveRoute.selectedSpeakerId,
+                                    modelVersion = "ResembleAI/Chatterbox-Multilingual-hi",
+                                    jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                    configuredSteps = sherpaEngine.configuredNumSteps,
+                                    lastError = explicitWarn
+                                )
+                                TranslatorStateRepository.updateDiagnosisMetrics(
+                                    lastSynthesizedRms = Float.NaN,
+                                    activeVoiceName = "CHATTERBOX_UNAVAILABLE: ${activeAssignment.displayName}"
+                                )
+                            } else if (!isBenchmarkRun) {
+                                // Honest fallback only for non-cloned global presets
+                                if (SupertonicModelManager.isModelReady(appContext)) {
+                                    TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                                        backendType = "SHERPA_FALLBACK (${errCat.code})",
+                                        modelLoaded = true,
+                                        modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
+                                        speakerCount = sherpaEngine.numSpeakers,
+                                        selectedSid = effectiveRoute.selectedSpeakerId,
+                                        modelVersion = SupertonicModelManager.modelInfo.version,
+                                        jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                        configuredSteps = sherpaEngine.configuredNumSteps,
+                                        lastError = explicitWarn
+                                    )
+                                    managerScope.launch(Dispatchers.Default) {
+                                        sherpaEngine.synthesizeAndPlay(
+                                            text = spokenWithOverrides,
+                                            sid = effectiveRoute.selectedSpeakerId,
+                                            speed = activeAssignment.speed,
+                                            pitch = activeAssignment.pitch,
+                                            epoch = epoch,
+                                            onFirstAudioStarted = { latencyMs ->
+                                                TranslatorStateRepository.updateDiagnosisMetrics(
+                                                    ttsFirstAudioLatencyMs = latencyMs,
+                                                    activeVoiceName = "SHERPA_FALLBACK: Supertonic Sid #${effectiveRoute.selectedSpeakerId} (${errCat.code})"
+                                                )
+                                            },
+                                            onCompleted = {
+                                                com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                                                    routeDecision = effectiveRoute,
+                                                    actualSidPassedToNative = sherpaEngine.lastValidatedNativeSid,
+                                                    actualBackend = "SHERPA_DIRECT",
+                                                    jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                                    modelLoaded = sherpaEngine.isModelRuntimeInitialized,
+                                                    fallbackReason = explicitWarn,
+                                                    audioDurationMs = sherpaEngine.lastAudioDurationMs,
+                                                    outputPcmRms = sherpaEngine.lastWaveformRms
+                                                )
+                                                onUtteranceCompletedImmediately?.invoke(utteranceId)
+                                            },
+                                            onError = { sherpaErr ->
+                                                val sysBackend = resolveSystemFallbackBackendCode(state)
+                                                com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                                                    routeDecision = effectiveRoute,
+                                                    actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
+                                                    actualBackend = sysBackend,
+                                                    jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                                    modelLoaded = false,
+                                                    fallbackReason = "$explicitWarn; $sherpaErr",
+                                                    audioDurationMs = 0L,
+                                                    outputPcmRms = null
+                                                )
+                                                managerScope.launch(Dispatchers.Main) {
+                                                    TranslatorStateRepository.updateDiagnosisMetrics(
+                                                        lastSynthesizedRms = Float.NaN,
+                                                        activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} ($sherpaErr)"
+                                                    )
+                                                    speakOnAndroidTts(text, sourceEnglishText, effectiveVoiceProfile, false)
+                                                }
+                                            }
+                                        )
+                                    }
+                                } else {
+                                    val sysBackend = resolveSystemFallbackBackendCode(state)
+                                    val singleVoiceWarn = if (sysBackend == "SYSTEM_FALLBACK_SINGLE_VOICE") {
+                                        "WARNING: $explicitWarn • Active system TTS (${state.activeTtsEngineLabel}) only provides 1 robotic voice! Fix PC server connection or download Supertonic 3 for distinct Male/Female voices."
+                                    } else {
+                                        "WARNING: $explicitWarn • Using $sysBackend (${state.activeTtsEngineLabel})"
+                                    }
+                                    TranslatorStateRepository.updateVoiceEngineWarning(singleVoiceWarn, errCat.code)
+                                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                                        routeDecision = effectiveRoute,
+                                        actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
+                                        actualBackend = sysBackend,
+                                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                        modelLoaded = false,
+                                        fallbackReason = explicitWarn,
+                                        audioDurationMs = 0L,
+                                        outputPcmRms = null
+                                    )
+                                    TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                                        backendType = "$sysBackend (${errCat.code})",
+                                        modelLoaded = false,
+                                        modelPath = state.chatterboxServerUrl,
+                                        speakerCount = sherpaEngine.numSpeakers,
+                                        selectedSid = effectiveRoute.selectedSpeakerId,
+                                        modelVersion = SupertonicModelManager.modelInfo.version,
+                                        jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                                        configuredSteps = sherpaEngine.configuredNumSteps,
+                                        lastError = explicitWarn
+                                    )
+                                    TranslatorStateRepository.updateDiagnosisMetrics(
+                                        lastSynthesizedRms = Float.NaN,
+                                        activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} (${errCat.code})"
+                                    )
+                                    managerScope.launch(Dispatchers.Main) {
+                                        if (_playbackEpoch.get() == epoch) {
+                                            speakOnAndroidTts(text, sourceEnglishText, effectiveVoiceProfile, false)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val onTelemetry: (NeuralSynthesisOutcome.Success) -> Unit = { outcome ->
+                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                        routeDecision = effectiveRoute,
+                        actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
+                        actualBackend = "CHATTERBOX_LOCAL_SERVER",
+                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        modelLoaded = true,
+                        fallbackReason = "",
+                        audioDurationMs = outcome.parsedWav.durationMs,
+                        outputPcmRms = outcome.parsedWav.waveformRms
+                    )
+                    TranslatorStateRepository.updateChatterboxServerStatus(
+                        reachable = true,
+                        modelLoaded = true,
+                        device = outcome.deviceUsed,
+                        statusText = "Connected (${outcome.deviceUsed.uppercase(Locale.ROOT)}) • Infer ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", outcome.parsedWav.waveformRms)}",
+                        errorCategory = "NONE",
+                        warningMessage = ""
+                    )
+                    TranslatorStateRepository.updateVoiceEngineDiagnostics(
+                        backendType = "CHATTERBOX_LOCAL_SERVER",
+                        modelLoaded = true,
+                        modelPath = "${state.chatterboxServerUrl} (${outcome.voiceId}.wav)",
+                        speakerCount = VoiceProfileRepository.getUniqueReferenceVoiceSummary().first,
+                        selectedSid = effectiveRoute.selectedSpeakerId,
+                        modelVersion = "ResembleAI/Chatterbox-Multilingual-hi (${outcome.deviceUsed})",
+                        jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        configuredSteps = sherpaEngine.configuredNumSteps,
+                        firstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                        lastError = ""
+                    )
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        serverRequestLatencyMs = outcome.serverRequestLatencyMs,
+                        serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                        conditioningLatencyMs = outcome.conditioningLatencyMs,
+                        conditioningCached = outcome.conditioningCached,
+                        ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                        lastSynthesizedVoiceSha256 = outcome.voiceSha256,
+                        lastSynthesizedRms = outcome.parsedWav.waveformRms,
+                        activeVoiceName = "Chatterbox V3 (${activeAssignment.displayName} • ${outcome.voiceId})"
+                    )
+                }
+
+                var lastErr = ""
+                var success = neuralVoiceClient.synthesizeAndPlay(
+                    rawBaseUrl = state.chatterboxServerUrl,
+                    authToken = state.chatterboxAuthToken,
+                    request = synthReq,
+                    onSynthesisTelemetry = onTelemetry,
                     onFirstAudioStarted = { firstPlayableMs ->
                         val e2eMs = if (frameTimestampMs > 0L) {
                             (System.currentTimeMillis() - frameTimestampMs).coerceAtLeast(firstPlayableMs)
@@ -1527,133 +1762,39 @@ class ForegroundTtsManager private constructor(context: Context) {
                             }
                         }
                     },
-                    onError = { err ->
-                        if (fallbackDispatched.compareAndSet(false, true)) {
-                            val errCat = neuralVoiceClient.lastErrorCategory
-                            val explicitWarn = "[${errCat.code}] ${errCat.displayTitle}: $err"
-                            Log.w(TAG, "Chatterbox local server error ($explicitWarn)")
-                            TranslatorStateRepository.updateChatterboxServerStatus(
-                                reachable = errCat == NeuralServerErrorCategory.MODEL_UNAVAILABLE || errCat == NeuralServerErrorCategory.INFERENCE_FAILED,
-                                modelLoaded = errCat == NeuralServerErrorCategory.INFERENCE_FAILED,
-                                device = "error_${errCat.code.lowercase(Locale.ROOT)}",
-                                statusText = explicitWarn,
-                                errorCategory = errCat.code,
-                                warningMessage = "WARNING: Human Voice server error — $explicitWarn"
-                            )
-                            if (_playbackEpoch.get() == epoch) {
-                                isSpeakingUtterance = false
-                                if (activeUtteranceId == utteranceId) activeUtteranceId = null
-                                stopVisualizerSync()
-                                if (!isBenchmarkRun) {
-                                    // Honest fallback: never claim Chatterbox is active when falling back
-                                    if (SupertonicModelManager.isModelReady(appContext)) {
-                                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                                            backendType = "SHERPA_FALLBACK (${errCat.code})",
-                                            modelLoaded = true,
-                                            modelPath = SupertonicModelManager.getModelDirectory(appContext).absolutePath,
-                                            speakerCount = sherpaEngine.numSpeakers,
-                                            selectedSid = effectiveRoute.selectedSpeakerId,
-                                            modelVersion = SupertonicModelManager.modelInfo.version,
-                                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                                            configuredSteps = sherpaEngine.configuredNumSteps,
-                                            lastError = explicitWarn
-                                        )
-                                        managerScope.launch(Dispatchers.Default) {
-                                            sherpaEngine.synthesizeAndPlay(
-                                                text = spokenWithOverrides,
-                                                sid = effectiveRoute.selectedSpeakerId,
-                                                speed = activeAssignment.speed,
-                                                pitch = activeAssignment.pitch,
-                                                epoch = epoch,
-                                                onFirstAudioStarted = { latencyMs ->
-                                                    TranslatorStateRepository.updateDiagnosisMetrics(
-                                                        ttsFirstAudioLatencyMs = latencyMs,
-                                                        activeVoiceName = "SHERPA_FALLBACK: Supertonic Sid #${effectiveRoute.selectedSpeakerId} (${errCat.code})"
-                                                    )
-                                                },
-                                                onCompleted = {
-                                                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
-                                                        routeDecision = effectiveRoute,
-                                                        actualSidPassedToNative = sherpaEngine.lastValidatedNativeSid,
-                                                        actualBackend = "SHERPA_DIRECT",
-                                                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                                                        modelLoaded = sherpaEngine.isModelRuntimeInitialized,
-                                                        fallbackReason = explicitWarn,
-                                                        audioDurationMs = sherpaEngine.lastAudioDurationMs,
-                                                        outputPcmRms = sherpaEngine.lastWaveformRms
-                                                    )
-                                                    onUtteranceCompletedImmediately?.invoke(utteranceId)
-                                                },
-                                                onError = { sherpaErr ->
-                                                    val sysBackend = resolveSystemFallbackBackendCode(state)
-                                                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
-                                                        routeDecision = effectiveRoute,
-                                                        actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-                                                        actualBackend = sysBackend,
-                                                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                                                        modelLoaded = false,
-                                                        fallbackReason = "$explicitWarn; $sherpaErr",
-                                                        audioDurationMs = 0L,
-                                                        outputPcmRms = null
-                                                    )
-                                                    managerScope.launch(Dispatchers.Main) {
-                                                        TranslatorStateRepository.updateDiagnosisMetrics(
-                                                            lastSynthesizedRms = Float.NaN,
-                                                            activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} ($sherpaErr)"
-                                                        )
-                                                        speakOnAndroidTts(text, sourceEnglishText, effectiveVoiceProfile, false)
-                                                    }
-                                                }
-                                            )
-                                        }
-                                    } else {
-                                        val sysBackend = resolveSystemFallbackBackendCode(state)
-                                        val singleVoiceWarn = if (sysBackend == "SYSTEM_FALLBACK_SINGLE_VOICE") {
-                                            "WARNING: $explicitWarn • Active system TTS (${state.activeTtsEngineLabel}) only provides 1 robotic voice! Fix PC server connection or download Supertonic 3 for distinct Male/Female voices."
-                                        } else {
-                                            "WARNING: $explicitWarn • Using $sysBackend (${state.activeTtsEngineLabel})"
-                                        }
-                                        TranslatorStateRepository.updateVoiceEngineWarning(singleVoiceWarn, errCat.code)
-                                        com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
-                                            routeDecision = effectiveRoute,
-                                            actualSidPassedToNative = effectiveRoute.selectedSpeakerId,
-                                            actualBackend = sysBackend,
-                                            jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                                            modelLoaded = false,
-                                            fallbackReason = explicitWarn,
-                                            audioDurationMs = 0L,
-                                            outputPcmRms = null
-                                        )
-                                        TranslatorStateRepository.updateVoiceEngineDiagnostics(
-                                            backendType = "$sysBackend (${errCat.code})",
-                                            modelLoaded = false,
-                                            modelPath = state.chatterboxServerUrl,
-                                            speakerCount = sherpaEngine.numSpeakers,
-                                            selectedSid = effectiveRoute.selectedSpeakerId,
-                                            modelVersion = SupertonicModelManager.modelInfo.version,
-                                            jniLoadResult = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                                            configuredSteps = sherpaEngine.configuredNumSteps,
-                                            lastError = explicitWarn
-                                        )
-                                        TranslatorStateRepository.updateDiagnosisMetrics(
-                                            lastSynthesizedRms = Float.NaN,
-                                            activeVoiceName = "$sysBackend: ${state.activeTtsEngineLabel} (${errCat.code})"
-                                        )
-                                        managerScope.launch(Dispatchers.Main) {
-                                            if (_playbackEpoch.get() == epoch) {
-                                                speakOnAndroidTts(text, sourceEnglishText, effectiveVoiceProfile, false)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    onError = { err -> lastErr = err }
                 )
-                if (!success && _playbackEpoch.get() == epoch && fallbackDispatched.compareAndSet(false, true)) {
-                    isSpeakingUtterance = false
-                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
-                    stopVisualizerSync()
+
+                // If server evicted or restarted without this custom clip (404), force re-upload once & retry
+                if (!success && _playbackEpoch.get() == epoch && lastErr.contains("404")) {
+                    val reupload = ensureReferenceVoiceAvailableOnServer(
+                        assignment = activeAssignment,
+                        rawBaseUrl = state.chatterboxServerUrl,
+                        authToken = state.chatterboxAuthToken,
+                        forceUpload = true
+                    )
+                    if (reupload.isSuccess) {
+                        lastErr = ""
+                        success = neuralVoiceClient.synthesizeAndPlay(
+                            rawBaseUrl = state.chatterboxServerUrl,
+                            authToken = state.chatterboxAuthToken,
+                            request = synthReq,
+                            onSynthesisTelemetry = onTelemetry,
+                            onCompleted = {
+                                if (_playbackEpoch.get() == epoch) {
+                                    isSpeakingUtterance = false
+                                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                                    stopVisualizerSync()
+                                    onUtteranceCompletedImmediately?.invoke(utteranceId)
+                                }
+                            },
+                            onError = { err -> lastErr = err }
+                        )
+                    }
+                }
+
+                if (!success && _playbackEpoch.get() == epoch) {
+                    handleServerFailure(lastErr.ifBlank { "Chatterbox synthesis failed" })
                 }
             }
             return true
@@ -2812,52 +2953,94 @@ class ForegroundTtsManager private constructor(context: Context) {
         }
 
         if (canonicalSelection.backend == com.example.engine.CanonicalVoiceBackend.CHATTERBOX_LOCAL_SERVER) {
+            val requireStrictClonedVoice = isExplicitClonedVoiceAssignment(resolvedAssignment, null)
             managerScope.launch(Dispatchers.Default) {
+                val uploadRes = ensureReferenceVoiceAvailableOnServer(
+                    assignment = resolvedAssignment,
+                    rawBaseUrl = state.chatterboxServerUrl,
+                    authToken = state.chatterboxAuthToken
+                )
+                if (uploadRes.isFailure && requireStrictClonedVoice) {
+                    val err = uploadRes.exceptionOrNull()?.localizedMessage ?: "Failed to upload reference clip"
+                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                        routeDecision = routeDecision,
+                        actualSidPassedToNative = routeDecision.selectedSpeakerId,
+                        actualBackend = "CHATTERBOX_UNAVAILABLE",
+                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        modelLoaded = false,
+                        fallbackReason = err,
+                        audioDurationMs = 0L,
+                        outputPcmRms = null
+                    )
+                    withContext(Dispatchers.Main) {
+                        onResult(false, "CHATTERBOX_UNAVAILABLE: $err", Float.NaN)
+                    }
+                    return@launch
+                }
+
                 var reportedRms = Float.NaN
                 var reportedSummary = ""
-                val ok = neuralVoiceClient.synthesizeAndPlay(
+                val req = NeuralSynthesizeRequest(
+                    text = spokenWithOverrides,
+                    characterId = resolvedAssignment.characterName,
+                    referenceVoiceId = resolvedAssignment.referenceVoiceId,
+                    languageId = "hi",
+                    emotion = emotionToUse.code,
+                    exaggeration = effectiveExag,
+                    cfgWeight = effectiveCfg,
+                    requestId = routeDecision.utteranceId,
+                    epoch = epoch
+                )
+                val telemetryCallback: (NeuralSynthesisOutcome.Success) -> Unit = { outcome ->
+                    reportedRms = outcome.parsedWav.waveformRms
+                    reportedSummary = "CHATTERBOX_LOCAL_SERVER (${outcome.voiceId}.wav • SHA ${outcome.voiceSha256.take(8)} • ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", reportedRms)})"
+                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                        routeDecision = routeDecision,
+                        actualSidPassedToNative = routeDecision.selectedSpeakerId,
+                        actualBackend = "CHATTERBOX_LOCAL_SERVER",
+                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        modelLoaded = true,
+                        fallbackReason = "",
+                        audioDurationMs = outcome.parsedWav.durationMs,
+                        outputPcmRms = reportedRms
+                    )
+                    TranslatorStateRepository.updateDiagnosisMetrics(
+                        serverRequestLatencyMs = outcome.serverRequestLatencyMs,
+                        serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                        conditioningLatencyMs = outcome.conditioningLatencyMs,
+                        conditioningCached = outcome.conditioningCached,
+                        ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                        lastSynthesizedVoiceSha256 = outcome.voiceSha256,
+                        lastSynthesizedRms = reportedRms,
+                        activeVoiceName = "Chatterbox V3 (${resolvedAssignment.displayName} • ${outcome.voiceId})"
+                    )
+                }
+                var ok = neuralVoiceClient.synthesizeAndPlay(
                     rawBaseUrl = state.chatterboxServerUrl,
                     authToken = state.chatterboxAuthToken,
-                    request = NeuralSynthesizeRequest(
-                        text = spokenWithOverrides,
-                        characterId = resolvedAssignment.characterName,
-                        referenceVoiceId = resolvedAssignment.referenceVoiceId,
-                        languageId = "hi",
-                        emotion = emotionToUse.code,
-                        exaggeration = effectiveExag,
-                        cfgWeight = effectiveCfg,
-                        requestId = routeDecision.utteranceId,
-                        epoch = epoch
-                    ),
+                    request = req,
                     exportWavFile = exportWavFile,
-                    onSynthesisTelemetry = { outcome ->
-                        reportedRms = outcome.parsedWav.waveformRms
-                        reportedSummary = "CHATTERBOX_LOCAL_SERVER (${outcome.voiceId}.wav • SHA ${outcome.voiceSha256.take(8)} • ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", reportedRms)})"
-                        com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
-                            routeDecision = routeDecision,
-                            actualSidPassedToNative = routeDecision.selectedSpeakerId,
-                            actualBackend = "CHATTERBOX_LOCAL_SERVER",
-                            jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
-                            modelLoaded = true,
-                            fallbackReason = "",
-                            audioDurationMs = outcome.parsedWav.durationMs,
-                            outputPcmRms = reportedRms
-                        )
-                        TranslatorStateRepository.updateDiagnosisMetrics(
-                            serverRequestLatencyMs = outcome.serverRequestLatencyMs,
-                            serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
-                            conditioningLatencyMs = outcome.conditioningLatencyMs,
-                            conditioningCached = outcome.conditioningCached,
-                            ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
-                            lastSynthesizedVoiceSha256 = outcome.voiceSha256,
-                            lastSynthesizedRms = reportedRms,
-                            activeVoiceName = "Chatterbox V3 (${resolvedAssignment.displayName} • ${outcome.voiceId})"
-                        )
-                    },
-                    onError = { err ->
-                        reportedSummary = "Local Server Unavailable ($err)"
-                    }
+                    onSynthesisTelemetry = telemetryCallback,
+                    onError = { err -> reportedSummary = "Local Server Unavailable ($err)" }
                 )
+                if (!ok && reportedSummary.contains("404")) {
+                    val reupload = ensureReferenceVoiceAvailableOnServer(
+                        assignment = resolvedAssignment,
+                        rawBaseUrl = state.chatterboxServerUrl,
+                        authToken = state.chatterboxAuthToken,
+                        forceUpload = true
+                    )
+                    if (reupload.isSuccess) {
+                        ok = neuralVoiceClient.synthesizeAndPlay(
+                            rawBaseUrl = state.chatterboxServerUrl,
+                            authToken = state.chatterboxAuthToken,
+                            request = req,
+                            exportWavFile = exportWavFile,
+                            onSynthesisTelemetry = telemetryCallback,
+                            onError = { err -> reportedSummary = "Local Server Unavailable ($err)" }
+                        )
+                    }
+                }
                 if (ok && !reportedRms.isNaN()) {
                     withContext(Dispatchers.Main) {
                         onResult(true, reportedSummary, reportedRms)
@@ -2865,7 +3048,25 @@ class ForegroundTtsManager private constructor(context: Context) {
                     return@launch
                 }
 
-                // Honest fallback to Supertonic or Android TTS if local server is offline during preview
+                if (requireStrictClonedVoice) {
+                    // NEVER fake an explicit cloned neural voice with System TTS or Supertonic!
+                    com.example.engine.CharacterVoiceRouter.recordSpokenUtteranceAudit(
+                        routeDecision = routeDecision,
+                        actualSidPassedToNative = routeDecision.selectedSpeakerId,
+                        actualBackend = "CHATTERBOX_UNAVAILABLE",
+                        jniStatus = com.k2fsa.sherpa.onnx.OfflineTts.jniStatusSummary,
+                        modelLoaded = false,
+                        fallbackReason = reportedSummary,
+                        audioDurationMs = 0L,
+                        outputPcmRms = null
+                    )
+                    withContext(Dispatchers.Main) {
+                        onResult(false, "CHATTERBOX_UNAVAILABLE: $reportedSummary", Float.NaN)
+                    }
+                    return@launch
+                }
+
+                // Honest fallback to Supertonic or Android TTS only for non-cloned global presets
                 if (SupertonicModelManager.isModelReady(appContext) && (sherpaEngine.isReady || sherpaEngine.initialize())) {
                     val wavTarget = exportWavFile ?: File(appContext.cacheDir, "ab_preview_${resolvedAssignment.characterName}_sid${routeDecision.selectedSpeakerId}.wav")
                     val valResult = sherpaEngine.synthesizeAndValidateToWav(
@@ -2982,6 +3183,333 @@ class ForegroundTtsManager private constructor(context: Context) {
                         Float.NaN
                     )
                 }
+            }
+        }
+    }
+
+    private fun isExplicitClonedVoiceAssignment(
+        assignment: CharacterVoiceAssignment,
+        voiceProfile: VoiceProfile?
+    ): Boolean {
+        val matchesAssignedClone = assignment.assignedVoiceId.isNotBlank() &&
+            VoiceProfileRepository.voices.value.any {
+                it.id == assignment.assignedVoiceId && (it.isNeuralCloned || it.voiceCategory == com.example.data.VoiceCategory.CLONED)
+            }
+        return (assignment.isUserOverride && assignment.voiceEngine.equals("chatterbox_local_server", ignoreCase = true)) ||
+            voiceProfile?.isNeuralCloned == true ||
+            voiceProfile?.voiceCategory == com.example.data.VoiceCategory.CLONED ||
+            matchesAssignedClone
+    }
+
+    private suspend fun ensureReferenceVoiceAvailableOnServer(
+        assignment: CharacterVoiceAssignment,
+        rawBaseUrl: String,
+        authToken: String,
+        forceUpload: Boolean = false
+    ): Result<String> {
+        val cleanId = assignment.referenceVoiceId.trim().removeSuffix(".wav")
+        if (cleanId.isBlank() ||
+            cleanId == CharacterVoiceAssignment.DEFAULT_MALE_REF_ID ||
+            cleanId == CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
+        ) {
+            return Result.success(cleanId)
+        }
+        val localFile = VoiceProfileRepository.resolveReferenceVoiceFile(appContext, cleanId)
+            ?: VoiceProfileRepository.voices.value
+                .find { it.id == assignment.assignedVoiceId }
+                ?.sampleAudioPath
+                ?.let(::File)
+                ?.takeIf { it.exists() && it.length() > 100L }
+            ?: return Result.failure(
+                IllegalStateException("Missing local reference WAV for '$cleanId'. Re-import sample audio before cloning.")
+            )
+        val fileSha = assignment.referenceAudioSha256.takeIf { it.isNotBlank() }
+            ?: com.example.engine.CharacterVoiceRouter.computeFileSha256(localFile)
+        return ensureReferenceVoiceFileUploaded(
+            voiceId = cleanId,
+            audioFile = localFile,
+            sha256 = fileSha,
+            speakerConsentConfirmed = assignment.speakerConsentConfirmed,
+            rawBaseUrl = rawBaseUrl,
+            authToken = authToken,
+            forceUpload = forceUpload
+        ).map { cleanId }
+    }
+
+    private suspend fun ensureReferenceVoiceFileUploaded(
+        voiceId: String,
+        audioFile: File,
+        sha256: String,
+        speakerConsentConfirmed: Boolean,
+        rawBaseUrl: String,
+        authToken: String,
+        forceUpload: Boolean = false
+    ): Result<Boolean> {
+        val cleanId = voiceId.trim().removeSuffix(".wav").ifBlank { "custom_clone_${System.currentTimeMillis()}" }
+        val normEndpoint = NeuralVoiceClient.normalizeBaseUrl(rawBaseUrl)
+        val cacheKey = "$normEndpoint|$cleanId"
+        if (!forceUpload && sha256.isNotBlank() && uploadedReferenceVoiceShaByEndpoint[cacheKey] == sha256) {
+            return Result.success(true) // Already uploaded & verified
+        }
+        return when (val res = neuralVoiceClient.uploadReferenceVoice(
+            rawBaseUrl = normEndpoint,
+            authToken = authToken,
+            voiceId = cleanId,
+            audioFile = audioFile,
+            speakerConsentConfirmed = speakerConsentConfirmed
+        )) {
+            is ReferenceVoiceUploadOutcome.Success -> {
+                if (res.sha256.isNotBlank()) {
+                    uploadedReferenceVoiceShaByEndpoint[cacheKey] = res.sha256
+                } else if (sha256.isNotBlank()) {
+                    uploadedReferenceVoiceShaByEndpoint[cacheKey] = sha256
+                }
+                Result.success(false)
+            }
+            is ReferenceVoiceUploadOutcome.Error -> {
+                Result.failure(IllegalStateException(res.reason))
+            }
+        }
+    }
+
+    /**
+     * ElevenLabs-style Instant Neural Voice Cloning preview synthesis:
+     * 1. Enforces explicit speaker ownership/permission confirmation (`speakerConsentConfirmed == true`).
+     * 2. Uploads normalized reference WAV to Chatterbox `/v1/voices/upload` (skipping re-upload if matching SHA already uploaded).
+     * 3. Synthesizes **brand-new** Hindi speech via Chatterbox `/v1/synthesize` (never replays original recording or System TTS).
+     * 4. Verifies output WAV exists, is non-silent (`RMS >= 1e-4f`), and has SHA-256 distinct from reference clip.
+     */
+    suspend fun generateNeuralClonePreview(
+        voiceName: String,
+        referenceAudioFile: File,
+        previewHindiText: String,
+        characterId: String = "clone_preview",
+        exaggeration: Float = 0.50f,
+        cfgWeight: Float = 0.40f,
+        speakerConsentConfirmed: Boolean,
+        rawBaseUrl: String = TranslatorStateRepository.state.value.chatterboxServerUrl,
+        authToken: String = TranslatorStateRepository.state.value.chatterboxAuthToken,
+        outputDir: File = File(appContext.filesDir, "custom_voices")
+    ): CloneGenerationResult = withContext(Dispatchers.IO) {
+        if (!speakerConsentConfirmed) {
+            return@withContext CloneGenerationResult(
+                success = false,
+                errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED,
+                errorMessage = "Please confirm voice ownership or speaker permission before generating a neural clone."
+            )
+        }
+        if (!referenceAudioFile.exists() || referenceAudioFile.length() <= 100L) {
+            return@withContext CloneGenerationResult(
+                success = false,
+                errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED,
+                errorMessage = "Reference audio sample is missing or empty."
+            )
+        }
+        val cleanHindi = previewHindiText.trim().ifBlank {
+            "नमस्ते गेमर! यह मेरी क्लोन की गई न्यूरल हिन्दी आवाज़ है।"
+        }
+        val stableVoiceId = referenceAudioFile.nameWithoutExtension
+            .trim()
+            .replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+            .ifBlank { "clone_${System.currentTimeMillis()}" }
+        val refSha = com.example.engine.CharacterVoiceRouter.computeFileSha256(referenceAudioFile)
+        val totalStartMs = SystemClock.elapsedRealtime()
+
+        val uploadRes = ensureReferenceVoiceFileUploaded(
+            voiceId = stableVoiceId,
+            audioFile = referenceAudioFile,
+            sha256 = refSha,
+            speakerConsentConfirmed = speakerConsentConfirmed,
+            rawBaseUrl = rawBaseUrl,
+            authToken = authToken
+        )
+        if (uploadRes.isFailure) {
+            val cat = neuralVoiceClient.lastErrorCategory.takeIf { it != NeuralServerErrorCategory.NONE }
+                ?: NeuralServerErrorCategory.SERVER_UNREACHABLE
+            val msg = uploadRes.exceptionOrNull()?.localizedMessage ?: cat.displayTitle
+            TranslatorStateRepository.updateChatterboxServerStatus(
+                reachable = cat == NeuralServerErrorCategory.MODEL_UNAVAILABLE || cat == NeuralServerErrorCategory.INFERENCE_FAILED,
+                modelLoaded = cat == NeuralServerErrorCategory.INFERENCE_FAILED,
+                device = "error_${cat.code.lowercase(Locale.ROOT)}",
+                statusText = msg,
+                errorCategory = cat.code,
+                warningMessage = msg
+            )
+            return@withContext CloneGenerationResult(
+                success = false,
+                referenceVoiceId = stableVoiceId,
+                referenceSha256 = refSha,
+                errorCategory = cat,
+                errorMessage = msg
+            )
+        }
+
+        val req = NeuralSynthesizeRequest(
+            text = cleanHindi,
+            characterId = characterId.ifBlank { voiceName.ifBlank { "clone_preview" } },
+            referenceVoiceId = stableVoiceId,
+            languageId = "hi",
+            emotion = "neutral",
+            exaggeration = exaggeration.coerceIn(0.1f, 2.0f),
+            cfgWeight = cfgWeight.coerceIn(0.1f, 1.5f)
+        )
+
+        var outcome = neuralVoiceClient.synthesizeHindiWav(rawBaseUrl, authToken, req)
+        if (outcome is NeuralSynthesisOutcome.Error && outcome.httpStatus == 404) {
+            // Re-upload once if server evicted temporary voice cache
+            val reupload = ensureReferenceVoiceFileUploaded(
+                voiceId = stableVoiceId,
+                audioFile = referenceAudioFile,
+                sha256 = refSha,
+                speakerConsentConfirmed = speakerConsentConfirmed,
+                rawBaseUrl = rawBaseUrl,
+                authToken = authToken,
+                forceUpload = true
+            )
+            if (reupload.isSuccess) {
+                outcome = neuralVoiceClient.synthesizeHindiWav(rawBaseUrl, authToken, req)
+            }
+        }
+
+        when (outcome) {
+            is NeuralSynthesisOutcome.Error -> {
+                TranslatorStateRepository.updateChatterboxServerStatus(
+                    reachable = outcome.errorCategory == NeuralServerErrorCategory.MODEL_UNAVAILABLE || outcome.errorCategory == NeuralServerErrorCategory.INFERENCE_FAILED,
+                    modelLoaded = outcome.errorCategory == NeuralServerErrorCategory.INFERENCE_FAILED,
+                    device = "error_${outcome.errorCategory.code.lowercase(Locale.ROOT)}",
+                    statusText = outcome.reason,
+                    errorCategory = outcome.errorCategory.code,
+                    warningMessage = outcome.reason
+                )
+                CloneGenerationResult(
+                    success = false,
+                    referenceVoiceId = stableVoiceId,
+                    referenceSha256 = refSha,
+                    totalRequestLatencyMs = (SystemClock.elapsedRealtime() - totalStartMs).coerceAtLeast(1L),
+                    errorCategory = outcome.errorCategory,
+                    errorMessage = outcome.reason,
+                    uploadSkippedCached = uploadRes.getOrDefault(false)
+                )
+            }
+            is NeuralSynthesisOutcome.Success -> {
+                outputDir.mkdirs()
+                val outWav = File(outputDir, "clone_preview_${stableVoiceId}_${System.currentTimeMillis()}.wav")
+                outWav.writeBytes(outcome.rawWavBytes)
+                val outSha = outcome.parsedWav.sha256Hex.ifBlank {
+                    com.example.engine.CharacterVoiceRouter.computeFileSha256(outWav)
+                }
+                val totalMs = (SystemClock.elapsedRealtime() - totalStartMs).coerceAtLeast(1L)
+                if (outSha == refSha && refSha.isNotBlank()) {
+                    try {
+                        outWav.delete()
+                    } catch (_: Exception) {
+                    }
+                    return@withContext CloneGenerationResult(
+                        success = false,
+                        referenceVoiceId = stableVoiceId,
+                        referenceSha256 = refSha,
+                        errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED,
+                        errorMessage = "Integrity check failed: synthesized output matched raw reference clip instead of new Hindi speech."
+                    )
+                }
+
+                TranslatorStateRepository.updateChatterboxServerStatus(
+                    reachable = true,
+                    modelLoaded = true,
+                    device = outcome.deviceUsed,
+                    statusText = "Connected (${outcome.deviceUsed.uppercase(Locale.ROOT)}) • Cloned preview ${outcome.serverInferenceLatencyMs}ms • RMS ${String.format(Locale.US, "%.4f", outcome.parsedWav.waveformRms)}",
+                    errorCategory = "NONE",
+                    warningMessage = ""
+                )
+                TranslatorStateRepository.updateDiagnosisMetrics(
+                    serverRequestLatencyMs = outcome.serverRequestLatencyMs,
+                    serverInferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                    conditioningLatencyMs = outcome.conditioningLatencyMs,
+                    conditioningCached = outcome.conditioningCached,
+                    ttsFirstAudioLatencyMs = outcome.serverRequestLatencyMs,
+                    lastSynthesizedVoiceSha256 = outSha,
+                    lastSynthesizedRms = outcome.parsedWav.waveformRms,
+                    activeVoiceName = "Cloned Voice (${voiceName.ifBlank { stableVoiceId }})"
+                )
+                CloneGenerationResult(
+                    success = true,
+                    outputWavPath = outWav.absolutePath,
+                    outputWavSha256 = outSha,
+                    referenceVoiceId = stableVoiceId,
+                    referenceSha256 = refSha,
+                    synthesizedRms = outcome.parsedWav.waveformRms,
+                    audioDurationMs = outcome.parsedWav.durationMs,
+                    conditioningLatencyMs = outcome.conditioningLatencyMs,
+                    conditioningCached = outcome.conditioningCached,
+                    inferenceLatencyMs = outcome.serverInferenceLatencyMs,
+                    totalRequestLatencyMs = totalMs,
+                    firstAudioMs = totalMs,
+                    deviceUsed = outcome.deviceUsed,
+                    errorCategory = NeuralServerErrorCategory.NONE,
+                    errorMessage = "",
+                    uploadSkippedCached = uploadRes.getOrDefault(false)
+                )
+            }
+        }
+    }
+
+    /**
+     * Synthesizes arbitrary new Hindi dialogue using an already-saved cloned [VoiceProfile]'s
+     * reference audio clip, saves the new synthesized WAV on the profile, and plays it back.
+     */
+    fun regenerateVoiceProfilePreview(
+        voiceId: String,
+        hindiText: String,
+        playAfterGeneration: Boolean = true,
+        onResult: (CloneGenerationResult) -> Unit = {}
+    ) {
+        val voice = VoiceProfileRepository.voices.value.find { it.id == voiceId }
+        if (voice == null) {
+            onResult(
+                CloneGenerationResult(
+                    success = false,
+                    errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED,
+                    errorMessage = "Voice profile not found."
+                )
+            )
+            return
+        }
+        val refFile = voice.sampleAudioPath?.let(::File)?.takeIf { it.exists() && it.length() > 100L }
+        if (refFile == null) {
+            onResult(
+                CloneGenerationResult(
+                    success = false,
+                    errorCategory = NeuralServerErrorCategory.INFERENCE_FAILED,
+                    errorMessage = "Reference WAV file missing for '${voice.name}'."
+                )
+            )
+            return
+        }
+        managerScope.launch(Dispatchers.Default) {
+            val result = generateNeuralClonePreview(
+                voiceName = voice.name,
+                referenceAudioFile = refFile,
+                previewHindiText = hindiText,
+                characterId = voice.id,
+                exaggeration = voice.cloneExaggeration,
+                cfgWeight = voice.cloneCfgWeight,
+                speakerConsentConfirmed = voice.consentConfirmed
+            )
+            if (result.success) {
+                VoiceProfileRepository.updateVoiceGeneratedPreview(
+                    context = appContext,
+                    voiceId = voice.id,
+                    generatedPreviewPath = result.outputWavPath,
+                    generatedPreviewText = hindiText
+                )
+                if (playAfterGeneration) {
+                    withContext(Dispatchers.Main) {
+                        VoiceProfileRepository.playRecordedReferenceSample(result.outputWavPath)
+                    }
+                }
+            }
+            withContext(Dispatchers.Main) {
+                onResult(result)
             }
         }
     }

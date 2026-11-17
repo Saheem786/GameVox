@@ -931,6 +931,28 @@ class OcrTranslationPipeline private constructor(context: Context) {
     }
 
     fun previewVoiceProfile(voiceProfile: VoiceProfile) {
+        val isClonedNeural = voiceProfile.isNeuralCloned ||
+            voiceProfile.voiceCategory == com.example.data.VoiceCategory.CLONED
+        if (isClonedNeural) {
+            val synthPath = voiceProfile.generatedPreviewPath
+            if (!synthPath.isNullOrBlank() && java.io.File(synthPath).exists()) {
+                VoiceProfileRepository.playRecordedReferenceSample(synthPath)
+                return
+            }
+            val lang = TranslatorStateRepository.state.value.targetLanguage
+            val previewLine = voiceProfile.generatedPreviewText.ifBlank {
+                when (lang.code) {
+                    "hi" -> "हे गेमर! यह ${voiceProfile.name} की क्लोन की गई आवाज़ है।"
+                    else -> lang.sampleGreeting
+                }
+            }
+            ttsManager.regenerateVoiceProfilePreview(
+                voiceId = voiceProfile.id,
+                hindiText = previewLine,
+                playAfterGeneration = true
+            )
+            return
+        }
         val lang = TranslatorStateRepository.state.value.targetLanguage
         val previewLine = when (lang.code) {
             "hi" -> "हे गेमर! यह ${voiceProfile.name} की आवाज़ है। गेम के डायलॉग इसी आवाज़ में बोले जाएंगे।"

@@ -118,6 +118,8 @@ fun VoiceLibraryScreen(
     var voiceToRename by remember { mutableStateOf<VoiceProfile?>(null) }
     var voiceToAssign by remember { mutableStateOf<VoiceProfile?>(null) }
     var voicePendingDeletion by remember { mutableStateOf<VoiceProfile?>(null) }
+    var voiceToRegenerateHindi by remember { mutableStateOf<VoiceProfile?>(null) }
+    var isRegeneratingHindi by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         integrityReport = SupertonicModelManager.verifyModelIntegrity(context)
@@ -197,6 +199,39 @@ fun VoiceLibraryScreen(
                         scope.launch { snackbarHostState.showSnackbar(err.localizedMessage ?: "Delete failed") }
                     }
                 )
+            }
+        )
+    }
+
+    voiceToRegenerateHindi?.let { target ->
+        RegenerateClonedHindiDialog(
+            voice = target,
+            initialHindiText = target.generatedPreviewText.ifBlank { VOICE_PREVIEW_HINDI_SAMPLE },
+            isSynthesizing = isRegeneratingHindi,
+            onDismiss = { voiceToRegenerateHindi = null },
+            onConfirmSynthesize = { newHindiText ->
+                isRegeneratingHindi = true
+                ForegroundTtsManager.getInstance(context).regenerateVoiceProfilePreview(
+                    voiceId = target.id,
+                    hindiText = newHindiText,
+                    playAfterGeneration = true
+                ) { result ->
+                    isRegeneratingHindi = false
+                    if (result.success) {
+                        voiceToRegenerateHindi = null
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                "Synthesized \"${target.name}\" (${result.audioDurationMs}ms, ${result.inferenceLatencyMs}ms)"
+                            )
+                        }
+                    } else {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                "[${result.errorCategory.displayTitle}] ${result.errorMessage}"
+                            )
+                        }
+                    }
+                }
             }
         )
     }
@@ -359,35 +394,77 @@ fun VoiceLibraryScreen(
                     val boundChars = remember(voice.id, characterAssignments) {
                         VoiceProfileRepository.getCharactersAssignedToVoice(voice.id)
                     }
+                    val isClonedNeural = voice.voiceCategory == VoiceCategory.CLONED || voice.isNeuralCloned
                     VoiceLibraryCard(
                         voice = voice,
                         isSelected = voice.id == selectedVoiceId,
                         boundCharacters = boundChars,
                         onPreview = {
-                            val hasLocalSample = !voice.sampleAudioPath.isNullOrBlank() &&
-                                File(voice.sampleAudioPath).exists() &&
-                                (voice.voiceCategory == VoiceCategory.IMPORTED || voice.voiceCategory == VoiceCategory.CLONED)
-                            if (hasLocalSample) {
-                                VoiceProfileRepository.playRecordedReferenceSample(voice.sampleAudioPath)
+                            VoiceProfileRepository.stopReferenceAudioPlayback()
+                            val tts = ForegroundTtsManager.getInstance(context)
+                            if (isClonedNeural) {
+                                val synthPath = voice.generatedPreviewPath
+                                if (!synthPath.isNullOrBlank() && File(synthPath).exists()) {
+                                    VoiceProfileRepository.playRecordedReferenceSample(synthPath)
+                                } else {
+                                    tts.regenerateVoiceProfilePreview(
+                                        voiceId = voice.id,
+                                        hindiText = voice.generatedPreviewText.ifBlank { VOICE_PREVIEW_HINDI_SAMPLE },
+                                        playAfterGeneration = true
+                                    ) { result ->
+                                        scope.launch {
+                                            if (result.success) {
+                                                snackbarHostState.showSnackbar(
+                                                    "Synthesized preview for \"${voice.name}\" (${result.inferenceLatencyMs}ms)"
+                                                )
+                                            } else {
+                                                snackbarHostState.showSnackbar(
+                                                    "[${result.errorCategory.displayTitle}] ${result.errorMessage}"
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
-                                val tts = ForegroundTtsManager.getInstance(context)
-                                val previewAssign = CharacterVoiceAssignment(
-                                    characterName = "preview_${voice.id}",
-                                    displayName = voice.name,
-                                    speakerId = voice.engineVoiceIndex.coerceIn(0, 9),
-                                    speed = voice.speechRate,
-                                    pitch = voice.pitch,
-                                    voicePresentation = if (voice.gender == SpeakerGender.FEMALE_18) "female" else "male",
-                                    assignedVoiceId = voice.id
-                                )
-                                tts.synthesizeCharacterPreview(
-                                    assignment = previewAssign,
-                                    hindiText = VOICE_PREVIEW_HINDI_SAMPLE,
-                                    explicitEmotion = SpeechEmotion.NEUTRAL
-                                )
-                                onPlayVoicePreview(voice)
+                                val hasLocalPresetSample = !voice.sampleAudioPath.isNullOrBlank() &&
+                                    File(voice.sampleAudioPath).exists() &&
+                                    voice.voiceCategory == VoiceCategory.IMPORTED
+                                if (hasLocalPresetSample) {
+                                    VoiceProfileRepository.playRecordedReferenceSample(voice.sampleAudioPath)
+                                } else {
+                                    val previewAssign = CharacterVoiceAssignment(
+                                        characterName = "preview_${voice.id}",
+                                        displayName = voice.name,
+                                        speakerId = voice.engineVoiceIndex.coerceIn(0, 9),
+                                        speed = voice.speechRate,
+                                        pitch = voice.pitch,
+                                        voicePresentation = if (voice.gender == SpeakerGender.FEMALE_18) "female" else "male",
+                                        voiceEngine = if (voice.voiceCategory == VoiceCategory.GENERATED_ONLINE) {
+                                            com.example.service.FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER.code
+                                        } else {
+                                            "follow_global"
+                                        },
+                                        assignedVoiceId = voice.id
+                                    )
+                                    tts.synthesizeCharacterPreview(
+                                        assignment = previewAssign,
+                                        hindiText = voice.generatedPreviewText.ifBlank { VOICE_PREVIEW_HINDI_SAMPLE },
+                                        explicitEmotion = SpeechEmotion.NEUTRAL
+                                    )
+                                }
                             }
                         },
+                        onPlayOriginalRef = {
+                            val refPath = voice.sampleAudioPath
+                            if (!refPath.isNullOrBlank() && File(refPath).exists()) {
+                                VoiceProfileRepository.playRecordedReferenceSample(refPath)
+                            } else {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Original reference recording file not found.")
+                                }
+                            }
+                        },
+                        onRegenerateHindi = { voiceToRegenerateHindi = voice },
                         onSelect = { onSelectVoice(voice) },
                         onRename = { voiceToRename = voice },
                         onAssignToCharacter = { voiceToAssign = voice },
@@ -428,6 +505,8 @@ private fun VoiceLibraryCard(
     isSelected: Boolean,
     boundCharacters: List<CharacterVoiceAssignment>,
     onPreview: () -> Unit,
+    onPlayOriginalRef: () -> Unit,
+    onRegenerateHindi: () -> Unit,
     onSelect: () -> Unit,
     onRename: () -> Unit,
     onAssignToCharacter: () -> Unit,
@@ -435,6 +514,7 @@ private fun VoiceLibraryCard(
     onDelete: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val isClonedNeural = voice.voiceCategory == VoiceCategory.CLONED || voice.isNeuralCloned
 
     Card(
         shape = RoundedCornerShape(16.dp),
@@ -528,6 +608,16 @@ private fun VoiceLibraryCard(
                             },
                             modifier = Modifier.testTag("menu_assign_${voice.id}")
                         )
+                        if (isClonedNeural) {
+                            DropdownMenuItem(
+                                text = { Text("Regenerate Hindi Line") },
+                                onClick = {
+                                    menuExpanded = false
+                                    onRegenerateHindi()
+                                },
+                                modifier = Modifier.testTag("menu_regen_hindi_${voice.id}")
+                            )
+                        }
                         if (voice.isSystemProtected) {
                             DropdownMenuItem(
                                 text = {
@@ -591,6 +681,29 @@ private fun VoiceLibraryCard(
                         }
                     }
                 }
+                if (isClonedNeural) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Text(
+                            text = "Chatterbox Neural Clone",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Text(
+                            text = if (voice.consentConfirmed) "Consent OK • PC/Server Req" else "Consent Unverified",
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
                 boundCharacters.take(3).forEach { charAssign ->
                     Surface(
                         shape = RoundedCornerShape(50),
@@ -618,7 +731,7 @@ private fun VoiceLibraryCard(
                 ) {
                     Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Preview")
+                    Text(if (isClonedNeural) "Preview AI" else "Preview", maxLines = 1)
                 }
                 Button(
                     onClick = onSelect,
@@ -630,9 +743,9 @@ private fun VoiceLibraryCard(
                     if (isSelected) {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Selected")
+                        Text("Selected", maxLines = 1)
                     } else {
-                        Text("Select")
+                        Text("Select", maxLines = 1)
                     }
                 }
                 IconButton(
@@ -645,6 +758,34 @@ private fun VoiceLibraryCard(
                         imageVector = Icons.Default.PersonAdd,
                         contentDescription = "Assign ${voice.name} to character"
                     )
+                }
+            }
+
+            if (isClonedNeural) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!voice.sampleAudioPath.isNullOrBlank() && File(voice.sampleAudioPath).exists()) {
+                        OutlinedButton(
+                            onClick = onPlayOriginalRef,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("play_ref_${voice.id}")
+                        ) {
+                            Text("Play Original Ref", maxLines = 1)
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = onRegenerateHindi,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("regen_hindi_btn_${voice.id}")
+                    ) {
+                        Text("New Hindi Line", maxLines = 1)
+                    }
                 }
             }
         }

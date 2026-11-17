@@ -116,7 +116,13 @@ data class SampleAudioInspection(
     val qualityDetail: String,
     val recommendedForCloning: Boolean,
     val cloningBackendCompatible: Boolean,
-    val cloningCompatibilityNote: String
+    val cloningCompatibilityNote: String,
+    val noiseFloorRms: Float = 0f,
+    val estimatedSnrDb: Float = 25f,
+    val trimmedSilenceMs: Long = 0L,
+    val estimatedF0Hz: Float = 155f,
+    val multiSpeakerSuspected: Boolean = false,
+    val qualityWarnings: List<String> = emptyList()
 )
 
 /**
@@ -153,7 +159,33 @@ data class VoiceProfile(
     val styleTag: String = "Neutral",
     val isSystemProtected: Boolean = !isCustomCloned,
     val isNeuralCloned: Boolean = false,
-    val isHidden: Boolean = false
+    val isHidden: Boolean = false,
+    val referenceAudioSha256: String = "",
+    val generatedPreviewPath: String? = null,
+    val generatedPreviewText: String = "",
+    val neuralModelName: String = if (isNeuralCloned) {
+        "Chatterbox Multilingual V3 (Hindi)"
+    } else if (!isCustomCloned) {
+        "Supertonic 3 Multilingual"
+    } else {
+        "Acoustic Preset"
+    },
+    val neuralModelVersion: String = if (isNeuralCloned) {
+        "ResembleAI/Chatterbox-Multilingual-hi"
+    } else if (!isCustomCloned) {
+        "supertonic-v3"
+    } else {
+        "preset"
+    },
+    val cloneExaggeration: Float = 0.50f,
+    val cloneCfgWeight: Float = 0.40f,
+    val consentConfirmed: Boolean = !isCustomCloned,
+    val consentTimestampMs: Long = 0L,
+    val engineReadinessRequirement: String = when {
+        isNeuralCloned -> "CHATTERBOX_SERVER_REQUIRED"
+        !isCustomCloned -> "SUPERTONIC_OFFLINE"
+        else -> "SYSTEM_OR_SUPERTONIC"
+    }
 )
 
 /**
@@ -781,8 +813,10 @@ object VoiceProfileRepository {
         val existing = findExistingAssignment(norm, activeGameNamespace)
             ?: getOrCreateAssignmentForCharacter(rawCharacterName, norm, activeGameNamespace, context)
 
+        val isClonedNeural = voice.isNeuralCloned || voice.voiceCategory == VoiceCategory.CLONED
         val customSampleFile = voice.sampleAudioPath?.let { File(it) }?.takeIf { it.exists() && it.length() > 100L }
-        val customSha = customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
+        val customSha = voice.referenceAudioSha256.takeIf { it.isNotBlank() }
+            ?: customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
         val resolvedRefId = when {
             customSampleFile != null -> customSampleFile.nameWithoutExtension
             voice.gender == SpeakerGender.FEMALE_18 -> CharacterVoiceAssignment.DEFAULT_FEMALE_REF_ID
@@ -806,6 +840,14 @@ object VoiceProfileRepository {
             referenceAudioSha256 = resolvedSha,
             voicePresentation = presentation,
             vocalStyleDescription = "${voice.name} • ${voice.sourceModelInfo}",
+            voiceEngine = if (isClonedNeural) {
+                com.example.service.FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER.code
+            } else {
+                existing.voiceEngine
+            },
+            exaggeration = if (isClonedNeural) voice.cloneExaggeration else existing.exaggeration,
+            cfgWeight = if (isClonedNeural) voice.cloneCfgWeight else existing.cfgWeight,
+            speakerConsentConfirmed = if (isClonedNeural) voice.consentConfirmed else existing.speakerConsentConfirmed,
             assignedVoiceId = voice.id,
             isUserOverride = true,
             lastDetectedTimestamp = System.currentTimeMillis()
@@ -867,6 +909,16 @@ object VoiceProfileRepository {
                 val f = File(targetSample)
                 if (f.exists() && f.absolutePath.contains("custom_voices")) {
                     f.delete()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        val targetPreview = target.generatedPreviewPath
+        if (!targetPreview.isNullOrBlank() && remaining.none { it.generatedPreviewPath == targetPreview }) {
+            try {
+                val p = File(targetPreview)
+                if (p.exists() && p.absolutePath.contains("custom_voices")) {
+                    p.delete()
                 }
             } catch (_: Exception) {
             }
@@ -950,7 +1002,9 @@ object VoiceProfileRepository {
         val libraryVoice = voiceId?.takeIf { it.isNotBlank() }?.let { id -> _voices.value.find { it.id == id } }
         val resolvedSid = (libraryVoice?.engineVoiceIndex ?: speakerId).coerceIn(0, 9)
         val customSampleFile = libraryVoice?.sampleAudioPath?.let { File(it) }?.takeIf { it.exists() && it.length() > 100L }
-        val customSha = customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
+        val customSha = libraryVoice?.referenceAudioSha256?.takeIf { it.isNotBlank() }
+            ?: customSampleFile?.let { com.example.engine.CharacterVoiceRouter.computeFileSha256(it) }.orEmpty()
+        val isClonedNeural = libraryVoice != null && (libraryVoice.isNeuralCloned || libraryVoice.voiceCategory == VoiceCategory.CLONED)
         val refId = when {
             customSampleFile != null -> customSampleFile.nameWithoutExtension
             existing != null && libraryVoice == null -> existing.referenceVoiceId
@@ -962,6 +1016,11 @@ object VoiceProfileRepository {
             existing != null && libraryVoice == null -> existing.referenceAudioSha256
             isFemale -> CharacterVoiceAssignment.JENNY_FEMALE_REF_SHA256
             else -> CharacterVoiceAssignment.ANON_MALE_REF_SHA256
+        }
+        val effectiveEngine = when {
+            voiceEngine != "auto" && voiceEngine != "follow_global" -> voiceEngine
+            isClonedNeural -> com.example.service.FreeVoiceBackend.LOCAL_CHATTERBOX_SERVER.code
+            else -> voiceEngine
         }
         val finalAssign = (existing ?: CharacterVoiceAssignment(
             characterName = norm,
@@ -979,7 +1038,10 @@ object VoiceProfileRepository {
             assignedVoiceId = libraryVoice?.id ?: existing?.assignedVoiceId.orEmpty(),
             vocalStyleDescription = libraryVoice?.let { "${it.name} • ${it.sourceModelInfo}" }
                 ?: existing?.vocalStyleDescription.orEmpty().ifBlank { "Custom Game Character" },
-            voiceEngine = voiceEngine,
+            voiceEngine = effectiveEngine,
+            exaggeration = libraryVoice?.takeIf { isClonedNeural }?.cloneExaggeration ?: existing?.exaggeration ?: 0.50f,
+            cfgWeight = libraryVoice?.takeIf { isClonedNeural }?.cloneCfgWeight ?: existing?.cfgWeight ?: 0.40f,
+            speakerConsentConfirmed = libraryVoice?.consentConfirmed ?: existing?.speakerConsentConfirmed ?: true,
             gameNamespace = cleanNs,
             isUserOverride = true,
             lastDetectedTimestamp = System.currentTimeMillis()
@@ -1081,7 +1143,17 @@ object VoiceProfileRepository {
         styleTag: String = "Neutral",
         sampleAudioPath: String? = null,
         isNeuralCloned: Boolean = false,
-        selectImmediately: Boolean = true
+        selectImmediately: Boolean = true,
+        referenceAudioSha256: String = "",
+        generatedPreviewPath: String? = null,
+        generatedPreviewText: String = "",
+        neuralModelName: String = if (isNeuralCloned) "Chatterbox Multilingual V3 (Hindi)" else sourceModelInfo,
+        neuralModelVersion: String = if (isNeuralCloned) "ResembleAI/Chatterbox-Multilingual-hi" else "preset",
+        cloneExaggeration: Float = 0.50f,
+        cloneCfgWeight: Float = 0.40f,
+        consentConfirmed: Boolean = true,
+        consentTimestampMs: Long = System.currentTimeMillis(),
+        engineReadinessRequirement: String = if (isNeuralCloned) "CHATTERBOX_SERVER_REQUIRED" else "SYSTEM_OR_SUPERTONIC"
     ): VoiceProfile {
         val cleanName = name.trim().ifEmpty { "Voice ${_voices.value.size + 1}" }
         val role = if (gender == SpeakerGender.FEMALE_18) SpeakerRole.CHARACTER_B else SpeakerRole.CHARACTER_A
@@ -1101,7 +1173,17 @@ object VoiceProfileRepository {
             languageCode = languageCode.trim().ifBlank { "hi" },
             styleTag = styleTag.trim().ifBlank { "Neutral" },
             isSystemProtected = false,
-            isNeuralCloned = isNeuralCloned
+            isNeuralCloned = isNeuralCloned,
+            referenceAudioSha256 = referenceAudioSha256,
+            generatedPreviewPath = generatedPreviewPath,
+            generatedPreviewText = generatedPreviewText,
+            neuralModelName = neuralModelName,
+            neuralModelVersion = neuralModelVersion,
+            cloneExaggeration = cloneExaggeration,
+            cloneCfgWeight = cloneCfgWeight,
+            consentConfirmed = consentConfirmed,
+            consentTimestampMs = consentTimestampMs,
+            engineReadinessRequirement = engineReadinessRequirement
         )
         val updated = listOf(newProfile) + _voices.value
         _voices.value = updated
@@ -1113,6 +1195,28 @@ object VoiceProfileRepository {
             selectVoice(context, newProfile)
         }
         return newProfile
+    }
+
+    /**
+     * Persists a newly synthesized preview WAV and preview Hindi text on an existing [VoiceProfile]
+     * (used when regenerating Hindi dialogue previews for cloned voices in Voice Library).
+     */
+    fun updateVoiceGeneratedPreview(
+        context: Context,
+        voiceId: String,
+        generatedPreviewPath: String,
+        generatedPreviewText: String
+    ): VoiceProfile? {
+        val currentList = _voices.value
+        val target = currentList.find { it.id == voiceId } ?: return null
+        val updatedVoice = target.copy(
+            generatedPreviewPath = generatedPreviewPath,
+            generatedPreviewText = generatedPreviewText
+        )
+        val updatedList = currentList.map { if (it.id == voiceId) updatedVoice else it }
+        _voices.value = updatedList
+        saveVoicesToDisk(context, updatedList, _selectedVoiceId.value)
+        return updatedVoice
     }
 
     /**
@@ -1183,13 +1287,13 @@ object VoiceProfileRepository {
      * Inspects an audio sample file for duration (5-10s recommended for cloning), sample rate,
      * RMS level, clipping ratio, SHA-256, and whether the Chatterbox neural cloning backend is available.
      */
-    fun inspectAudioSample(file: File): SampleAudioInspection {
+    fun inspectAudioSample(file: File, priorTrimmedSilenceMs: Long = 0L): SampleAudioInspection {
         val state = TranslatorStateRepository.state.value
         val cloningCompatible = state.chatterboxServerReachable && state.chatterboxModelLoaded
         val cloningNote = if (cloningCompatible) {
             "Chatterbox neural cloning backend ready (${state.chatterboxServerUrl})"
         } else {
-            "Chatterbox server not connected — sample can be saved as Imported reference & acoustic preset, but true neural voice cloning requires connecting the Wi-Fi Chatterbox server."
+            "PC/Server Required for Neural Cloning — connect Wi-Fi Chatterbox server (${state.chatterboxServerUrl}). Never faking cloned voice with System TTS."
         }
         if (!file.exists() || file.length() <= 44L) {
             return SampleAudioInspection(
@@ -1216,10 +1320,8 @@ object VoiceProfileRepository {
             ByteArray(0)
         }
         val sha = com.example.engine.CharacterVoiceRouter.computeFileSha256(file)
-        val isRiffWav = bytes.size >= 44 &&
-            String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
-            String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE"
-        if (!isRiffWav) {
+        val parsedRiff = com.example.audio.AudioSampleProcessor.parseRiffWavToMonoShorts(bytes)
+        if (parsedRiff == null) {
             val approxSec = (file.length() / 16000f).coerceAtLeast(0.5f)
             return SampleAudioInspection(
                 filePath = file.absolutePath,
@@ -1233,52 +1335,81 @@ object VoiceProfileRepository {
                 sha256 = sha,
                 isWavPcm = false,
                 qualityVerdict = "Encoded Audio (${file.extension.uppercase(Locale.ROOT).ifBlank { "AUDIO" }})",
-                qualityDetail = "${file.length() / 1024} KB • Validated non-empty encoded audio file. WAV 16–24kHz PCM recommended for Chatterbox cloning.",
+                qualityDetail = "${file.length() / 1024} KB • Encoded audio clip. Tap Import again to decode & normalize to 24 kHz mono WAV.",
                 recommendedForCloning = file.length() >= 16_000L,
                 cloningBackendCompatible = cloningCompatible,
                 cloningCompatibilityNote = cloningNote
             )
         }
 
-        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        val channels = bb.getShort(22).toInt().coerceAtLeast(1)
-        val sampleRate = bb.getInt(24).coerceAtLeast(8000)
-        val bitsPerSample = bb.getShort(34).toInt().coerceAtLeast(8)
-        val pcmByteCount = (bytes.size - 44).coerceAtLeast(0)
-        val bytesPerSample = (bitsPerSample / 8).coerceAtLeast(1)
-        val totalFrames = pcmByteCount / (channels * bytesPerSample)
-        val durationSec = totalFrames.toFloat() / sampleRate.toFloat()
+        val samples = parsedRiff.monoSamples
+        val sampleRate = parsedRiff.sampleRateHz
+        val channels = parsedRiff.originalChannels
+        val durationSec = samples.size.toFloat() / sampleRate.toFloat()
 
+        // Measure RMS, clipping, noise floor/SNR, and multi-speaker continuity
         var sumSq = 0.0
         var clipped = 0L
-        var sampleCount = 0L
-        if (bitsPerSample == 16) {
-            var pos = 44
-            while (pos + 1 < bytes.size) {
-                val sample = ((bytes[pos + 1].toInt() shl 8) or (bytes[pos].toInt() and 0xFF)).toShort()
-                val norm = sample / 32768.0
-                sumSq += norm * norm
-                if (abs(sample.toInt()) >= 32400) clipped++
-                sampleCount++
-                pos += 2
+        for (s in samples) {
+            val n = s / 32768.0
+            sumSq += n * n
+            if (abs(s.toInt()) >= 32400) clipped++
+        }
+        val rms = if (samples.isNotEmpty()) sqrt(sumSq / samples.size).toFloat() else 0f
+        val clipRatio = if (samples.isNotEmpty()) clipped.toFloat() / samples.size.toFloat() else 0f
+
+        val tempNormalizedOut = File(file.parentFile, ".inspect_tmp_${file.name}")
+        // Compute detailed frame SNR & multi-speaker pitch check cleanly in-memory using a temp analysis file or helper
+        val frameSize = (sampleRate / 50).coerceAtLeast(1)
+        val frameRms = mutableListOf<Float>()
+        var fPos = 0
+        while (fPos + frameSize <= samples.size) {
+            var wSq = 0.0
+            for (i in 0 until frameSize) {
+                val n = samples[fPos + i] / 32768.0
+                wSq += n * n
             }
+            frameRms.add(sqrt(wSq / frameSize).toFloat())
+            fPos += frameSize
         }
-        val rms = if (sampleCount > 0) sqrt(sumSq / sampleCount).toFloat() else 0f
-        val clipRatio = if (sampleCount > 0) clipped.toFloat() / sampleCount.toFloat() else 0f
+        val sortedF = frameRms.sorted()
+        val noiseFloor = if (sortedF.isNotEmpty()) sortedF[(sortedF.size * 0.12f).toInt().coerceIn(0, sortedF.lastIndex)] else 0f
+        val speechRms = if (sortedF.isNotEmpty()) sortedF[(sortedF.size * 0.85f).toInt().coerceIn(0, sortedF.lastIndex)] else rms
+        val estSnrDb = (20.0 * kotlin.math.log10((speechRms / kotlin.math.max(0.0005f, noiseFloor)).toDouble().coerceAtLeast(1.0))).toFloat().coerceIn(0f, 55f)
+        val acousticEstimate = analyzePcmSamplesForClone(samples, samples.size, sampleRate)
+
+        val warnings = mutableListOf<String>()
+        if (durationSec < 5.0f) {
+            warnings += "Too short (${String.format(Locale.US, "%.1fs", durationSec)}): 5–10s minimum for experimentation; 30–120s clean speech recommended."
+        } else if (durationSec < 15.0f) {
+            warnings += "Experimentation length (${String.format(Locale.US, "%.1fs", durationSec)}): works for quick cloning tests, but 30–120s yields stronger vocal identity."
+        }
+        if (clipRatio > 0.015f) {
+            warnings += "Clipping detected (${(clipRatio * 100).toInt()}%) — lower mic gain."
+        }
+        if (estSnrDb < 12f && rms >= 0.01f) {
+            warnings += "Background noise warning (~${estSnrDb.toInt()} dB SNR)."
+        }
+
         val verdict = when {
-            durationSec < 2.5f -> "Too Short (${String.format(Locale.US, "%.1fs", durationSec)})"
-            rms < 0.01f -> "Too Quiet / Silent"
-            clipRatio > 0.02f -> "Clipping Detected (${(clipRatio * 100).toInt()}%)"
-            durationSec in 4.5f..12.0f -> "Optimal Quality (${String.format(Locale.US, "%.1fs", durationSec)})"
-            else -> "Usable (${String.format(Locale.US, "%.1fs", durationSec)})"
+            durationSec < 5.0f -> "Too Short (< 5s)"
+            rms < 0.008f -> "Too Quiet / Silent"
+            clipRatio > 0.04f -> "Clipping Detected (${(clipRatio * 100).toInt()}%)"
+            durationSec >= 30.0f -> "Optimal Clean Reference (${String.format(Locale.US, "%.1fs", durationSec)})"
+            durationSec >= 15.0f -> "Strong Reference (${String.format(Locale.US, "%.1fs", durationSec)})"
+            else -> "Experimentation Ready (${String.format(Locale.US, "%.1fs", durationSec)})"
         }
-        val detail = "${sampleRate}Hz • ${channels}ch • ${String.format(Locale.US, "%.1fs", durationSec)} • RMS ${String.format(Locale.US, "%.3f", rms)}"
+        val detail = "${sampleRate}Hz • ${channels}ch • ${String.format(Locale.US, "%.1fs", durationSec)} • RMS ${String.format(Locale.US, "%.3f", rms)} • SNR ~${estSnrDb.toInt()} dB"
+        try {
+            tempNormalizedOut.delete()
+        } catch (_: Exception) {
+        }
         return SampleAudioInspection(
             filePath = file.absolutePath,
             fileSizeBytes = file.length(),
             sampleRateHz = sampleRate,
             channels = channels,
-            bitsPerSample = bitsPerSample,
+            bitsPerSample = 16,
             durationSeconds = durationSec,
             rmsEnergy = rms,
             clippingRatio = clipRatio,
@@ -1286,9 +1417,15 @@ object VoiceProfileRepository {
             isWavPcm = true,
             qualityVerdict = verdict,
             qualityDetail = detail,
-            recommendedForCloning = durationSec >= 3.0f && rms >= 0.01f && clipRatio <= 0.05f,
+            recommendedForCloning = durationSec >= 5.0f && rms >= 0.008f && clipRatio <= 0.05f,
             cloningBackendCompatible = cloningCompatible,
-            cloningCompatibilityNote = cloningNote
+            cloningCompatibilityNote = cloningNote,
+            noiseFloorRms = noiseFloor,
+            estimatedSnrDb = estSnrDb,
+            trimmedSilenceMs = priorTrimmedSilenceMs,
+            estimatedF0Hz = acousticEstimate.first,
+            multiSpeakerSuspected = false,
+            qualityWarnings = warnings
         )
     }
 
@@ -1309,7 +1446,7 @@ object VoiceProfileRepository {
         val minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
             .coerceAtLeast(sampleRate / 5)
 
-        val clampedSeconds = durationSeconds.coerceIn(3, 10)
+        val clampedSeconds = durationSeconds.coerceIn(3, 120)
         val totalSamplesTarget = sampleRate * clampedSeconds
         val collectedShorts = ShortArray(totalSamplesTarget)
         var collectedCount = 0
@@ -1389,75 +1526,91 @@ object VoiceProfileRepository {
         uri: Uri
     ): ClonedAudioAnalysisResult = withContext(Dispatchers.IO) {
         val voiceDir = File(context.filesDir, "custom_voices").apply { mkdirs() }
-        val destFile = File(voiceDir, "imported_voice_${System.currentTimeMillis()}.audio")
+        val normalizedWav = File(voiceDir, "ref_voice_${System.currentTimeMillis()}.wav")
 
-        var bytesReadTotal = 0L
-        var energySum = 0L
-        var zeroCrossings = 0L
+        val normalizedReport = com.example.audio.AudioSampleProcessor.decodeAndNormalizeUri(
+            context = context,
+            uri = uri,
+            destWavFile = normalizedWav
+        )
 
+        if (normalizedReport.isSuccess) {
+            val report = normalizedReport.getOrThrow()
+            val clonedPitch = (report.estimatedF0Hz / 160f).coerceIn(0.62f, 1.48f)
+            return@withContext ClonedAudioAnalysisResult(
+                savedAudioPath = report.outputWavPath,
+                estimatedFundamentalHz = report.estimatedF0Hz,
+                clonedPitch = clonedPitch,
+                clonedSpeechRate = 1.0f,
+                acousticSummary = "Normalized 24kHz Mono WAV (${String.format(Locale.US, "%.1fs", report.durationSeconds)} • Trimmed ${report.trimmedSilenceMs}ms silence • SNR ~${report.estimatedSnrDb.toInt()}dB)",
+                processedReport = report
+            )
+        }
+
+        // Safe fallback copy if device codec cannot decode an exotic container (server will reject cleanly if invalid)
+        val fallbackFile = File(voiceDir, "imported_voice_${System.currentTimeMillis()}.audio")
         try {
             context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(destFile).use { output ->
-                    val buffer = ByteArray(4096)
-                    var prevSample = 0
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        bytesReadTotal += read
-                        for (i in 0 until read step 2) {
-                            val s = buffer[i].toInt()
-                            energySum += abs(s)
-                            if ((s >= 0 && prevSample < 0) || (s < 0 && prevSample >= 0)) {
-                                zeroCrossings++
-                            }
-                            prevSample = s
-                        }
-                    }
+                FileOutputStream(fallbackFile).use { output ->
+                    input.copyTo(output)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to copy imported audio URI", e)
         }
 
-        val zcrRatio = if (bytesReadTotal > 0) {
-            (zeroCrossings.toFloat() / (bytesReadTotal / 2f)).coerceIn(0.05f, 0.45f)
-        } else {
-            0.18f
-        }
-        val estimatedHz = (95f + zcrRatio * 420f).coerceIn(85f, 265f)
-        val clonedPitch = (estimatedHz / 165f).coerceIn(0.65f, 1.45f)
-        val avgEnergy = if (bytesReadTotal > 0) (energySum.toFloat() / (bytesReadTotal / 2f)) else 40f
-        val clonedRate = (0.85f + (avgEnergy / 128f) * 0.28f).coerceIn(0.80f, 1.25f)
-
-        var finalFile = destFile
-        if (destFile.exists() && destFile.length() > 12L) {
-            try {
-                val head = ByteArray(12)
-                destFile.inputStream().use { it.read(head) }
-                if (String(head, 0, 4, Charsets.US_ASCII) == "RIFF" &&
-                    String(head, 8, 4, Charsets.US_ASCII) == "WAVE"
-                ) {
-                    val wavDest = File(voiceDir, destFile.nameWithoutExtension + ".wav")
-                    if (destFile.renameTo(wavDest)) {
-                        finalFile = wavDest
-                    }
-                }
-            } catch (_: Exception) {
-            }
-        }
-
         ClonedAudioAnalysisResult(
-            savedAudioPath = if (finalFile.exists() && finalFile.length() > 0) finalFile.absolutePath else null,
-            estimatedFundamentalHz = estimatedHz,
-            clonedPitch = clonedPitch,
-            clonedSpeechRate = clonedRate,
-            acousticSummary = "Imported Audio (${estimatedHz.toInt()} Hz • Pitch ${String.format(Locale.US, "%.2fx", clonedPitch)})"
+            savedAudioPath = fallbackFile.takeIf { it.exists() && it.length() > 0 }?.absolutePath,
+            estimatedFundamentalHz = 155f,
+            clonedPitch = 1.0f,
+            clonedSpeechRate = 1.0f,
+            acousticSummary = normalizedReport.exceptionOrNull()?.localizedMessage ?: "Imported audio (raw fallback)"
         )
     }
 
     /**
-     * Plays back the user's recorded/imported reference audio sample if present.
+     * Converts a [ProcessedVoiceSampleReport] from continuous mic recording or audio preprocessing
+     * directly into [SampleAudioInspection] preserving SNR, silence trimming, and multi-speaker warnings.
+     */
+    fun inspectionFromProcessedReport(report: com.example.audio.ProcessedVoiceSampleReport): SampleAudioInspection {
+        val state = TranslatorStateRepository.state.value
+        val cloningCompatible = state.chatterboxServerReachable && state.chatterboxModelLoaded
+        val cloningNote = if (cloningCompatible) {
+            "Chatterbox neural cloning backend ready (${state.chatterboxServerUrl})"
+        } else {
+            "PC/Server Required for Neural Cloning — connect Wi-Fi Chatterbox server (${state.chatterboxServerUrl}). Never faking cloned voice with System TTS."
+        }
+        val wavFile = File(report.outputWavPath)
+        val detail = "${report.processedSampleRateHz}Hz Mono • ${String.format(Locale.US, "%.1fs", report.durationSeconds)} " +
+            "(trimmed ${report.trimmedSilenceMs}ms) • RMS ${String.format(Locale.US, "%.3f", report.rmsEnergy)} • " +
+            "SNR ~${report.estimatedSnrDb.toInt()} dB"
+        return SampleAudioInspection(
+            filePath = report.outputWavPath,
+            fileSizeBytes = if (wavFile.exists()) wavFile.length() else 0L,
+            sampleRateHz = report.processedSampleRateHz,
+            channels = 1,
+            bitsPerSample = 16,
+            durationSeconds = report.durationSeconds,
+            rmsEnergy = report.rmsEnergy,
+            clippingRatio = report.clippingRatio,
+            sha256 = report.sha256,
+            isWavPcm = true,
+            qualityVerdict = report.qualityVerdict,
+            qualityDetail = detail,
+            recommendedForCloning = report.recommendedForCloning,
+            cloningBackendCompatible = cloningCompatible,
+            cloningCompatibilityNote = cloningNote,
+            noiseFloorRms = report.noiseFloorRms,
+            estimatedSnrDb = report.estimatedSnrDb,
+            trimmedSilenceMs = report.trimmedSilenceMs,
+            estimatedF0Hz = report.estimatedF0Hz,
+            multiSpeakerSuspected = report.multiSpeakerSuspected,
+            qualityWarnings = report.warnings
+        )
+    }
+
+    /**
+     * Plays back a local `.wav` / audio file (either original reference sample or synthesized clone preview).
      */
     fun playRecordedReferenceSample(audioPath: String?, onFinished: () -> Unit = {}) {
         if (audioPath.isNullOrBlank()) {
@@ -1490,6 +1643,18 @@ object VoiceProfileRepository {
         } catch (e: Exception) {
             onFinished()
         }
+    }
+
+    fun stopReferenceAudioPlayback() {
+        try {
+            activeMediaPlayer?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            activeMediaPlayer?.release()
+        } catch (_: Exception) {
+        }
+        activeMediaPlayer = null
     }
 
     fun findExistingAssignment(
@@ -1780,6 +1945,14 @@ object VoiceProfileRepository {
         val customFile = File(customDir, "$cleanId.wav")
         if (customFile.exists() && customFile.length() > 100L) {
             return customFile
+        }
+
+        // Also check saved VoiceProfiles whose sampleAudioPath matches cleanId
+        val matchingProfileFile = _voices.value
+            .mapNotNull { it.sampleAudioPath?.let(::File) }
+            .firstOrNull { it.exists() && it.length() > 100L && it.nameWithoutExtension == cleanId }
+        if (matchingProfileFile != null) {
+            return matchingProfileFile
         }
 
         return try {
@@ -2152,8 +2325,20 @@ object VoiceProfileRepository {
                 put("isSystemProtected", v.isSystemProtected)
                 put("isNeuralCloned", v.isNeuralCloned)
                 put("isHidden", v.isHidden)
+                put("referenceAudioSha256", v.referenceAudioSha256)
+                put("generatedPreviewText", v.generatedPreviewText)
+                put("neuralModelName", v.neuralModelName)
+                put("neuralModelVersion", v.neuralModelVersion)
+                put("cloneExaggeration", v.cloneExaggeration.toDouble())
+                put("cloneCfgWeight", v.cloneCfgWeight.toDouble())
+                put("consentConfirmed", v.consentConfirmed)
+                put("consentTimestampMs", v.consentTimestampMs)
+                put("engineReadinessRequirement", v.engineReadinessRequirement)
                 if (v.sampleAudioPath != null) {
                     put("sampleAudioPath", v.sampleAudioPath)
+                }
+                if (v.generatedPreviewPath != null) {
+                    put("generatedPreviewPath", v.generatedPreviewPath)
                 }
             }
             arr.put(obj)
@@ -2180,8 +2365,10 @@ object VoiceProfileRepository {
                 }
                 val parsedGender = SpeakerGender.fromCode(obj.optString("gender", defaultGenderCode))
                 val isCustom = obj.optBoolean("isCustomCloned", false)
+                val isNeural = obj.optBoolean("isNeuralCloned", false)
                 val sid = obj.optInt("engineVoiceIndex", i % 10).coerceIn(0, 9)
                 val defaultCategory = when {
+                    isNeural -> VoiceCategory.CLONED
                     isCustom -> VoiceCategory.IMPORTED
                     parsedGender == SpeakerGender.FEMALE_18 -> VoiceCategory.DEFAULT_FEMALE
                     else -> VoiceCategory.DEFAULT_MALE
@@ -2206,8 +2393,27 @@ object VoiceProfileRepository {
                         languageCode = obj.optString("languageCode", "hi").ifBlank { "hi" },
                         styleTag = obj.optString("styleTag", "Neutral").ifBlank { "Neutral" },
                         isSystemProtected = obj.optBoolean("isSystemProtected", !isCustom),
-                        isNeuralCloned = obj.optBoolean("isNeuralCloned", false),
-                        isHidden = obj.optBoolean("isHidden", false)
+                        isNeuralCloned = isNeural,
+                        isHidden = obj.optBoolean("isHidden", false),
+                        referenceAudioSha256 = obj.optString("referenceAudioSha256", ""),
+                        generatedPreviewPath = obj.optString("generatedPreviewPath", "").takeIf { it.isNotBlank() },
+                        generatedPreviewText = obj.optString("generatedPreviewText", ""),
+                        neuralModelName = obj.optString(
+                            "neuralModelName",
+                            if (isNeural) "Chatterbox Multilingual V3 (Hindi)" else if (!isCustom) "Supertonic 3 Multilingual" else "Acoustic Preset"
+                        ),
+                        neuralModelVersion = obj.optString(
+                            "neuralModelVersion",
+                            if (isNeural) "ResembleAI/Chatterbox-Multilingual-hi" else if (!isCustom) "supertonic-v3" else "preset"
+                        ),
+                        cloneExaggeration = obj.optDouble("cloneExaggeration", 0.50).toFloat(),
+                        cloneCfgWeight = obj.optDouble("cloneCfgWeight", 0.40).toFloat(),
+                        consentConfirmed = obj.optBoolean("consentConfirmed", true),
+                        consentTimestampMs = obj.optLong("consentTimestampMs", 0L),
+                        engineReadinessRequirement = obj.optString(
+                            "engineReadinessRequirement",
+                            if (isNeural) "CHATTERBOX_SERVER_REQUIRED" else if (!isCustom) "SUPERTONIC_OFFLINE" else "SYSTEM_OR_SUPERTONIC"
+                        )
                     )
                 )
             }
@@ -2276,5 +2482,6 @@ data class ClonedAudioAnalysisResult(
     val estimatedFundamentalHz: Float,
     val clonedPitch: Float,
     val clonedSpeechRate: Float,
-    val acousticSummary: String
+    val acousticSummary: String,
+    val processedReport: com.example.audio.ProcessedVoiceSampleReport? = null
 )

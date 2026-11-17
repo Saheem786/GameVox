@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import com.example.data.CharacterVoiceAssignment
 import com.example.data.VoiceProfile
 
@@ -294,6 +296,79 @@ fun DeleteVoiceConfirmationDialog(
                 modifier = Modifier.testTag("cancel_delete_voice_button")
             ) {
                 Text(if (voice.isSystemProtected) "Close" else "Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun RegenerateClonedHindiDialog(
+    voice: VoiceProfile,
+    initialHindiText: String,
+    isSynthesizing: Boolean,
+    onDismiss: () -> Unit,
+    onConfirmSynthesize: (String) -> Unit
+) {
+    var hindiInput by remember(voice.id, initialHindiText) { mutableStateOf(initialHindiText) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isSynthesizing) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .widthIn(max = 520.dp),
+        title = {
+            Text(
+                text = "Synthesize New Hindi Line",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Generate new Hindi speech in \"${voice.name}\"'s cloned voice via Chatterbox Multilingual V3 (${voice.neuralModelVersion}).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = hindiInput,
+                    onValueChange = { hindiInput = it },
+                    label = { Text("Hindi Dialogue Text") },
+                    singleLine = true,
+                    enabled = !isSynthesizing,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("regenerate_hindi_input")
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val clean = hindiInput.trim()
+                    if (clean.isNotEmpty()) {
+                        onConfirmSynthesize(clean)
+                    }
+                },
+                enabled = !isSynthesizing && hindiInput.trim().isNotEmpty(),
+                modifier = Modifier.testTag("regenerate_hindi_confirm_button")
+            ) {
+                Text(if (isSynthesizing) "Synthesizing..." else "Synthesize & Play")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                enabled = !isSynthesizing,
+                modifier = Modifier.testTag("regenerate_hindi_cancel_button")
+            ) {
+                Text("Cancel")
             }
         }
     )

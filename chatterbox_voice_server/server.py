@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+    from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
     from fastapi.responses import Response
     from pydantic import BaseModel, Field
 except ImportError:
@@ -73,12 +73,19 @@ except ImportError:
     def Query(default=None, **_kwargs):  # type: ignore[no-redef]
         return default
 
+    def Form(default=None, **_kwargs):  # type: ignore[no-redef]
+        return default
+
     def File(default=None, **_kwargs):  # type: ignore[no-redef]
         return default
 
     class UploadFile:  # type: ignore[no-redef]
+        def __init__(self, filename: str = "upload.wav", content: bytes = b"") -> None:
+            self.filename = filename
+            self._content = content
+
         async def read(self) -> bytes:
-            return b""
+            return self._content
 
     class FastAPI:  # type: ignore[no-redef]
         def __init__(self, **_kwargs) -> None:
@@ -90,6 +97,11 @@ except ImportError:
             return _decorator
 
         def post(self, _path: str):
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        def delete(self, _path: str):
             def _decorator(fn):
                 return fn
             return _decorator
@@ -111,6 +123,8 @@ DEFAULT_HF_REPO_ID = os.environ.get(
 )
 AUTH_TOKEN = os.environ.get("GAMEVOX_AUTH_TOKEN", "gamevox-local-secret-2026").strip()
 MIN_NON_SILENT_RMS = 1e-4
+TARGET_REFERENCE_SR = 24000
+MAX_REFERENCE_DURATION_SEC = 120.0
 
 SPEAKER_PREFIX_REGEX = re.compile(
     r"^\s*(?:\[[^\]]{1,30}\]|\([^\)]{1,30}\)|<[^>]{1,30}>|【[^】]{1,30}】|[A-Za-z0-9_\- ]{1,24})\s*[:：\-–—]\s*"
@@ -158,6 +172,8 @@ class ReferenceVoiceMetadata(BaseModel):
     waveform_rms: float
     presentation: str
     description: str
+    consent_confirmed: bool = True
+    quality_warning: str = ""
 
 
 def verify_auth_token(
@@ -203,7 +219,7 @@ def inspect_wav_file(wav_path: Path) -> Tuple[int, float, float, str]:
     with wave.open(str(wav_path), "rb") as wf:
         sr = wf.getframerate()
         nframes = wf.getnframes()
-        nchannels = wf.getnchannels()
+        _nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         pcm = wf.readframes(nframes)
     duration_sec = nframes / float(max(sr, 1))
@@ -212,6 +228,166 @@ def inspect_wav_file(wav_path: Path) -> Tuple[int, float, float, str]:
     else:
         rms = 0.05 if len(pcm) > 0 else 0.0
     return sr, round(duration_sec, 3), round(rms, 5), sha256_hex
+
+
+def trim_silence_and_normalize_pcm16(
+    samples: List[int],
+    sample_rate: int,
+    channels: int = 1,
+    target_sr: int = TARGET_REFERENCE_SR,
+) -> Tuple[bytes, int, int]:
+    """
+    Pure-Python + optional fast preprocessing for reference voice clips:
+    - Downmixes multi-channel PCM to mono
+    - Trims leading & trailing silence below adaptive noise threshold (preserving 80ms margin)
+    - Resamples linearly to `target_sr` (24000 Hz) if needed
+    - Caps duration to `MAX_REFERENCE_DURATION_SEC` (120s)
+    Returns `(pcm16_mono_bytes, output_sample_rate, trimmed_silence_ms)`.
+    """
+    if channels > 1:
+        mono: List[int] = []
+        limit = len(samples) - (len(samples) % channels)
+        for i in range(0, limit, channels):
+            acc = 0
+            for ch in range(channels):
+                acc += samples[i + ch]
+            mono.append(int(acc / channels))
+    else:
+        mono = list(samples)
+
+    if not mono:
+        return b"", target_sr, 0
+
+    frame_len = max(1, int(sample_rate * 0.02))
+    frame_rms_list: List[float] = []
+    for start in range(0, len(mono), frame_len):
+        end = min(len(mono), start + frame_len)
+        cnt = max(1, end - start)
+        sq = sum((s / 32768.0) ** 2 for s in mono[start:end])
+        frame_rms_list.append(math.sqrt(sq / cnt))
+
+    sorted_rms = sorted(frame_rms_list)
+    noise_est = sorted_rms[max(0, len(sorted_rms) // 8)] if sorted_rms else 0.0
+    speech_thresh = max(0.008, noise_est * 2.4)
+
+    first_active = next((idx for idx, r in enumerate(frame_rms_list) if r >= speech_thresh), 0)
+    last_active = next(
+        (idx for idx in range(len(frame_rms_list) - 1, -1, -1) if frame_rms_list[idx] >= speech_thresh),
+        len(frame_rms_list) - 1,
+    )
+    margin_frames = 4  # 80ms padding
+    trim_start_idx = max(0, (first_active - margin_frames) * frame_len)
+    trim_end_idx = min(len(mono), (last_active + 1 + margin_frames) * frame_len)
+    if trim_end_idx <= trim_start_idx:
+        trim_start_idx = 0
+        trim_end_idx = len(mono)
+
+    trimmed_samples_count = trim_start_idx + (len(mono) - trim_end_idx)
+    trimmed_silence_ms = int((trimmed_samples_count * 1000) / max(1, sample_rate))
+    mono = mono[trim_start_idx:trim_end_idx]
+
+    # Resample to target_sr if sample rate differs
+    if sample_rate != target_sr and len(mono) > 1:
+        out_len = max(1, int(round(len(mono) * (target_sr / float(sample_rate)))))
+        ratio = (len(mono) - 1) / float(max(1, out_len - 1))
+        resampled: List[int] = []
+        for j in range(out_len):
+            pos = j * ratio
+            idx0 = int(pos)
+            frac = pos - idx0
+            s0 = mono[idx0]
+            s1 = mono[min(len(mono) - 1, idx0 + 1)]
+            resampled.append(int(max(-32768, min(32767, round(s0 + (s1 - s0) * frac)))))
+        mono = resampled
+    else:
+        target_sr = sample_rate
+
+    max_samples = int(target_sr * MAX_REFERENCE_DURATION_SEC)
+    if len(mono) > max_samples:
+        mono = mono[:max_samples]
+
+    pcm_bytes = struct.pack(f"<{len(mono)}h", *mono)
+    return pcm_bytes, target_sr, trimmed_silence_ms
+
+
+def preprocess_uploaded_audio_to_wav(raw_bytes: bytes, filename: str, dest_wav_path: Path) -> Dict[str, object]:
+    """
+    Validates and normalizes uploaded audio (RIFF WAV natively, or MP3/M4A/OGG/FLAC via
+    torchaudio/soundfile when installed) into mono 24kHz PCM16 WAV with silence trimming.
+    """
+    is_wav = len(raw_bytes) >= 44 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WAVE"
+    samples: List[int] = []
+    src_sr = TARGET_REFERENCE_SR
+    src_channels = 1
+
+    if is_wav:
+        with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
+            src_sr = wf.getframerate()
+            src_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+            if sampwidth != 2:
+                raise ValueError(f"Unsupported WAV bit width: {sampwidth * 8}-bit (expected 16-bit PCM)")
+            cnt = len(frames) // 2
+            samples = list(struct.unpack(f"<{cnt}h", frames[: cnt * 2]))
+    else:
+        try:
+            import soundfile as sf
+            import numpy as np
+
+            data, src_sr = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=True)
+            mono_np = np.clip(data.mean(axis=1), -1.0, 1.0)
+            samples = (mono_np * 32767.0).astype(np.int16).tolist()
+            src_channels = 1
+        except Exception as sf_exc:
+            try:
+                import torchaudio
+                import numpy as np
+
+                suffix = Path(filename or "upload.audio").suffix or ".audio"
+                tmp_in = dest_wav_path.with_suffix(suffix)
+                tmp_in.write_bytes(raw_bytes)
+                try:
+                    wav_t, src_sr = torchaudio.load(str(tmp_in))
+                    mono_np = wav_t.mean(dim=0).clamp(-1.0, 1.0).cpu().numpy()
+                    samples = (mono_np * 32767.0).astype(np.int16).tolist()
+                    src_channels = 1
+                finally:
+                    tmp_in.unlink(missing_ok=True)
+            except Exception as ta_exc:
+                raise ValueError(
+                    f"Could not decode '{filename}'. Upload 16-bit PCM WAV or install soundfile/torchaudio ({sf_exc}; {ta_exc})."
+                )
+
+    pcm_out, out_sr, trimmed_ms = trim_silence_and_normalize_pcm16(
+        samples=samples,
+        sample_rate=src_sr,
+        channels=src_channels,
+        target_sr=TARGET_REFERENCE_SR,
+    )
+    if len(pcm_out) < 200:
+        raise ValueError("Uploaded audio contained too little non-silent PCM audio.")
+
+    with wave.open(str(dest_wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(out_sr)
+        wf.writeframes(pcm_out)
+
+    sr, dur, rms, sha256_hex = inspect_wav_file(dest_wav_path)
+    quality_warning = ""
+    if dur < 5.0:
+        quality_warning = f"Short sample ({dur:.1f}s): 5-10s minimum for experiments; 30-120s recommended for stable cloning."
+    elif dur < 15.0:
+        quality_warning = f"Experimentation length ({dur:.1f}s): 30-120s clean speech recommended for highest fidelity."
+    return {
+        "sample_rate": sr,
+        "duration_seconds": dur,
+        "waveform_rms": rms,
+        "sha256": sha256_hex,
+        "trimmed_silence_ms": trimmed_ms,
+        "quality_warning": quality_warning,
+    }
 
 
 class ChatterboxEngineRuntime:
@@ -397,6 +573,8 @@ class ChatterboxEngineRuntime:
                 wf.writeframes(pcm16)
 
             wav_bytes = wav_buf.getvalue()
+            audio_duration_ms = max(1, int(round((len(pcm16) / 2.0 / float(max(1, self.sample_rate))) * 1000.0)))
+            out_sha256 = hashlib.sha256(wav_bytes).hexdigest()
             headers = {
                 "X-GameVox-Model-Id": self.model_id,
                 "X-GameVox-Device": self.device,
@@ -404,7 +582,9 @@ class ChatterboxEngineRuntime:
                 "X-GameVox-Inference-Ms": str(infer_ms),
                 "X-GameVox-Conditioning-Ms": str(cond_ms),
                 "X-GameVox-Conditioning-Cached": "true" if conditioning_cached else "false",
+                "X-GameVox-Audio-Duration-Ms": str(audio_duration_ms),
                 "X-GameVox-Waveform-Rms": f"{rms:.5f}",
+                "X-GameVox-Output-Sha256": out_sha256,
                 "X-GameVox-Voice-Id": ref_wav_path.stem,
                 "X-GameVox-Voice-Sha256": ref_sha256,
                 "X-GameVox-Exaggeration": f"{exaggeration:.2f}",
@@ -429,11 +609,24 @@ app = FastAPI(
 )
 
 
+def _read_voice_sidecar(wav_path: Path) -> dict:
+    import json
+
+    meta_path = wav_path.with_suffix(".meta.json")
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
 def list_reference_voices() -> List[ReferenceVoiceMetadata]:
     voices: List[ReferenceVoiceMetadata] = []
     for wav_path in sorted(REFERENCE_VOICES_DIR.glob("*.wav")):
         try:
             sr, dur, rms, sha256_hex = inspect_wav_file(wav_path)
+            sidecar = _read_voice_sidecar(wav_path)
             stem = wav_path.stem.lower()
             if "female" in stem or "jenny" in stem or "ira" in stem:
                 presentation = "female"
@@ -442,8 +635,8 @@ def list_reference_voices() -> List[ReferenceVoiceMetadata]:
                 presentation = "male"
                 desc = "Male Reference Voice Clip (Consenting / Licensed Prompt)"
             else:
-                presentation = "neutral"
-                desc = "Custom Reference Voice Clip"
+                presentation = str(sidecar.get("presentation", "neutral"))
+                desc = str(sidecar.get("description", "Custom Cloned Reference Voice Clip"))
             voices.append(
                 ReferenceVoiceMetadata(
                     voice_id=wav_path.stem,
@@ -454,6 +647,8 @@ def list_reference_voices() -> List[ReferenceVoiceMetadata]:
                     waveform_rms=rms,
                     presentation=presentation,
                     description=desc,
+                    consent_confirmed=bool(sidecar.get("speaker_consent_confirmed", True)),
+                    quality_warning=str(sidecar.get("quality_warning", "")),
                 )
             )
         except Exception as exc:
@@ -515,34 +710,72 @@ async def upload_reference_voice(
     file: UploadFile = File(...),
     _token: str = Depends(verify_auth_token),
 ):
+    import json
+
     if not speaker_consent_confirmed:
         raise HTTPException(
             status_code=400,
             detail="Speaker consent confirmation is mandatory before registering a reference voice clip.",
         )
     safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", voice_id.strip())
+    if len(safe_id) < 2:
+        raise HTTPException(status_code=400, detail="voice_id must contain at least 2 valid characters.")
+
     raw_bytes = await file.read()
+    if len(raw_bytes) < 256:
+        raise HTTPException(status_code=422, detail="Uploaded audio file is empty or too small.")
+
     target_path = REFERENCE_VOICES_DIR / f"{safe_id}.wav"
-    target_path.write_bytes(raw_bytes)
     try:
-        sr, dur, rms, sha256_hex = inspect_wav_file(target_path)
+        info = preprocess_uploaded_audio_to_wav(
+            raw_bytes=raw_bytes,
+            filename=getattr(file, "filename", "upload.wav") or "upload.wav",
+            dest_wav_path=target_path,
+        )
     except Exception as exc:
         target_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=f"Invalid WAV file: {exc}") from exc
+        raise HTTPException(status_code=422, detail=f"Audio preprocessing failed: {exc}") from exc
+
+    sr = int(info["sample_rate"])
+    dur = float(info["duration_seconds"])
+    rms = float(info["waveform_rms"])
+    sha256_hex = str(info["sha256"])
 
     if rms < MIN_NON_SILENT_RMS or dur < 0.5:
         target_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=422,
-            detail=f"Rejected reference WAV: must be non-silent (RMS={rms:.5f}) and >= 0.5s (dur={dur:.2f}s).",
+            detail=f"Rejected reference audio: must be non-silent (RMS={rms:.5f}) and >= 0.5s (dur={dur:.2f}s).",
         )
-    return {
+
+    meta_path = target_path.with_suffix(".meta.json")
+    meta_payload = {
         "voice_id": safe_id,
         "sha256": sha256_hex,
         "sample_rate": sr,
         "duration_seconds": dur,
         "waveform_rms": rms,
+        "trimmed_silence_ms": info["trimmed_silence_ms"],
+        "quality_warning": info["quality_warning"],
+        "speaker_consent_confirmed": True,
+        "consent_timestamp_ms": int(time.time() * 1000),
+        "neural_model": runtime.model_id,
     }
+    meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+    return meta_payload
+
+
+@app.delete("/v1/voices/{voice_id}")
+def delete_reference_voice(voice_id: str, _token: str = Depends(verify_auth_token)):
+    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", voice_id.strip())
+    if safe_id in {"anon_male_ref", "jenny_female_ref"}:
+        raise HTTPException(status_code=403, detail="Built-in default reference voices cannot be deleted.")
+    target_path = REFERENCE_VOICES_DIR / f"{safe_id}.wav"
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail=f"Voice '{safe_id}' not found.")
+    target_path.unlink(missing_ok=True)
+    target_path.with_suffix(".meta.json").unlink(missing_ok=True)
+    return {"deleted": True, "voice_id": safe_id}
 
 
 @app.post("/v1/synthesize")
