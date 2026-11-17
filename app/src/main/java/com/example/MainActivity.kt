@@ -139,6 +139,7 @@ class MainActivity : ComponentActivity() {
         VoiceProfileRepository.initialize(applicationContext)
         localPipeline = OcrTranslationPipeline.getInstance(applicationContext)
         localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
+        localPipeline.ttsManager.prewarmNeuralEngineIfReady()
 
         setContent {
             MyApplicationTheme {
@@ -377,6 +378,13 @@ fun GameVoxApp(
                 onTranslationModeChange = { mode, aiConsent ->
                     TranslatorStateRepository.updateTranslationMode(context, mode, aiConsent)
                     localPipeline.resetAntiRepeatMemory()
+                },
+                onTranslationStyleChange = { style ->
+                    TranslatorStateRepository.updateTranslationStyle(context, style)
+                    localPipeline.resetAntiRepeatMemory()
+                },
+                onDubbingDeliveryModeChange = { deliveryMode ->
+                    TranslatorStateRepository.updateDubbingDeliveryMode(context, deliveryMode)
                 },
                 onDownloadOfflinePack = {
                     localPipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)

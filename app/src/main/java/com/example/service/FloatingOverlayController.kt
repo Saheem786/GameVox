@@ -35,9 +35,11 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import com.example.data.DubbingDeliveryMode
 import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
@@ -99,6 +101,12 @@ class FloatingOverlayController(
     private var translationBoxView: TextView? = null
     private var translationBoxParams: WindowManager.LayoutParams? = null
     private var latestHindiOnlyText: String = ""
+
+    @Volatile
+    private var latestCaptionSequenceId: Long = 0L
+
+    @Volatile
+    private var latestCaptionSessionEpoch: Long = 0L
 
     @Volatile
     var isBoxVisible: Boolean = true
@@ -181,6 +189,38 @@ class FloatingOverlayController(
             loc[0] + view.width,
             loc[1] + view.height
         )
+    }
+
+    fun getTranslationCaptionScreenBounds(): Rect? {
+        val view = translationBoxView ?: return null
+        if (view.visibility != View.VISIBLE || view.width <= 0 || view.height <= 0) return null
+        val loc = IntArray(2)
+        view.getLocationOnScreen(loc)
+        return Rect(
+            loc[0],
+            loc[1],
+            loc[0] + view.width,
+            loc[1] + view.height
+        )
+    }
+
+    fun getAllOverlayExclusionBounds(): List<Rect> {
+        val rects = mutableListOf<Rect>()
+        getOverlayScreenBounds()?.let { rects.add(it) }
+        getTranslationCaptionScreenBounds()?.let { rects.add(it) }
+        bottomSheetOverlayView?.let { sheet ->
+            if (sheet.visibility == View.VISIBLE && sheet.width > 0 && sheet.height > 0) {
+                val loc = IntArray(2)
+                sheet.getLocationOnScreen(loc)
+                rects.add(Rect(loc[0], loc[1], loc[0] + sheet.width, loc[1] + sheet.height))
+            }
+        }
+        return rects
+    }
+
+    fun resetSubtitleCaptionSequence(sessionEpoch: Long) {
+        latestCaptionSequenceId = 0L
+        latestCaptionSessionEpoch = maxOf(sessionEpoch, latestCaptionSessionEpoch)
     }
 
     fun getTargetBoxScreenBounds(): Rect? {
@@ -887,8 +927,23 @@ class FloatingOverlayController(
         }
     }
 
-    fun updateDebugReadout(englishText: String, hindiText: String, statusNote: String) {
+    fun updateDebugReadout(
+        englishText: String,
+        hindiText: String,
+        statusNote: String,
+        sequenceId: Long = 0L,
+        sessionEpoch: Long = 0L
+    ) {
         mainHandler.post {
+            val isStale = sequenceId > 0L && (
+                sessionEpoch < latestCaptionSessionEpoch ||
+                    (sessionEpoch == latestCaptionSessionEpoch && sequenceId < latestCaptionSequenceId)
+                )
+            if (isStale) return@post
+            if (sequenceId > 0L) {
+                latestCaptionSequenceId = maxOf(sequenceId, latestCaptionSequenceId)
+                latestCaptionSessionEpoch = maxOf(sessionEpoch, latestCaptionSessionEpoch)
+            }
             val cleanHindi = hindiText.trim()
             if (cleanHindi.isEmpty()) return@post
             latestHindiOnlyText = cleanHindi
@@ -1445,6 +1500,100 @@ class FloatingOverlayController(
             modeRow.addView(aiModeBtn)
             sheetCard.addView(modeRow)
             sheetCard.addView(modeNoteTv)
+
+            // Translation Style & Queue Delivery Mode Quick Selectors
+            val styleHeaderTv = TextView(context).apply {
+                text = "Hindi Style (${currentState.translationStyle.shortBadge}) & Queue (${currentState.dubbingDeliveryMode.shortBadge})"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setPadding(0, dpToPx(2), 0, dpToPx(6))
+            }
+            sheetCard.addView(styleHeaderTv)
+
+            val styleRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 3f
+                setPadding(0, 0, 0, dpToPx(6))
+            }
+            val styleButtons = mutableListOf<Pair<TranslationStyle, Button>>()
+            fun refreshStyleButtons(selectedStyle: TranslationStyle) {
+                val activeDelivery = TranslatorStateRepository.state.value.dubbingDeliveryMode
+                styleHeaderTv.text = "Hindi Style (${selectedStyle.shortBadge}) & Queue (${activeDelivery.shortBadge})"
+                styleButtons.forEach { (st, btn) ->
+                    val isSel = st == selectedStyle
+                    btn.setTextColor(if (isSel) Color.parseColor("#0F172A") else Color.WHITE)
+                    btn.background = GradientDrawable().apply {
+                        cornerRadius = dpToPx(10).toFloat()
+                        setColor(if (isSel) Color.parseColor("#10B981") else Color.parseColor("#1E293B"))
+                    }
+                }
+            }
+            TranslationStyle.entries.forEachIndexed { idx, style ->
+                val btn = Button(context).apply {
+                    text = style.shortBadge
+                    isAllCaps = false
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    layoutParams = LinearLayout.LayoutParams(0, dpToPx(34), 1f).apply {
+                        if (idx > 0) marginStart = dpToPx(4)
+                        if (idx < TranslationStyle.entries.lastIndex) marginEnd = dpToPx(4)
+                    }
+                    setOnClickListener {
+                        TranslatorStateRepository.updateTranslationStyle(context, style)
+                        refreshStyleButtons(style)
+                    }
+                }
+                styleButtons.add(style to btn)
+                styleRow.addView(btn)
+            }
+            refreshStyleButtons(currentState.translationStyle)
+            sheetCard.addView(styleRow)
+
+            val deliveryRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 2f
+                setPadding(0, 0, 0, dpToPx(8))
+            }
+            lateinit var liveModeBtn: Button
+            lateinit var storyModeBtn: Button
+            fun refreshDeliveryButtons(selectedMode: DubbingDeliveryMode) {
+                val activeStyle = TranslatorStateRepository.state.value.translationStyle
+                styleHeaderTv.text = "Hindi Style (${activeStyle.shortBadge}) & Queue (${selectedMode.shortBadge})"
+                liveModeBtn.setTextColor(if (selectedMode == DubbingDeliveryMode.LIVE_MODE) Color.parseColor("#0F172A") else Color.WHITE)
+                liveModeBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(if (selectedMode == DubbingDeliveryMode.LIVE_MODE) Color.parseColor("#38BDF8") else Color.parseColor("#1E293B"))
+                }
+                storyModeBtn.setTextColor(if (selectedMode == DubbingDeliveryMode.STORY_MODE) Color.parseColor("#0F172A") else Color.WHITE)
+                storyModeBtn.background = GradientDrawable().apply {
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(if (selectedMode == DubbingDeliveryMode.STORY_MODE) Color.parseColor("#38BDF8") else Color.parseColor("#1E293B"))
+                }
+            }
+            liveModeBtn = Button(context).apply {
+                text = "Live Mode (Drop Old)"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(34), 1f).apply { marginEnd = dpToPx(6) }
+                setOnClickListener {
+                    TranslatorStateRepository.updateDubbingDeliveryMode(context, DubbingDeliveryMode.LIVE_MODE)
+                    refreshDeliveryButtons(DubbingDeliveryMode.LIVE_MODE)
+                }
+            }
+            storyModeBtn = Button(context).apply {
+                text = "Story Mode (Ordered)"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                layoutParams = LinearLayout.LayoutParams(0, dpToPx(34), 1f).apply { marginStart = dpToPx(6) }
+                setOnClickListener {
+                    TranslatorStateRepository.updateDubbingDeliveryMode(context, DubbingDeliveryMode.STORY_MODE)
+                    refreshDeliveryButtons(DubbingDeliveryMode.STORY_MODE)
+                }
+            }
+            refreshDeliveryButtons(currentState.dubbingDeliveryMode)
+            deliveryRow.addView(liveModeBtn)
+            deliveryRow.addView(storyModeBtn)
+            sheetCard.addView(deliveryRow)
 
             // Quick Female / Male Voice Switcher (Synchronized with Jenny Female SID #1 & Anon Male SID #5 for Live Gameplay)
             val currentGender = when {

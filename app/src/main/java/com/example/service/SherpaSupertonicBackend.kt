@@ -6,6 +6,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.SystemClock
 import android.util.Log
+import android.util.LruCache
 import com.k2fsa.sherpa.onnx.GeneratedAudio
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
@@ -137,6 +138,28 @@ class SherpaSupertonicBackend(
 
     @Volatile
     private var cachedNumSpeakers: Int = 0
+
+    @Volatile
+    var lastGenerationModeLabel: String = "Not synthesized yet"
+        private set
+
+    @Volatile
+    var lastSynthesisCacheHit: Boolean = false
+        private set
+
+    private class CachedSynthesizedPcm(
+        val samples: FloatArray,
+        val sampleRate: Int,
+        val waveformRms: Float,
+        val originalGenTimeMs: Long
+    )
+
+    private val shortUtterancePcmCache = LruCache<String, CachedSynthesizedPcm>(24)
+
+    fun clearSynthesisCacheForTesting() {
+        shortUtterancePcmCache.evictAll()
+        lastSynthesisCacheHit = false
+    }
 
     data class StepBenchmarkResult(
         val numSteps: Int,
@@ -438,13 +461,17 @@ class SherpaSupertonicBackend(
             var audioTrackWriteLatencyMs = 0L
             var estimatedPlayoutLatencyMs = 0L
 
+            val synthCacheKey = "$cleanText|sid=$validatedSid|spd=$validatedSpeed|steps=$configuredNumSteps"
+            val cachedEntry = if (cleanText.length <= 120) shortUtterancePcmCache.get(synthCacheKey) else null
+
             var audioTrack: AudioTrack? = null
             try {
+                val trackSampleRate = cachedEntry?.sampleRate ?: currentSampleRate
                 val minBufferSize = AudioTrack.getMinBufferSize(
-                    currentSampleRate,
+                    trackSampleRate,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT
-                ).coerceAtLeast(currentSampleRate / 4)
+                ).coerceAtLeast(trackSampleRate / 4)
 
                 val audioAttributes = AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
@@ -453,7 +480,7 @@ class SherpaSupertonicBackend(
 
                 val audioFormat = AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(currentSampleRate)
+                    .setSampleRate(trackSampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
 
@@ -467,63 +494,117 @@ class SherpaSupertonicBackend(
                 activeAudioTrack = audioTrack
                 audioTrack.play()
 
-                val config = GenerationConfig(
-                    silenceScale = 0.2f,
-                    speed = validatedSpeed,
-                    sid = validatedSid,
-                    numSteps = configuredNumSteps,
-                    extra = mapOf("lang" to "hi")
-                )
+                val effectiveSamples: Int
+                val waveformRms: Float
+                var callbackChunkCount = 0
 
-                var totalSamplesWritten = 0
-                var sumSquares = 0.0
+                if (cachedEntry != null) {
+                    lastSynthesisCacheHit = true
+                    lastGenerationModeLabel = "SPEECH_CACHE_HIT (Pre-synthesized SID #$validatedSid)"
+                    com.example.data.TranslatorStateRepository.updateTtsGenerationMode(lastGenerationModeLabel)
 
-                val generatedAudio = tts.generateWithConfigAndCallback(cleanText, config) { floatChunk ->
-                    if (isStopping.get() || activePlayEpoch.get() != epoch) {
-                        return@generateWithConfigAndCallback 0
-                    }
-
-                    if (floatChunk.isNotEmpty()) {
-                        totalSamplesWritten += floatChunk.size
-                        for (s in floatChunk) {
-                            val d = s.toDouble()
-                            sumSquares += d * d
-                        }
-                        val pcm16 = convertFloatsToPcm16Bytes(floatChunk)
-                        if (!firstAudioNotified) {
-                            firstAudioNotified = true
-                            firstChunkLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
-                            lastFirstChunkLatencyMs = firstChunkLatencyMs
-                            audioTrack.write(pcm16, 0, pcm16.size, AudioTrack.WRITE_BLOCKING)
-                            audioTrackWriteLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
-                            val bufferFrames = (minBufferSize / 2).coerceAtLeast(1)
-                            val halBufferDelayMs = (bufferFrames * 1000L) / currentSampleRate
-                            estimatedPlayoutLatencyMs = audioTrackWriteLatencyMs + halBufferDelayMs
-
-                            onFirstAudioStarted(firstChunkLatencyMs)
-                            com.example.data.TranslatorStateRepository.updateDiagnosisMetrics(
-                                ttsFirstAudioLatencyMs = firstChunkLatencyMs,
-                                ttsFirstPcmChunkLatencyMs = firstChunkLatencyMs,
-                                ttsAudioTrackWriteLatencyMs = audioTrackWriteLatencyMs,
-                                ttsEstimatedPlayoutLatencyMs = estimatedPlayoutLatencyMs
-                            )
-                        } else {
-                            audioTrack.write(pcm16, 0, pcm16.size, AudioTrack.WRITE_BLOCKING)
-                        }
-                    }
-                    1
-                }
-
-                if (isStopping.get() || activePlayEpoch.get() != epoch) {
-                    return@withContext false
-                }
-
-                val effectiveSamples = if (totalSamplesWritten > 0) totalSamplesWritten else generatedAudio.samples.size
-                val waveformRms = if (totalSamplesWritten > 0) {
-                    sqrt(sumSquares / totalSamplesWritten).toFloat()
+                    val pcm16 = convertFloatsToPcm16Bytes(cachedEntry.samples)
+                    firstChunkLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
+                    lastFirstChunkLatencyMs = firstChunkLatencyMs
+                    audioTrack.write(pcm16, 0, pcm16.size, AudioTrack.WRITE_BLOCKING)
+                    audioTrackWriteLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
+                    val bufferFrames = (minBufferSize / 2).coerceAtLeast(1)
+                    val halBufferDelayMs = (bufferFrames * 1000L) / trackSampleRate
+                    estimatedPlayoutLatencyMs = audioTrackWriteLatencyMs + halBufferDelayMs
+                    firstAudioNotified = true
+                    onFirstAudioStarted(firstChunkLatencyMs)
+                    com.example.data.TranslatorStateRepository.updateDiagnosisMetrics(
+                        ttsFirstAudioLatencyMs = firstChunkLatencyMs,
+                        ttsFirstPcmChunkLatencyMs = firstChunkLatencyMs,
+                        ttsAudioTrackWriteLatencyMs = audioTrackWriteLatencyMs,
+                        ttsEstimatedPlayoutLatencyMs = estimatedPlayoutLatencyMs
+                    )
+                    effectiveSamples = cachedEntry.samples.size
+                    waveformRms = cachedEntry.waveformRms
                 } else {
-                    computeWaveformRms(generatedAudio.samples)
+                    lastSynthesisCacheHit = false
+                    val config = GenerationConfig(
+                        silenceScale = 0.2f,
+                        speed = validatedSpeed,
+                        sid = validatedSid,
+                        numSteps = configuredNumSteps,
+                        extra = mapOf("lang" to "hi")
+                    )
+
+                    var totalSamplesWritten = 0
+                    var sumSquares = 0.0
+
+                    val generatedAudio = tts.generateWithConfigAndCallback(cleanText, config) { floatChunk ->
+                        if (isStopping.get() || activePlayEpoch.get() != epoch) {
+                            return@generateWithConfigAndCallback 0
+                        }
+
+                        if (floatChunk.isNotEmpty()) {
+                            callbackChunkCount++
+                            totalSamplesWritten += floatChunk.size
+                            for (s in floatChunk) {
+                                val d = s.toDouble()
+                                sumSquares += d * d
+                            }
+                            val pcm16 = convertFloatsToPcm16Bytes(floatChunk)
+                            if (!firstAudioNotified) {
+                                firstAudioNotified = true
+                                firstChunkLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
+                                lastFirstChunkLatencyMs = firstChunkLatencyMs
+                                audioTrack.write(pcm16, 0, pcm16.size, AudioTrack.WRITE_BLOCKING)
+                                audioTrackWriteLatencyMs = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
+                                val bufferFrames = (minBufferSize / 2).coerceAtLeast(1)
+                                val halBufferDelayMs = (bufferFrames * 1000L) / trackSampleRate
+                                estimatedPlayoutLatencyMs = audioTrackWriteLatencyMs + halBufferDelayMs
+
+                                onFirstAudioStarted(firstChunkLatencyMs)
+                                com.example.data.TranslatorStateRepository.updateDiagnosisMetrics(
+                                    ttsFirstAudioLatencyMs = firstChunkLatencyMs,
+                                    ttsFirstPcmChunkLatencyMs = firstChunkLatencyMs,
+                                    ttsAudioTrackWriteLatencyMs = audioTrackWriteLatencyMs,
+                                    ttsEstimatedPlayoutLatencyMs = estimatedPlayoutLatencyMs
+                                )
+                            } else {
+                                audioTrack.write(pcm16, 0, pcm16.size, AudioTrack.WRITE_BLOCKING)
+                            }
+                        }
+                        1
+                    }
+
+                    lastGenerationModeLabel = if (callbackChunkCount > 1) {
+                        "CALLBACK_STREAMED_TO_AUDIOTRACK ($callbackChunkCount chunks)"
+                    } else {
+                        "FULL_BUFFER_PREGENERATED_BEFORE_PLAYBACK"
+                    }
+                    com.example.data.TranslatorStateRepository.updateTtsGenerationMode(lastGenerationModeLabel)
+
+                    if (isStopping.get() || activePlayEpoch.get() != epoch) {
+                        return@withContext false
+                    }
+
+                    effectiveSamples = if (totalSamplesWritten > 0) totalSamplesWritten else generatedAudio.samples.size
+                    waveformRms = if (totalSamplesWritten > 0) {
+                        sqrt(sumSquares / totalSamplesWritten).toFloat()
+                    } else {
+                        computeWaveformRms(generatedAudio.samples)
+                    }
+                    if (cleanText.length <= 120 &&
+                        generatedAudio.samples.isNotEmpty() &&
+                        waveformRms >= MIN_NON_SILENT_RMS
+                    ) {
+                        val genTime = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
+                        shortUtterancePcmCache.put(
+                            synthCacheKey,
+                            CachedSynthesizedPcm(
+                                samples = generatedAudio.samples,
+                                sampleRate = generatedAudio.sampleRate.coerceAtLeast(trackSampleRate),
+                                waveformRms = waveformRms,
+                                originalGenTimeMs = genTime
+                            )
+                        )
+                    }
                 }
+
                 lastWaveformRms = waveformRms
 
                 if (effectiveSamples == 0 || waveformRms < MIN_NON_SILENT_RMS) {
@@ -535,7 +616,7 @@ class SherpaSupertonicBackend(
 
                 val totalSynthTime = ((System.nanoTime() / 1_000_000L) - startTimeMs).coerceAtLeast(1L)
                 lastTotalSynthesisTimeMs = totalSynthTime
-                val audioDurationMs = (effectiveSamples * 1000L) / currentSampleRate
+                val audioDurationMs = (effectiveSamples * 1000L) / trackSampleRate
                 lastAudioDurationMs = audioDurationMs
                 val rtf = if (audioDurationMs > 0) totalSynthTime.toFloat() / audioDurationMs else 0.0f
                 lastSynthesisRtf = rtf
@@ -544,7 +625,7 @@ class SherpaSupertonicBackend(
                 val drainedCleanly = drainAudioTrackPlayback(
                     audioTrack = audioTrack,
                     totalFramesWritten = effectiveSamples,
-                    sampleRate = currentSampleRate,
+                    sampleRate = trackSampleRate,
                     epoch = epoch
                 )
 

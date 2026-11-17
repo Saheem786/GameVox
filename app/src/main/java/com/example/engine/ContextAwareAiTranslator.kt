@@ -3,6 +3,7 @@ package com.example.engine
 import android.content.Context
 import android.util.Log
 import com.example.data.TargetLanguage
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorStateRepository
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
@@ -83,7 +84,8 @@ object ContextAwareAiTranslator {
         englishDialogue: String,
         targetLanguage: TargetLanguage,
         speakerName: String?,
-        recentLines: List<Pair<String, String>>
+        recentLines: List<Pair<String, String>>,
+        translationStyle: TranslationStyle = TranslatorStateRepository.state.value.translationStyle
     ): ContextAiTranslationResult {
         val trimmed = englishDialogue.trim()
         if (trimmed.isEmpty()) {
@@ -103,15 +105,27 @@ object ContextAwareAiTranslator {
         }
 
         val styleRule = if (targetLanguage == TargetLanguage.HINDI) {
-            """
-            Translate into natural, modern conversational Hindi as spoken in Hindi-dubbed games, movies, and everyday Indian conversations (Devanagari script). Use natural Hinglish loanwords (like sorry, please, wait, tension, backup) ONLY when they sound natural and fit the scene.
-            NEVER use stiff textbook/Sanskritized Hindi (avoid 'प्रतीक्षा करें', 'सहायता', 'अंतिम संस्कार' — prefer 'वेट करो', 'मदद', 'फ्यूनरल').
-            NEVER inject unnecessary forced slang or alter the original meaning.
-            Examples:
-            - "Are you kidding me?" -> "मज़ाक कर रहे हो क्या?"
-            - "Let's get moving!" -> "चलो, जल्दी निकलते हैं!"
-            - "I won't let you down." -> "भरोसा रखो, तुम्हें निराश नहीं करूँगा।"
-            """.trimIndent()
+            when (translationStyle) {
+                TranslationStyle.MODERN_HINDI -> """
+                    Translate into natural, modern everyday spoken Hindi as heard in popular Hindi-dubbed games and movies (Devanagari script).
+                    Prefer warm/natural तुम/तुम्हारा between equals, friends, or rivals unless clearly addressing an elder/authority figure.
+                    NEVER use stiff textbook/Sanskritized words like 'प्रतीक्षा करें', 'सहायता', 'अंतिम संस्कार' — prefer 'इंतज़ार/वेट करो', 'मदद', 'फ्यूनरल'.
+                    Examples:
+                    - "Yeah, well... Maybe she likes doing it?" -> "हाँ, हो सकता है उसे ऐसा करना पसंद हो।"
+                    - "It's the breakfast that's waiting for you downstairs, dummy." -> "अरे बुद्धू, नीचे नाश्ता तुम्हारा इंतज़ार कर रहा है!"
+                    - "Hey, you're the one who started it!" -> "अरे, शुरू तो तुमने किया था!"
+                    - "I got your back." -> "टेंशन मत लो, मैं हूँ ना!"
+                """.trimIndent()
+
+                TranslationStyle.CASUAL_HINGLISH -> """
+                    Translate into fast, punchy conversational Hinglish (written cleanly in Devanagari for Hindi TTS pronunciation).
+                    Keep natural everyday English loanwords (यार, ब्रो, वेट, स्टार्ट, ब्रेकफ़ास्ट, टेंशन, बैकअप, सॉरी, प्लीज़) without breaking original meaning.
+                """.trimIndent()
+
+                TranslationStyle.FORMAL_HINDI -> """
+                    Translate into clean, respectful standard Hindi (आप/प्रतीक्षा/सहायता) suited for formal cutscenes or narration.
+                """.trimIndent()
+            }
         } else {
             "Translate into natural, conversational ${targetLanguage.displayName} suitable for live voice dubbing without altering meaning."
         }

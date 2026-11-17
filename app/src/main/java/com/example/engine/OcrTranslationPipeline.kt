@@ -3,6 +3,11 @@ package com.example.engine
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
+import com.example.data.DubbingDeliveryMode
+import com.example.data.PipelineStageTimestamps
+import com.example.data.SubtitleAlignmentLogEntry
+import com.example.data.SubtitleEvent
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorStateRepository
 import com.example.data.VoiceProfile
 import com.example.data.VoiceProfileRepository
@@ -13,6 +18,7 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -51,6 +57,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
     private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val dubbingQueue = SubtitleDubbingQueue(maxCapacity = 2)
     private val sessionEpoch = AtomicLong(0L)
+    private val subtitleSequenceCounter = AtomicLong(0L)
+
+    @Volatile
+    private var activeTranslationJob: Job? = null
 
     companion object {
         val HINDI_LOCALE: Locale = Locale.forLanguageTag("hi-IN")
@@ -132,10 +142,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
      * clears [dubbingQueue], and stops TTS audio output cleanly.
      */
     fun stopAndClearQueue() {
-        sessionEpoch.incrementAndGet()
+        val newEpoch = sessionEpoch.incrementAndGet()
+        activeTranslationJob?.cancel()
+        activeTranslationJob = null
         dubbingQueue.clear()
         ttsManager.stopSpeaking()
         ttsManager.cancelThirtySecondRepeatTimer()
+        TranslatorStateRepository.resetSubtitleSequenceTracking(newEpoch)
         TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
     }
 
@@ -299,7 +312,9 @@ class OcrTranslationPipeline private constructor(context: Context) {
     suspend fun processExtractedRawText(
         rawEnglishText: String,
         enforceActiveSession: Boolean = true,
-        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
+        frameTimestampMs: Long = System.currentTimeMillis(),
+        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null,
+        onAlignedDebugTextUpdate: ((event: SubtitleEvent, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
         val entryEpoch = sessionEpoch.get()
         scanMutex.withLock {
@@ -316,12 +331,14 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 rawScanText = filtered,
                 extractedEnglish = extractedEnglish,
                 startTime = startTime,
+                frameTimestampMs = frameTimestampMs,
                 entryEpoch = entryEpoch,
                 enforceActiveSession = enforceActiveSession,
                 captureLatencyMs = 0L,
                 ocrLatencyMs = 0L,
                 roiDimensionsText = "Accessibility Nodes",
-                onDebugTextUpdate = onDebugTextUpdate
+                onDebugTextUpdate = onDebugTextUpdate,
+                onAlignedDebugTextUpdate = onAlignedDebugTextUpdate
             )
         }
     }
@@ -329,14 +346,17 @@ class OcrTranslationPipeline private constructor(context: Context) {
     suspend fun processCapturedFrame(
         rawBitmap: Bitmap,
         excludeOverlayRect: Rect? = null,
+        excludeOverlayRects: List<Rect> = listOfNotNull(excludeOverlayRect),
         targetRegionScreenRect: Rect? = null,
         rawScreenWidth: Int = 0,
         rawScreenHeight: Int = 0,
         skipIfRegionUnchanged: Boolean = true,
         captureLatencyMs: Long = 0L,
+        frameTimestampMs: Long = System.currentTimeMillis(),
         enforceActiveSession: Boolean = true,
         rotationDegrees: Int = 0,
-        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null
+        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)? = null,
+        onAlignedDebugTextUpdate: ((event: SubtitleEvent, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> = withContext(Dispatchers.Default) {
         val entryEpoch = sessionEpoch.get()
         scanMutex.withLock {
@@ -351,6 +371,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     source = rawBitmap,
                     enableColorInversion = appState.invertColorsEnabled,
                     excludeOverlayRect = excludeOverlayRect,
+                    excludeOverlayRects = excludeOverlayRects,
                     targetRegionScreenRect = targetRegionScreenRect,
                     rawScreenWidth = rawScreenWidth,
                     rawScreenHeight = rawScreenHeight,
@@ -409,13 +430,15 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 rawScanText = extractionResult.extractedText,
                 extractedEnglish = extractedEnglish,
                 startTime = startTime,
+                frameTimestampMs = frameTimestampMs,
                 entryEpoch = entryEpoch,
                 enforceActiveSession = enforceActiveSession,
                 captureLatencyMs = captureLatencyMs,
                 ocrLatencyMs = extractionResult.ocrLatencyMs,
                 roiDimensionsText = roiDimensions,
                 isFromMediaProjectionOcr = true,
-                onDebugTextUpdate = onDebugTextUpdate
+                onDebugTextUpdate = onDebugTextUpdate,
+                onAlignedDebugTextUpdate = onAlignedDebugTextUpdate
             )
         }
     }
@@ -453,13 +476,15 @@ class OcrTranslationPipeline private constructor(context: Context) {
         rawScanText: String,
         extractedEnglish: String,
         startTime: Long,
+        frameTimestampMs: Long,
         entryEpoch: Long,
         enforceActiveSession: Boolean,
         captureLatencyMs: Long,
         ocrLatencyMs: Long,
         roiDimensionsText: String,
         isFromMediaProjectionOcr: Boolean = false,
-        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?
+        onDebugTextUpdate: ((english: String, hindi: String, statusNote: String) -> Unit)?,
+        onAlignedDebugTextUpdate: ((event: SubtitleEvent, hindi: String, statusNote: String) -> Unit)? = null
     ): Pair<String, String> {
         if (sessionEpoch.get() != entryEpoch || (enforceActiveSession && !TranslatorStateRepository.state.value.isCapturingOcr)) {
             return "" to ""
@@ -468,24 +493,27 @@ class OcrTranslationPipeline private constructor(context: Context) {
         val state = TranslatorStateRepository.state.value
         val targetLang = state.targetLanguage
 
+        val speakerResolveStart = System.currentTimeMillis()
         val parsedDialogue = VoiceProfileRepository.resolveSpeakerAndVoiceForSubtitle(
             rawSubtitleText = rawScanText,
             isFromMediaProjectionOcr = isFromMediaProjectionOcr
         )
+        val speakerResolveMs = (System.currentTimeMillis() - speakerResolveStart).coerceAtLeast(0L)
         val assignedVoice = parsedDialogue.assignedVoice
         val dialogueToTranslate = parsedDialogue.spokenDialogue.trim()
         if (dialogueToTranslate.isBlank()) {
             return "" to ""
         }
 
-        val candidateSpeakerContextKey = buildSpeakerContextAntiRepeatKey(
+        val baseSpeakerContextKey = buildSpeakerContextAntiRepeatKey(
             routeDecision = parsedDialogue.routeDecision,
             characterAssignment = parsedDialogue.characterAssignment,
             speakerName = parsedDialogue.speakerName,
             epoch = entryEpoch
         )
+        val candidateSpeakerContextKey = "$baseSpeakerContextKey:${state.translationStyle.code}:${targetLang.code}"
 
-        // Skip re-translating ONLY if extracted dialogue AND speaker/profile/game context match the active or most recently queued line
+        // Skip re-translating ONLY if extracted dialogue AND speaker/profile/style/game context match the active or most recently queued line
         val candidateNorm = SubtitleDubbingQueue.normalize(dialogueToTranslate)
         if (candidateSpeakerContextKey == lastExtractedSpeakerContextKey &&
             SubtitleDubbingQueue.areSimilar(candidateNorm, lastExtractedNormalized) &&
@@ -510,13 +538,37 @@ class OcrTranslationPipeline private constructor(context: Context) {
             return dialogueToTranslate to lastSpokenText
         }
 
-        val translationResult = translateEnglishToHindiDetailed(
-            englishText = dialogueToTranslate,
-            speakerName = parsedDialogue.speakerName
+        val seqId = subtitleSequenceCounter.incrementAndGet()
+        val gameNs = parsedDialogue.routeDecision?.gameNamespace
+            ?: parsedDialogue.characterAssignment?.gameNamespace
+            ?: VoiceProfileRepository.getActiveGameNamespace()
+        val subtitleEvent = SubtitleEvent(
+            eventId = "sub_${entryEpoch}_$seqId",
+            sequenceId = seqId,
+            sessionEpoch = entryEpoch,
+            frameTimestampMs = frameTimestampMs,
+            sourceText = rawScanText,
+            spokenDialogue = dialogueToTranslate,
+            speakerName = parsedDialogue.speakerName,
+            gameNamespace = gameNs
         )
 
-        // Check epoch AGAIN after async translation so paused/stopped sessions never queue/speak disappeared lines
-        if (sessionEpoch.get() != entryEpoch || (enforceActiveSession && !TranslatorStateRepository.state.value.isCapturingOcr)) {
+        if (state.dubbingDeliveryMode == DubbingDeliveryMode.LIVE_MODE) {
+            activeTranslationJob?.cancel()
+        }
+
+        val translationResult = translateEnglishToHindiDetailed(
+            englishText = dialogueToTranslate,
+            speakerName = parsedDialogue.speakerName,
+            translationStyle = state.translationStyle,
+            gameNamespace = gameNs
+        )
+
+        // Enforce strict sequence & epoch ordering: discard stale async translation results
+        if (sessionEpoch.get() != entryEpoch ||
+            (enforceActiveSession && !TranslatorStateRepository.state.value.isCapturingOcr) ||
+            (state.dubbingDeliveryMode == DubbingDeliveryMode.LIVE_MODE && seqId < subtitleSequenceCounter.get())
+        ) {
             return "" to ""
         }
 
@@ -548,6 +600,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
         )
 
         val speakerTag = parsedDialogue.speakerName ?: assignedVoice.assignedRole.displayLabel.substringBefore(" (")
+        val resolvedSid = parsedDialogue.characterAssignment?.speakerId ?: assignedVoice.engineVoiceIndex
         val finalRouteDecision = parsedDialogue.routeDecision?.copy(
             hindiDialogue = CharacterVoiceRouter.prepareHindiDialogueForSpeech(
                 rawHindi = translatedText,
@@ -568,7 +621,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
             voiceProfile = assignedVoice,
             speakerLabel = speakerTag,
             characterAssignment = parsedDialogue.characterAssignment,
-            routeDecision = finalRouteDecision
+            routeDecision = finalRouteDecision,
+            sequenceId = seqId,
+            eventId = subtitleEvent.eventId,
+            frameTimestampMs = frameTimestampMs
         )
 
         val outcome = dubbingQueue.enqueue(
@@ -576,28 +632,56 @@ class OcrTranslationPipeline private constructor(context: Context) {
             isCurrentlySpeaking = isTtsSpeakingNow(),
             activeSpokenEnglishNormalized = lastExtractedNormalized,
             activeSpokenTranslated = lastSpokenText,
-            activeSpokenSpeakerContextKey = lastExtractedSpeakerContextKey
+            activeSpokenSpeakerContextKey = lastExtractedSpeakerContextKey,
+            deliveryMode = state.dubbingDeliveryMode
+        )
+
+        val prepEndMs = (System.currentTimeMillis() - startTime).coerceAtLeast(1L)
+        TranslatorStateRepository.updateStageTimestamps(
+            timestamps = PipelineStageTimestamps(
+                subtitleEventId = subtitleEvent.eventId,
+                sequenceId = seqId,
+                frameCaptureMs = captureLatencyMs,
+                ocrMs = ocrLatencyMs,
+                speakerResolveMs = speakerResolveMs,
+                translationMs = translationResult.latencyMs,
+                ttsPrepMs = prepEndMs,
+                playbackStartFromFrameMs = (System.currentTimeMillis() - frameTimestampMs).coerceAtLeast(0L),
+                ttsGenerationMode = ttsManager.sherpaEngine.lastGenerationModeLabel
+            )
         )
 
         val isVoiceMuted = TranslatorStateRepository.state.value.isVoiceMuted
+        var logStatus = "Processed"
+
         when (outcome) {
             is DubbingEnqueueOutcome.SkippedDuplicate -> {
+                logStatus = "Duplicate skipped"
                 TranslatorStateRepository.recordTranslationResult(
                     english = dialogueToTranslate,
                     hindi = translatedText,
                     wasSpoken = false,
                     skippedReason = "Anti-Repeat: Identical to lastSpokenText",
                     processingTimeMs = elapsedMs,
-                    timestamp = timestamp
+                    timestamp = timestamp,
+                    sequenceId = seqId,
+                    eventId = subtitleEvent.eventId,
+                    sessionEpoch = entryEpoch
                 )
                 onDebugTextUpdate?.let { cb ->
                     pipelineScope.launch(Dispatchers.Main) {
-                        cb(dialogueToTranslate, translatedText, "Duplicate skipped")
+                        cb(dialogueToTranslate, translatedText, logStatus)
+                    }
+                }
+                onAlignedDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(subtitleEvent, translatedText, logStatus)
                     }
                 }
             }
 
             is DubbingEnqueueOutcome.Queued -> {
+                logStatus = "Queued (${outcome.queueSize})"
                 TranslatorStateRepository.updateQueueTelemetry(queuedCount = outcome.queueSize)
                 TranslatorStateRepository.recordTranslationResult(
                     english = dialogueToTranslate,
@@ -605,16 +689,31 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     wasSpoken = false,
                     skippedReason = "Queued next (${outcome.queueSize})",
                     processingTimeMs = elapsedMs,
-                    timestamp = timestamp
+                    timestamp = timestamp,
+                    sequenceId = seqId,
+                    eventId = subtitleEvent.eventId,
+                    sessionEpoch = entryEpoch
                 )
                 onDebugTextUpdate?.let { cb ->
                     pipelineScope.launch(Dispatchers.Main) {
-                        cb(dialogueToTranslate, translatedText, "Queued (${outcome.queueSize})")
+                        cb(dialogueToTranslate, translatedText, logStatus)
+                    }
+                }
+                onAlignedDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(subtitleEvent, translatedText, logStatus)
                     }
                 }
             }
 
             is DubbingEnqueueOutcome.QueuedAndSkippedStale -> {
+                logStatus = if (state.dubbingDeliveryMode == DubbingDeliveryMode.LIVE_MODE &&
+                    ttsManager.stopIfSupersededInLiveMode(seqId)
+                ) {
+                    "Preempted stale speech • Speaking latest"
+                } else {
+                    "Skipped stale line • Queued (${outcome.queueSize})"
+                }
                 TranslatorStateRepository.updateQueueTelemetry(
                     queuedCount = outcome.queueSize,
                     skippedRapidIncrement = 1
@@ -623,18 +722,25 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     english = dialogueToTranslate,
                     hindi = translatedText,
                     wasSpoken = false,
-                    skippedReason = "Skipped stale line; queued latest (${outcome.queueSize})",
+                    skippedReason = logStatus,
                     processingTimeMs = elapsedMs,
-                    timestamp = timestamp
+                    timestamp = timestamp,
+                    sequenceId = seqId,
+                    eventId = subtitleEvent.eventId,
+                    sessionEpoch = entryEpoch
                 )
                 onDebugTextUpdate?.let { cb ->
                     pipelineScope.launch(Dispatchers.Main) {
-                        cb(
-                            dialogueToTranslate,
-                            translatedText,
-                            "Skipped old rapid line • Queued (${outcome.queueSize})"
-                        )
+                        cb(dialogueToTranslate, translatedText, logStatus)
                     }
+                }
+                onAlignedDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(subtitleEvent, translatedText, logStatus)
+                    }
+                }
+                if (state.dubbingDeliveryMode == DubbingDeliveryMode.LIVE_MODE && !isTtsSpeakingNow()) {
+                    drainNextQueuedSubtitleIfAny()
                 }
             }
 
@@ -645,7 +751,7 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 }
                 lastSpokenText = translatedText.trim()
                 lastExtractedNormalized = SubtitleDubbingQueue.normalize(dialogueToTranslate)
-                lastExtractedSpeakerContextKey = queueItem.buildSpeakerContextKey()
+                lastExtractedSpeakerContextKey = candidateSpeakerContextKey
 
                 val spokenSuccess = if (isVoiceMuted) {
                     false
@@ -656,11 +762,14 @@ class OcrTranslationPipeline private constructor(context: Context) {
                         voiceProfile = assignedVoice,
                         sourceEnglishText = dialogueToTranslate,
                         characterAssignment = parsedDialogue.characterAssignment,
-                        routeDecision = finalRouteDecision
+                        routeDecision = finalRouteDecision,
+                        sequenceId = seqId,
+                        subtitleEventId = subtitleEvent.eventId,
+                        frameTimestampMs = frameTimestampMs
                     )
                 }
                 val genderBadge = parsedDialogue.detectedGender.displayLabel
-                val note = when {
+                logStatus = when {
                     isVoiceMuted -> "Voice Muted • $speakerTag ($genderBadge)"
                     spokenSuccess -> "Speaking ${targetLang.displayName} ($speakerTag)"
                     else -> "TTS Initializing"
@@ -670,18 +779,41 @@ class OcrTranslationPipeline private constructor(context: Context) {
                     english = dialogueToTranslate,
                     hindi = translatedText,
                     wasSpoken = spokenSuccess,
-                    skippedReason = note,
+                    skippedReason = logStatus,
                     processingTimeMs = elapsedMs,
-                    timestamp = timestamp
+                    timestamp = timestamp,
+                    sequenceId = seqId,
+                    eventId = subtitleEvent.eventId,
+                    sessionEpoch = entryEpoch
                 )
 
                 onDebugTextUpdate?.let { cb ->
                     pipelineScope.launch(Dispatchers.Main) {
-                        cb(dialogueToTranslate, translatedText, note)
+                        cb(dialogueToTranslate, translatedText, logStatus)
+                    }
+                }
+                onAlignedDebugTextUpdate?.let { cb ->
+                    pipelineScope.launch(Dispatchers.Main) {
+                        cb(subtitleEvent, translatedText, logStatus)
                     }
                 }
             }
         }
+
+        TranslatorStateRepository.appendAlignmentLog(
+            SubtitleAlignmentLogEntry(
+                sequenceId = seqId,
+                eventId = subtitleEvent.eventId,
+                speakerLabel = speakerTag,
+                speakerId = resolvedSid,
+                rawEnglish = dialogueToTranslate,
+                translatedHindi = translatedText,
+                translationStyle = state.translationStyle.shortBadge,
+                deliveryMode = state.dubbingDeliveryMode.shortBadge,
+                status = logStatus,
+                endToEndLatencyMs = (System.currentTimeMillis() - frameTimestampMs).coerceAtLeast(elapsedMs)
+            )
+        )
 
         return dialogueToTranslate to translatedText
     }
@@ -698,12 +830,13 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 TranslatorStateRepository.updateQueueTelemetry(queuedCount = 0)
                 return@launch
             }
+            val state = TranslatorStateRepository.state.value
             TranslatorStateRepository.updateQueueTelemetry(queuedCount = dubbingQueue.size())
-            if (TranslatorStateRepository.state.value.isVoiceMuted) return@launch
+            if (state.isVoiceMuted) return@launch
 
             lastSpokenText = next.translatedText.trim()
             lastExtractedNormalized = SubtitleDubbingQueue.normalize(next.spokenDialogue)
-            lastExtractedSpeakerContextKey = next.buildSpeakerContextKey()
+            lastExtractedSpeakerContextKey = "${next.buildSpeakerContextKey()}:${state.translationStyle.code}:${state.targetLanguage.code}"
 
             val spokenSuccess = speakHindiNonBlocking(
                 hindiText = next.translatedText,
@@ -711,7 +844,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 voiceProfile = next.voiceProfile,
                 sourceEnglishText = next.sourceEnglish,
                 characterAssignment = next.characterAssignment,
-                routeDecision = next.routeDecision
+                routeDecision = next.routeDecision,
+                sequenceId = next.sequenceId,
+                subtitleEventId = next.eventId,
+                frameTimestampMs = next.frameTimestampMs
             )
 
             TranslatorStateRepository.recordTranslationResult(
@@ -720,7 +856,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
                 wasSpoken = spokenSuccess,
                 skippedReason = if (spokenSuccess) "Spoken from queue (${next.speakerLabel})" else "Queue TTS failed",
                 processingTimeMs = 0L,
-                timestamp = timeFormatter.format(Date())
+                timestamp = timeFormatter.format(Date()),
+                sequenceId = next.sequenceId,
+                eventId = next.eventId,
+                sessionEpoch = drainEpoch
             )
         }
     }
@@ -732,14 +871,18 @@ class OcrTranslationPipeline private constructor(context: Context) {
 
     suspend fun translateEnglishToHindiDetailed(
         englishText: String,
-        speakerName: String? = null
+        speakerName: String? = null,
+        translationStyle: TranslationStyle = TranslatorStateRepository.state.value.translationStyle,
+        gameNamespace: String = VoiceProfileRepository.getActiveGameNamespace()
     ): DetailedTranslationResult = withContext(Dispatchers.IO) {
         val state = TranslatorStateRepository.state.value
         HindiTranslationEngine.translateSuspendDetailed(
             englishText = englishText,
             targetLanguage = state.targetLanguage,
             mode = state.translationMode,
-            speakerName = speakerName
+            speakerName = speakerName,
+            translationStyle = translationStyle,
+            gameNamespace = gameNamespace
         )
     }
 
@@ -753,7 +896,10 @@ class OcrTranslationPipeline private constructor(context: Context) {
         voiceProfile: VoiceProfile? = null,
         sourceEnglishText: String = "",
         characterAssignment: com.example.data.CharacterVoiceAssignment? = null,
-        routeDecision: VoiceRouteDecision? = null
+        routeDecision: VoiceRouteDecision? = null,
+        sequenceId: Long = 0L,
+        subtitleEventId: String = "",
+        frameTimestampMs: Long = 0L
     ): Boolean {
         if (hindiText.isBlank()) return false
         val state = TranslatorStateRepository.state.value
@@ -776,7 +922,11 @@ class OcrTranslationPipeline private constructor(context: Context) {
             voiceProfile = activeProfile,
             sourceEnglishText = sourceEnglishText,
             characterAssignment = routeDecision?.characterAssignment ?: characterAssignment,
-            routeDecision = routeDecision
+            routeDecision = routeDecision,
+            sequenceId = sequenceId,
+            subtitleEventId = subtitleEventId,
+            frameTimestampMs = frameTimestampMs,
+            deliveryMode = state.dubbingDeliveryMode
         )
     }
 

@@ -566,7 +566,15 @@ fun DiagnosisScreen(
                         )
                         DiagnosisField(
                             label = "End-to-End Subtitle-to-Audio Latency",
-                            value = if (state.endToEndSubtitleToAudioLatencyMs > 0L) "${state.endToEndSubtitleToAudioLatencyMs} ms (OCR + Translation + Synthesis + Playback Start)" else "—"
+                            value = if (state.endToEndSubtitleToAudioLatencyMs > 0L) "${state.endToEndSubtitleToAudioLatencyMs} ms (Frame → OCR → Translation → TTS → Playback Start)" else "—"
+                        )
+                        DiagnosisField(
+                            label = "TTS Generation & Playout Mode",
+                            value = state.ttsGenerationModeLabel
+                        )
+                        DiagnosisField(
+                            label = "Pipeline Stage Timestamps (${state.stageTimestamps.subtitleEventId.ifBlank { "—" }})",
+                            value = "Capture=${state.stageTimestamps.frameCaptureMs}ms • OCR=${state.stageTimestamps.ocrMs}ms • Speaker=${state.stageTimestamps.speakerResolveMs}ms • Translate=${state.stageTimestamps.translationMs}ms • TTS Prep=${state.stageTimestamps.ttsPrepMs}ms • Playback Start=${state.stageTimestamps.playbackStartFromFrameMs}ms"
                         )
                         DiagnosisField(
                             label = "Utterance Duration & RMS",
@@ -746,10 +754,66 @@ fun DiagnosisScreen(
                         }
 
                         Text(
-                            text = "Queued: ${state.queuedSubtitlesCount} • Duplicates skipped: ${state.duplicateSkippedCount} • Rapid skipped: ${state.skippedRapidCount}",
+                            text = "Queued: ${state.queuedSubtitlesCount} • Duplicates skipped: ${state.duplicateSkippedCount} • Rapid/stale skipped: ${state.skippedRapidCount}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        Text(
+                            text = "Style: ${state.translationStyle.displayName} • Queue: ${state.dubbingDeliveryMode.displayName} • Seq #${state.latestSubtitleSequenceId} (Epoch ${state.latestSubtitleSessionEpoch})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // 8. Subtitle Alignment & Synchronization Logs Card
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("diagnosis_alignment_logs_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Subtitle Alignment Logs (${state.alignmentLogs.size})",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            OutlinedButton(
+                                onClick = { TranslatorStateRepository.clearAlignmentLogs() },
+                                modifier = Modifier.testTag("clear_alignment_logs_button")
+                            ) {
+                                Text("Clear Logs")
+                            }
+                        }
+
+                        if (state.alignmentLogs.isEmpty()) {
+                            Text(
+                                text = "No subtitle alignment events recorded yet.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            state.alignmentLogs.take(8).forEach { entry ->
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                                Text(
+                                    text = "[Seq #${entry.sequenceId}] ${entry.speakerLabel} (SID #${entry.speakerId}) • ${entry.translationStyle} • ${entry.deliveryMode} • ${entry.status} (${entry.endToEndLatencyMs}ms)\nEN: ${entry.rawEnglish}\nHI: ${entry.translatedHindi}",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
                     }
                 }
 

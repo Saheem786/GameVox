@@ -6,6 +6,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -21,6 +23,8 @@ import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -34,14 +38,18 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.data.DubbingDeliveryMode
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorAppState
 import com.example.data.TranslatorStateRepository
 import com.example.service.FreeVoiceBackend
 
 /**
  * A dedicated Compose-based UI card component for the main screen allowing instant 1-tap
- * switching between 'Human Voice (Neural)', 'Fast Offline (Supertonic)', and 'Pause' modes.
+ * switching between 'Human Voice (Neural)', 'Fast Offline (Supertonic)', and 'Pause' modes,
+ * plus modern Hindi style and Live vs Story queue delivery controls.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun DubbingModeSwitchCard(
     state: TranslatorAppState,
@@ -141,6 +149,76 @@ fun DubbingModeSwitchCard(
                     modifier = Modifier.weight(1f),
                     testTag = "mode_chip_pause"
                 )
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "Hindi Style",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    TranslationStyle.entries.forEach { style ->
+                        val selected = state.translationStyle == style
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                TranslatorStateRepository.updateTranslationStyle(context, style)
+                            },
+                            label = {
+                                Text(
+                                    text = style.displayName,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                            ),
+                            modifier = Modifier.testTag("style_chip_${style.code}")
+                        )
+                    }
+                }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "Queue Delivery",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    DubbingDeliveryMode.entries.forEach { mode ->
+                        val selected = state.dubbingDeliveryMode == mode
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                TranslatorStateRepository.updateDubbingDeliveryMode(context, mode)
+                            },
+                            label = {
+                                Text(
+                                    text = "${mode.displayName} (${mode.shortBadge})",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                            ),
+                            modifier = Modifier.testTag("delivery_chip_${mode.code}")
+                        )
+                    }
+                }
             }
 
             // Explicit First-Run Engine Readiness & Honest Active Backend Disclosure (Audit Item 9)

@@ -30,6 +30,7 @@ import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.DubbingDeliveryMode
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
 import com.example.engine.ImageProcessor
@@ -198,6 +199,7 @@ class ScreenTranslatorService : Service() {
         ttsManager.addVoiceDataDownloadListener(serviceVoiceDataListener)
         ttsManager.registerTtsDataBroadcastReceiver()
         ttsManager.initializeAsync()
+        ttsManager.prewarmNeuralEngineIfReady()
 
         pipeline = OcrTranslationPipeline.getInstance(applicationContext)
         pipeline.ensureTranslationModelDownloaded(downloadIfMissing = true)
@@ -414,6 +416,7 @@ class ScreenTranslatorService : Service() {
 
         if (active) {
             pipeline.resetAntiRepeatMemory()
+            overlayController?.resetSubtitleCaptionSequence(pipeline.currentEpoch())
             startCaptureLoop()
         } else {
             stopCaptureLoop()
@@ -426,19 +429,23 @@ class ScreenTranslatorService : Service() {
         isFrameInFlight.set(false)
         captureLoopJob = serviceScope.launch {
             while (isActive && TranslatorStateRepository.state.value.isCapturingOcr) {
-                val baseIntervalMs = TranslatorStateRepository.state.value.captureIntervalMs.coerceIn(700L, 5000L)
+                val stateNow = TranslatorStateRepository.state.value
+                val baseIntervalMs = stateNow.captureIntervalMs.coerceIn(700L, 5000L)
                 var nextDelayMs = baseIntervalMs
 
                 if (!isFrameInFlight.compareAndSet(false, true)) {
-                    delay(200L)
+                    delay(120L)
                     continue
                 }
 
                 try {
                     val a11yService = GameVoxAccessibilityService.instance
                     val overlayRect = overlayController?.getOverlayScreenBounds()
+                    val excludeRects = overlayController?.getAllOverlayExclusionBounds()
+                        .orEmpty()
+                        .ifEmpty { listOfNotNull(overlayRect) }
                     val targetBoxRect = overlayController?.getTargetBoxScreenBounds()
-                        ?: TranslatorStateRepository.state.value.targetBoxScreenRect
+                        ?: stateNow.targetBoxScreenRect
 
                     val captureStartMs = System.currentTimeMillis()
                     val capturedBitmap = acquireLatestScreenBitmap()
@@ -479,23 +486,34 @@ class ScreenTranslatorService : Service() {
                                 val (_, translated) = pipeline.processCapturedFrame(
                                     rawBitmap = capturedBitmap,
                                     excludeOverlayRect = overlayRect,
+                                    excludeOverlayRects = excludeRects,
                                     targetRegionScreenRect = targetBoxRect,
                                     rawScreenWidth = liveW,
                                     rawScreenHeight = liveH,
                                     skipIfRegionUnchanged = true,
                                     captureLatencyMs = captureLatencyMs,
+                                    frameTimestampMs = captureStartMs,
                                     enforceActiveSession = true,
-                                    onDebugTextUpdate = { eng, hin, note ->
-                                        overlayController?.updateDebugReadout(eng, hin, note)
+                                    onAlignedDebugTextUpdate = { ev, hin, note ->
+                                        overlayController?.updateDebugReadout(
+                                            englishText = ev.spokenDialogue,
+                                            hindiText = hin,
+                                            statusNote = note,
+                                            sequenceId = ev.sequenceId,
+                                            sessionEpoch = ev.sessionEpoch
+                                        )
                                     }
                                 )
 
-                                // Adaptive cadence: responsive while waiting for next subtitle, relaxed while speaking
+                                // Adaptive cadence: sub-300ms scan in Live Mode while awaiting next subtitle; paced while speaking
                                 nextDelayMs = when {
+                                    stateNow.dubbingDeliveryMode == DubbingDeliveryMode.LIVE_MODE &&
+                                        !pipeline.isTtsSpeakingNow() && translated.isBlank() ->
+                                        stateNow.adaptiveScanIntervalMs.coerceIn(220L, 450L)
                                     pipeline.isTtsSpeakingNow() || translated.isNotBlank() ->
-                                        (baseIntervalMs + 250L).coerceAtMost(1400L)
+                                        baseIntervalMs.coerceIn(550L, 950L)
                                     else ->
-                                        baseIntervalMs.coerceIn(700L, 1000L)
+                                        stateNow.adaptiveScanIntervalMs.coerceIn(250L, 600L)
                                 }
                             }
                         } finally {
@@ -510,8 +528,15 @@ class ScreenTranslatorService : Service() {
                             pipeline.processExtractedRawText(
                                 rawEnglishText = nodeText,
                                 enforceActiveSession = true,
-                                onDebugTextUpdate = { eng, hin, note ->
-                                    overlayController?.updateDebugReadout(eng, hin, note)
+                                frameTimestampMs = System.currentTimeMillis(),
+                                onAlignedDebugTextUpdate = { ev, hin, note ->
+                                    overlayController?.updateDebugReadout(
+                                        englishText = ev.spokenDialogue,
+                                        hindiText = hin,
+                                        statusNote = note,
+                                        sequenceId = ev.sequenceId,
+                                        sessionEpoch = ev.sessionEpoch
+                                    )
                                 }
                             )
                         }

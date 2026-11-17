@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.data.CharacterVoiceAssignment
+import com.example.data.DubbingDeliveryMode
 import com.example.data.VoiceProfile
 import java.util.Locale
 
@@ -11,7 +12,10 @@ data class PendingDubbingItem(
     val voiceProfile: VoiceProfile?,
     val speakerLabel: String,
     val characterAssignment: CharacterVoiceAssignment? = null,
-    val routeDecision: VoiceRouteDecision? = null
+    val routeDecision: VoiceRouteDecision? = null,
+    val sequenceId: Long = 0L,
+    val eventId: String = "",
+    val frameTimestampMs: Long = 0L
 ) {
     fun buildSpeakerContextKey(): String {
         val ns = (routeDecision?.gameNamespace ?: characterAssignment?.gameNamespace ?: "default_game")
@@ -34,11 +38,10 @@ sealed interface DubbingEnqueueOutcome {
 }
 
 /**
- * Short bounded queue (max 2 upcoming lines) for live subtitle dubbing:
- * - Prevents duplicate queuing of near-identical lines by the SAME speaker in the same scene/session.
- * - Allows up to [maxCapacity] upcoming subtitles to wait for the current sentence to finish.
- * - Intelligently skips stale older queued subtitles whenever fast scene transitions arrive
- *   more quickly than TTS can finish speaking.
+ * Subtitle dubbing queue supporting:
+ * - [DubbingDeliveryMode.LIVE_MODE]: Always replaces any waiting obsolete queued lines with the
+ *   newest subtitle (`pending.size <= 1`) so live game audio never lags several lines behind.
+ * - [DubbingDeliveryMode.STORY_MODE]: Preserves bounded FIFO ordering up to [maxCapacity] lines.
  */
 class SubtitleDubbingQueue(
     private val maxCapacity: Int = 2
@@ -51,14 +54,34 @@ class SubtitleDubbingQueue(
         isCurrentlySpeaking: Boolean,
         activeSpokenEnglishNormalized: String,
         activeSpokenTranslated: String,
-        activeSpokenSpeakerContextKey: String = ""
+        activeSpokenSpeakerContextKey: String = "",
+        deliveryMode: DubbingDeliveryMode = DubbingDeliveryMode.STORY_MODE
     ): DubbingEnqueueOutcome = synchronized(lock) {
+        if (item.sequenceId > 0L && pending.any { it.sequenceId > item.sequenceId }) {
+            return DubbingEnqueueOutcome.SkippedDuplicate
+        }
         if (isDuplicate(item, activeSpokenEnglishNormalized, activeSpokenTranslated, activeSpokenSpeakerContextKey)) {
             return DubbingEnqueueOutcome.SkippedDuplicate
         }
 
         if (!isCurrentlySpeaking && pending.isEmpty()) {
             return DubbingEnqueueOutcome.SpeakImmediately(item)
+        }
+
+        if (deliveryMode == DubbingDeliveryMode.LIVE_MODE) {
+            val dropped = if (pending.isNotEmpty()) {
+                val oldest = pending.removeFirst()
+                pending.clear()
+                oldest
+            } else {
+                null
+            }
+            pending.addLast(item)
+            return if (dropped != null) {
+                DubbingEnqueueOutcome.QueuedAndSkippedStale(dropped, pending.size)
+            } else {
+                DubbingEnqueueOutcome.Queued(pending.size)
+            }
         }
 
         var dropped: PendingDubbingItem? = null

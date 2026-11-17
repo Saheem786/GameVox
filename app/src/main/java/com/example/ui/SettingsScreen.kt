@@ -72,12 +72,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.data.DubbingDeliveryMode
 import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorAppState
+import com.example.data.TranslatorStateRepository
 import com.example.data.TtsEngineStatus
 import com.example.service.FreeVoiceBackend
 import java.io.File
@@ -114,12 +118,15 @@ fun SettingsScreen(
     onTestHindiTts: () -> Unit,
     onEnableAccessibility: () -> Unit,
     onInstallVoiceData: () -> Unit,
-    onOpenDiagnosis: () -> Unit
+    onOpenDiagnosis: () -> Unit,
+    onTranslationStyleChange: ((TranslationStyle) -> Unit)? = null,
+    onDubbingDeliveryModeChange: ((DubbingDeliveryMode) -> Unit)? = null
 ) {
     BackHandler {
         onNavigateBack()
     }
 
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -297,6 +304,98 @@ fun SettingsScreen(
                                     }
                                 }
                             )
+
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    text = "Hindi Dialogue Style",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    TranslationStyle.entries.forEach { style ->
+                                        val isSelected = state.translationStyle == style
+                                        FilterChip(
+                                            selected = isSelected,
+                                            onClick = {
+                                                if (onTranslationStyleChange != null) {
+                                                    onTranslationStyleChange(style)
+                                                } else {
+                                                    TranslatorStateRepository.updateTranslationStyle(context, style)
+                                                }
+                                            },
+                                            label = {
+                                                Text(
+                                                    text = style.displayName,
+                                                    style = MaterialTheme.typography.labelMedium
+                                                )
+                                            },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                            ),
+                                            modifier = Modifier.testTag("translation_style_${style.code}")
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = state.translationStyle.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    text = "Dubbing Queue Mode",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    DubbingDeliveryMode.entries.forEach { mode ->
+                                        val isSelected = state.dubbingDeliveryMode == mode
+                                        FilterChip(
+                                            selected = isSelected,
+                                            onClick = {
+                                                if (onDubbingDeliveryModeChange != null) {
+                                                    onDubbingDeliveryModeChange(mode)
+                                                } else {
+                                                    TranslatorStateRepository.updateDubbingDeliveryMode(context, mode)
+                                                }
+                                            },
+                                            label = {
+                                                Text(
+                                                    text = "${mode.displayName} (${mode.shortBadge})",
+                                                    style = MaterialTheme.typography.labelMedium
+                                                )
+                                            },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                                selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                            ),
+                                            modifier = Modifier.testTag("dubbing_delivery_mode_${mode.code}")
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = state.dubbingDeliveryMode.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
 
                             OutlinedButton(
                                 onClick = {

@@ -163,6 +163,104 @@ enum class TranslationMode(
     }
 }
 
+enum class TranslationStyle(
+    val code: String,
+    val displayName: String,
+    val shortBadge: String,
+    val description: String
+) {
+    MODERN_HINDI(
+        code = "modern_hindi",
+        displayName = "Modern Hindi (Default)",
+        shortBadge = "Modern",
+        description = "Natural everyday spoken Hindi with तुम/तुम्हारा, clean emotional tone, and natural loanwords."
+    ),
+    CASUAL_HINGLISH(
+        code = "casual_hinglish",
+        displayName = "Casual Hinglish",
+        shortBadge = "Hinglish",
+        description = "Fast conversational gamer/friend Hindi keeping common English words (bro, wait, tension, backup)."
+    ),
+    FORMAL_HINDI(
+        code = "formal_hindi",
+        displayName = "Formal Hindi",
+        shortBadge = "Formal",
+        description = "Respectful standard Hindi (आप/प्रतीक्षा/सहायता) for cutscenes or formal narration."
+    );
+
+    companion object {
+        fun fromCode(code: String?): TranslationStyle {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: MODERN_HINDI
+        }
+    }
+}
+
+enum class DubbingDeliveryMode(
+    val code: String,
+    val displayName: String,
+    val shortBadge: String,
+    val description: String
+) {
+    LIVE_MODE(
+        code = "live_mode",
+        displayName = "Live Mode (Default)",
+        shortBadge = "Live • Drop Old",
+        description = "Prioritizes newest subtitle: supersedes stale translation jobs and drops obsolete queued lines."
+    ),
+    STORY_MODE(
+        code = "story_mode",
+        displayName = "Story Mode",
+        shortBadge = "Story • Ordered",
+        description = "Keeps bounded sequential dialogue order for slow story scenes (max 2 upcoming lines)."
+    );
+
+    companion object {
+        fun fromCode(code: String?): DubbingDeliveryMode {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: LIVE_MODE
+        }
+    }
+}
+
+/**
+ * Immutable subtitle snapshot propagated from Frame Capture -> OCR -> Speaker Recognition -> Translation -> UI/TTS
+ * so stale async translation/TTS callbacks never overwrite a newer subtitle or speak obsolete dialogue.
+ */
+data class SubtitleEvent(
+    val eventId: String,
+    val sequenceId: Long,
+    val sessionEpoch: Long,
+    val frameTimestampMs: Long,
+    val sourceText: String,
+    val spokenDialogue: String,
+    val speakerName: String? = null,
+    val gameNamespace: String = "default_game"
+)
+
+data class PipelineStageTimestamps(
+    val subtitleEventId: String = "",
+    val sequenceId: Long = 0L,
+    val frameCaptureMs: Long = 0L,
+    val ocrMs: Long = 0L,
+    val speakerResolveMs: Long = 0L,
+    val translationMs: Long = 0L,
+    val ttsPrepMs: Long = 0L,
+    val playbackStartFromFrameMs: Long = 0L,
+    val ttsGenerationMode: String = "Not synthesized yet"
+)
+
+data class SubtitleAlignmentLogEntry(
+    val sequenceId: Long,
+    val eventId: String,
+    val speakerLabel: String,
+    val speakerId: Int,
+    val rawEnglish: String,
+    val translatedHindi: String,
+    val translationStyle: String,
+    val deliveryMode: String,
+    val status: String,
+    val endToEndLatencyMs: Long
+)
+
 data class SubtitleTranslationEntry(
     val id: Long,
     val timestamp: String,
@@ -171,7 +269,9 @@ data class SubtitleTranslationEntry(
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val wasSpoken: Boolean,
     val skippedReason: String? = null,
-    val processingTimeMs: Long = 0L
+    val processingTimeMs: Long = 0L,
+    val sequenceId: Long = 0L,
+    val eventId: String = ""
 )
 
 data class TranslatorAppState(
@@ -188,6 +288,15 @@ data class TranslatorAppState(
     val targetBoxScreenRect: Rect? = null,
     val targetLanguage: TargetLanguage = TargetLanguage.HINDI,
     val translationMode: TranslationMode = TranslationMode.ON_DEVICE_MLKIT,
+    val translationStyle: TranslationStyle = TranslationStyle.MODERN_HINDI,
+    val dubbingDeliveryMode: DubbingDeliveryMode = DubbingDeliveryMode.LIVE_MODE,
+    val adaptiveScanIntervalMs: Long = 280L,
+    val latestSubtitleEventId: String = "",
+    val latestSubtitleSequenceId: Long = 0L,
+    val latestSubtitleSessionEpoch: Long = 0L,
+    val ttsGenerationModeLabel: String = "Not synthesized yet",
+    val stageTimestamps: PipelineStageTimestamps = PipelineStageTimestamps(),
+    val alignmentLogs: List<SubtitleAlignmentLogEntry> = emptyList(),
     val aiPrivacyConsentAccepted: Boolean = false,
     val useHighQualityNetworkVoice: Boolean = false,
     val ssmlEnabledOnDevice: Boolean = false,
@@ -311,6 +420,8 @@ object TranslatorStateRepository {
     private const val KEY_KOKORO_MODEL_PATH = "kokoro_model_path_v1"
     private const val KEY_KOKORO_USE_GPU = "kokoro_use_gpu_v1"
     private const val KEY_TRANSLATION_MODE = "translation_mode_v1"
+    private const val KEY_TRANSLATION_STYLE = "translation_style_v1"
+    private const val KEY_DUBBING_DELIVERY_MODE = "dubbing_delivery_mode_v1"
     private const val KEY_AI_PRIVACY_CONSENT = "ai_privacy_consent_v1"
     private const val KEY_GLOSSARY_JSON = "pronunciation_glossary_v1"
     private const val KEY_CHATTERBOX_SERVER_URL = "chatterbox_server_url_v1"
@@ -328,6 +439,12 @@ object TranslatorStateRepository {
         val targetLang = TargetLanguage.fromCode(langCode)
         val translationMode = TranslationMode.fromCode(
             prefs.getString(KEY_TRANSLATION_MODE, TranslationMode.ON_DEVICE_MLKIT.code)
+        )
+        val translationStyle = TranslationStyle.fromCode(
+            prefs.getString(KEY_TRANSLATION_STYLE, TranslationStyle.MODERN_HINDI.code)
+        )
+        val deliveryMode = DubbingDeliveryMode.fromCode(
+            prefs.getString(KEY_DUBBING_DELIVERY_MODE, DubbingDeliveryMode.LIVE_MODE.code)
         )
         val aiConsent = prefs.getBoolean(KEY_AI_PRIVACY_CONSENT, false)
         val useHqVoice = prefs.getBoolean(KEY_NETWORK_VOICE, false)
@@ -356,6 +473,8 @@ object TranslatorStateRepository {
             it.copy(
                 targetLanguage = targetLang,
                 translationMode = translationMode,
+                translationStyle = translationStyle,
+                dubbingDeliveryMode = deliveryMode,
                 aiPrivacyConsentAccepted = aiConsent,
                 useHighQualityNetworkVoice = useHqVoice,
                 ssmlEnabledOnDevice = ssmlEnabled,
@@ -719,6 +838,22 @@ object TranslatorStateRepository {
         }
     }
 
+    fun updateTranslationStyle(context: Context, style: TranslationStyle) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_TRANSLATION_STYLE, style.code)
+            .apply()
+        _state.update { it.copy(translationStyle = style) }
+    }
+
+    fun updateDubbingDeliveryMode(context: Context, mode: DubbingDeliveryMode) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_DUBBING_DELIVERY_MODE, mode.code)
+            .apply()
+        _state.update { it.copy(dubbingDeliveryMode = mode) }
+    }
+
     fun upsertGlossaryEntry(context: Context, term: String, pronunciation: String): Boolean {
         val sanitized = PronunciationGlossary.sanitizeEntry(term, pronunciation) ?: return false
         val current = _state.value.pronunciationGlossary.toMutableMap()
@@ -1061,15 +1196,66 @@ object TranslatorStateRepository {
         }
     }
 
+    fun updateStageTimestamps(
+        timestamps: PipelineStageTimestamps,
+        endToEndLatencyMs: Long? = null
+    ) {
+        _state.update { current ->
+            current.copy(
+                stageTimestamps = timestamps,
+                ttsGenerationModeLabel = timestamps.ttsGenerationMode.ifBlank { current.ttsGenerationModeLabel },
+                endToEndSubtitleToAudioLatencyMs = endToEndLatencyMs ?: current.endToEndSubtitleToAudioLatencyMs
+            )
+        }
+    }
+
+    fun updateTtsGenerationMode(modeLabel: String) {
+        if (modeLabel.isBlank()) return
+        _state.update { current ->
+            current.copy(
+                ttsGenerationModeLabel = modeLabel,
+                stageTimestamps = current.stageTimestamps.copy(ttsGenerationMode = modeLabel)
+            )
+        }
+    }
+
+    fun appendAlignmentLog(entry: SubtitleAlignmentLogEntry) {
+        _state.update { current ->
+            val updated = (listOf(entry) + current.alignmentLogs).take(30)
+            current.copy(alignmentLogs = updated)
+        }
+    }
+
+    fun clearAlignmentLogs() {
+        _state.update { it.copy(alignmentLogs = emptyList()) }
+    }
+
+    /**
+     * Records translation/caption result while enforcing strict subtitle sequence & epoch ordering:
+     * if [sequenceId] is provided (> 0) and is strictly older than [TranslatorAppState.latestSubtitleSequenceId]
+     * within the same or older [sessionEpoch], the stale result is ignored so it never overwrites a newer caption.
+     */
     fun recordTranslationResult(
         english: String,
         hindi: String,
         wasSpoken: Boolean,
         skippedReason: String? = null,
         processingTimeMs: Long = 0L,
-        timestamp: String
-    ) {
+        timestamp: String,
+        sequenceId: Long = 0L,
+        eventId: String = "",
+        sessionEpoch: Long = 0L
+    ): Boolean {
+        var accepted = true
         _state.update { current ->
+            val isStaleSequence = sequenceId > 0L && (
+                sessionEpoch < current.latestSubtitleSessionEpoch ||
+                    (sessionEpoch == current.latestSubtitleSessionEpoch && sequenceId < current.latestSubtitleSequenceId)
+                )
+            if (isStaleSequence) {
+                accepted = false
+                return@update current
+            }
             val newEntry = SubtitleTranslationEntry(
                 id = System.nanoTime(),
                 timestamp = timestamp,
@@ -1078,19 +1264,35 @@ object TranslatorStateRepository {
                 targetLanguage = current.targetLanguage,
                 wasSpoken = wasSpoken,
                 skippedReason = skippedReason,
-                processingTimeMs = processingTimeMs
+                processingTimeMs = processingTimeMs,
+                sequenceId = sequenceId,
+                eventId = eventId
             )
             val updatedHistory = (listOf(newEntry) + current.history).take(25)
             current.copy(
                 lastExtractedEnglish = english,
                 lastTranslatedHindi = hindi,
                 lastSpokenText = if (wasSpoken) hindi else current.lastSpokenText,
+                latestSubtitleSequenceId = if (sequenceId > 0L) maxOf(sequenceId, current.latestSubtitleSequenceId) else current.latestSubtitleSequenceId,
+                latestSubtitleEventId = eventId.ifBlank { current.latestSubtitleEventId },
+                latestSubtitleSessionEpoch = maxOf(sessionEpoch, current.latestSubtitleSessionEpoch),
                 duplicateSkippedCount = if (skippedReason == "Anti-Repeat: Identical to lastSpokenText") {
                     current.duplicateSkippedCount + 1
                 } else {
                     current.duplicateSkippedCount
                 },
                 history = updatedHistory
+            )
+        }
+        return accepted
+    }
+
+    fun resetSubtitleSequenceTracking(sessionEpoch: Long) {
+        _state.update { current ->
+            current.copy(
+                latestSubtitleSequenceId = 0L,
+                latestSubtitleEventId = "",
+                latestSubtitleSessionEpoch = maxOf(sessionEpoch, current.latestSubtitleSessionEpoch)
             )
         }
     }
@@ -1100,6 +1302,6 @@ object TranslatorStateRepository {
     }
 
     fun clearHistory() {
-        _state.update { it.copy(history = emptyList(), duplicateSkippedCount = 0) }
+        _state.update { it.copy(history = emptyList(), duplicateSkippedCount = 0, alignmentLogs = emptyList()) }
     }
 }

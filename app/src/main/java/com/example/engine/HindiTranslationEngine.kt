@@ -5,6 +5,7 @@ import android.util.LruCache
 import com.example.data.ModelDownloadStatus
 import com.example.data.TargetLanguage
 import com.example.data.TranslationMode
+import com.example.data.TranslationStyle
 import com.example.data.TranslatorStateRepository
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
@@ -20,6 +21,10 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
@@ -64,13 +69,66 @@ object HindiTranslationEngine {
     @Volatile
     internal var mlKitPreDownloadOverride: (suspend (TargetLanguage, Boolean) -> Boolean)? = null
 
+    private val isBackgroundPackDownloadTriggered = AtomicBoolean(false)
+
+    private val HINDI_STYLE_PRESETS: Map<String, Map<TranslationStyle, String>> = mapOf(
+        "yeah, well... maybe she likes doing it?" to mapOf(
+            TranslationStyle.MODERN_HINDI to "हाँ, हो सकता है उसे ऐसा करना पसंद हो।",
+            TranslationStyle.CASUAL_HINGLISH to "हाँ यार, हो सकता है उसे ऐसा करना पसंद हो।",
+            TranslationStyle.FORMAL_HINDI to "जी हाँ, संभवतः उन्हें ऐसा करना पसंद है।"
+        ),
+        "yeah, well... maybe she likes doing it" to mapOf(
+            TranslationStyle.MODERN_HINDI to "हाँ, हो सकता है उसे ऐसा करना पसंद हो।",
+            TranslationStyle.CASUAL_HINGLISH to "हाँ यार, हो सकता है उसे ऐसा करना पसंद हो।",
+            TranslationStyle.FORMAL_HINDI to "जी हाँ, संभवतः उन्हें ऐसा करना पसंद है।"
+        ),
+        "it's the breakfast that's waiting for you downstairs, dummy." to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे बुद्धू, नीचे नाश्ता तुम्हारा इंतज़ार कर रहा है!",
+            TranslationStyle.CASUAL_HINGLISH to "अरे बुद्धू, नीचे ब्रेकफ़ास्ट तुम्हारा वेट कर रहा है!",
+            TranslationStyle.FORMAL_HINDI to "मूर्ख, नीचे नाश्ता आपकी प्रतीक्षा कर रहा है।"
+        ),
+        "its the breakfast thats waiting for you downstairs, dummy." to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे बुद्धू, नीचे नाश्ता तुम्हारा इंतज़ार कर रहा है!",
+            TranslationStyle.CASUAL_HINGLISH to "अरे बुद्धू, नीचे ब्रेकफ़ास्ट तुम्हारा वेट कर रहा है!",
+            TranslationStyle.FORMAL_HINDI to "मूर्ख, नीचे नाश्ता आपकी प्रतीक्षा कर रहा है।"
+        ),
+        "hey, you're the one who started it!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे, शुरू तो तुमने किया था!",
+            TranslationStyle.CASUAL_HINGLISH to "अरे यार, स्टार्ट तो तुमने ही किया था!",
+            TranslationStyle.FORMAL_HINDI to "सुनिए, इसकी शुरुआत तो आपने ही की थी!"
+        ),
+        "hey, you are the one who started it!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "अरे, शुरू तो तुमने किया था!",
+            TranslationStyle.CASUAL_HINGLISH to "अरे यार, स्टार्ट तो तुमने ही किया था!",
+            TranslationStyle.FORMAL_HINDI to "सुनिए, इसकी शुरुआत तो आपने ही की थी!"
+        ),
+        "i got your back." to mapOf(
+            TranslationStyle.MODERN_HINDI to "टेंशन मत लो, मैं हूँ ना!",
+            TranslationStyle.CASUAL_HINGLISH to "टेंशन मत लो ब्रो, मैं हूँ ना!",
+            TranslationStyle.FORMAL_HINDI to "चिंता मत कीजिए, मैं आपके साथ हूँ।"
+        ),
+        "i got your back!" to mapOf(
+            TranslationStyle.MODERN_HINDI to "टेंशन मत लो, मैं हूँ ना!",
+            TranslationStyle.CASUAL_HINGLISH to "टेंशन मत लो ब्रो, मैं हूँ ना!",
+            TranslationStyle.FORMAL_HINDI to "चिंता मत कीजिए, मैं आपके साथ हूँ।"
+        )
+    )
+
     private val MULTI_LANG_DIALOGUE_MAP: Map<TargetLanguage, Map<String, String>> = mapOf(
         TargetLanguage.HINDI to mapOf(
+            "yeah, well... maybe she likes doing it?" to "हाँ, हो सकता है उसे ऐसा करना पसंद हो।",
+            "yeah, well... maybe she likes doing it" to "हाँ, हो सकता है उसे ऐसा करना पसंद हो।",
+            "it's the breakfast that's waiting for you downstairs, dummy." to "अरे बुद्धू, नीचे नाश्ता तुम्हारा इंतज़ार कर रहा है!",
+            "its the breakfast thats waiting for you downstairs, dummy." to "अरे बुद्धू, नीचे नाश्ता तुम्हारा इंतज़ार कर रहा है!",
+            "hey, you're the one who started it!" to "अरे, शुरू तो तुमने किया था!",
+            "hey, you are the one who started it!" to "अरे, शुरू तो तुमने किया था!",
+            "i got your back." to "टेंशन मत लो, मैं हूँ ना!",
+            "i got your back!" to "टेंशन मत लो, मैं हूँ ना!",
             "are you kidding me?" to "मज़ाक कर रहे हो क्या?",
             "let's get moving!" to "चलो, जल्दी निकलते हैं!",
             "lets get moving!" to "चलो, जल्दी निकलते हैं!",
             "i won't let you down." to "भरोसा रखो, तुम्हें निराश नहीं करूँगा।",
-            "i won't let you down!" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा!",
+            "i won't let you down!" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा।",
             "don't mess with me!" to "मुझसे पंगा मत लो!",
             "what the hell is going on?" to "ये सब क्या चल रहा है यार?",
             "get out of here!" to "यहाँ से निकलो, जल्दी!",
@@ -276,7 +334,10 @@ object HindiTranslationEngine {
         "loading game" to "गेम लोड हो रहा है",
         "talk to" to "से बात करो",
         "pick up" to "उठा लो",
-        "inventory full" to "इन्वेंटरी फुल है"
+        "inventory full" to "इन्वेंटरी फुल है",
+        "waiting for you" to "तुम्हारा इंतज़ार कर रहा है",
+        "started it" to "शुरू किया था",
+        "i got your back" to "मैं हूँ ना"
     )
 
     // Post-processor rules converting stiff/formal Sanskritized Hindi (from ML Kit / Google Translate)
@@ -289,10 +350,16 @@ object HindiTranslationEngine {
         "मैं आपको निराश नहीं करूँगा" to "भरोसा रखो, तुम्हें निराश नहीं करूँगा",
         "आइए चलते हैं" to "चलो, जल्दी निकलते हैं",
         "आइए आगे बढ़ें" to "चलो, आगे बढ़ते हैं",
+        "आपकी प्रतीक्षा कर रहा है" to "तुम्हारा इंतज़ार कर रहा है",
+        "आपकी प्रतीक्षा कर रही है" to "तुम्हारा इंतज़ार कर रही है",
+        "आपके लिए प्रतीक्षा कर रहा है" to "तुम्हारा इंतज़ार कर रहा है",
+        "आपने ही इसकी शुरुआत की थी" to "शुरू तो तुमने किया था",
+        "आप ही ने शुरू किया" to "शुरू तो तुमने किया",
+        "मैं आपका साथ दूंगा" to "टेंशन मत लो, मैं हूँ ना",
         "मेरे पिता के अंतिम संस्कार" to "मेरे पापा के फ्यूनरल",
         "मेरे पिता का अंतिम संस्कार" to "मेरे पापा का फ्यूनरल",
         "पिता के अंतिम संस्कार" to "पापा के फ्यूनरल",
-        "पिता का अंतिम संस्कार" to "पापा का फ्यूनरल",
+        "पिता का अंतिम संस्कार" to "पापा के फ्यूनरल",
         "अंतिम संस्कार में" to "फ्यूनरल पे",
         "अंतिम संस्कार पर" to "फ्यूनरल पे",
         "अंतिम संस्कार" to "फ्यूनरल",
@@ -300,7 +367,7 @@ object HindiTranslationEngine {
         "मेरे पिताजी" to "मेरे पापा",
         "मेरे पिता" to "मेरे पापा",
         "तुम्हारे पिता" to "तुम्हारे पापा",
-        "आपके पिता" to "आपके पापा",
+        "आपके पिता" to "तुम्हारे पापा",
         "पिताजी" to "पापा",
         "मेरी माताजी" to "मेरी मम्मी",
         "मेरी माता" to "मेरी मम्मी",
@@ -380,7 +447,10 @@ object HindiTranslationEngine {
         "can" to "सकते हो", "must" to "पक्का", "in" to "में", "on" to "पे", "at" to "पे",
         "to" to "को", "from" to "से", "with" to "के साथ", "without" to "के बिना", "of" to "का",
         "for" to "के लिए", "and" to "और", "or" to "या", "but" to "पर", "not" to "नहीं",
-        "no" to "नहीं", "yes" to "हाँ", "hello" to "हेलो", "welcome" to "वेलकम",
+        "no" to "नहीं", "yes" to "हाँ", "yeah" to "हाँ", "maybe" to "शायद", "hey" to "अरे",
+        "hello" to "हेलो", "welcome" to "वेलकम",
+        "breakfast" to "नाश्ता", "downstairs" to "नीचे", "upstairs" to "ऊपर", "dummy" to "बुद्धू",
+        "started" to "शुरू किया", "waiting" to "इंतज़ार कर रहा",
         "father" to "पापा", "father's" to "पापा का", "dad" to "पापा", "mother" to "मम्मी",
         "mom" to "मम्मी", "brother" to "भाई", "sister" to "बहन", "funeral" to "फ्यूनरल",
         "alert" to "अलर्ट", "warning" to "वॉर्निंग", "danger" to "खतरा", "safe" to "सेफ",
@@ -570,17 +640,29 @@ object HindiTranslationEngine {
      */
     fun translateOfflinePhrasebook(
         englishText: String,
-        targetLanguage: TargetLanguage = TargetLanguage.HINDI
+        targetLanguage: TargetLanguage = TargetLanguage.HINDI,
+        translationStyle: TranslationStyle = TranslatorStateRepository.state.value.translationStyle
     ): String? {
         val withoutSpeaker = SpeakerHeuristicEngine.stripLeadingCharacterName(englishText).trim()
         val clean = STAGE_DIRECTION_PREFIX_REGEX.replace(withoutSpeaker, "").replace(Regex("\\s+"), " ").trim()
         if (clean.isEmpty()) return null
         val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
-        MULTI_LANG_DIALOGUE_MAP[targetLanguage]?.get(normalized)?.let { return it }
-        return convertFormalHindiToModernCasual(
-            translateOfflineFallback(clean, targetLanguage),
-            normalized
-        )
+        if (targetLanguage == TargetLanguage.HINDI) {
+            HINDI_STYLE_PRESETS[normalized]?.get(translationStyle)?.let { return it }
+        }
+        MULTI_LANG_DIALOGUE_MAP[targetLanguage]?.get(normalized)?.let { preset ->
+            return if (targetLanguage == TargetLanguage.HINDI) {
+                applyTranslationStyle(preset, normalized, translationStyle)
+            } else {
+                preset
+            }
+        }
+        val raw = translateOfflineFallback(clean, targetLanguage)
+        return if (targetLanguage == TargetLanguage.HINDI) {
+            applyTranslationStyle(raw, normalized, translationStyle)
+        } else {
+            raw
+        }
     }
 
     /**
@@ -590,13 +672,17 @@ object HindiTranslationEngine {
         englishText: String,
         targetLanguage: TargetLanguage = TargetLanguage.HINDI,
         mode: TranslationMode = TranslatorStateRepository.state.value.translationMode,
-        speakerName: String? = null
+        speakerName: String? = null,
+        translationStyle: TranslationStyle = TranslatorStateRepository.state.value.translationStyle,
+        gameNamespace: String = "default_game"
     ): String {
         return translateSuspendDetailed(
             englishText = englishText,
             targetLanguage = targetLanguage,
             mode = mode,
-            speakerName = speakerName
+            speakerName = speakerName,
+            translationStyle = translationStyle,
+            gameNamespace = gameNamespace
         ).translatedText
     }
 
@@ -604,18 +690,15 @@ object HindiTranslationEngine {
      * Primary suspend translation entrypoint returning both translated dialogue and exact
      * source provenance + latency telemetry for the Diagnosis screen.
      *
-     * Privacy Guarantee:
-     * - When [mode] is [TranslationMode.ON_DEVICE_MLKIT], this method NEVER calls
-     *   [translateViaGoogleApi] or any external network translator. If the offline ML Kit pack is
-     *   not yet installed, it surfaces download status and returns the bounded local phrasebook fallback.
-     * - When [mode] is [TranslationMode.CONTEXT_AWARE_AI], it checks explicit consent and
-     *   [ContextAwareAiTranslator.isFirebaseAiAvailable], falling back strictly offline if unavailable.
+     * Cache Key: includes mode, targetLanguage, translationStyle, normalized speaker, gameNamespace, and normalized dialogue.
      */
     suspend fun translateSuspendDetailed(
         englishText: String,
         targetLanguage: TargetLanguage = TargetLanguage.HINDI,
         mode: TranslationMode = TranslatorStateRepository.state.value.translationMode,
-        speakerName: String? = null
+        speakerName: String? = null,
+        translationStyle: TranslationStyle = TranslatorStateRepository.state.value.translationStyle,
+        gameNamespace: String = "default_game"
     ): DetailedTranslationResult {
         didAttemptNetworkTranslationOnLastCall = false
         val startMs = System.currentTimeMillis()
@@ -630,7 +713,9 @@ object HindiTranslationEngine {
         }
 
         val normalized = clean.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ")
-        val cacheKey = "${mode.code}:${targetLanguage.code}:v6:$normalized"
+        val speakerKey = (speakerName?.trim()?.lowercase(Locale.ROOT).orEmpty()).ifBlank { "unknown" }
+        val nsKey = gameNamespace.trim().lowercase(Locale.ROOT).ifBlank { "default_game" }
+        val cacheKey = "${mode.code}:${targetLanguage.code}:${translationStyle.code}:$speakerKey:$nsKey:v7:$normalized"
 
         translationCache.get(cacheKey)?.let { cached ->
             recordContextLine(clean, cached)
@@ -642,13 +727,29 @@ object HindiTranslationEngine {
         }
 
         // Fast-path preset conversational matches (0ms latency, 100% offline)
+        if (targetLanguage == TargetLanguage.HINDI) {
+            HINDI_STYLE_PRESETS[normalized]?.get(translationStyle)?.let { stylePreset ->
+                translationCache.put(cacheKey, stylePreset)
+                recordContextLine(clean, stylePreset)
+                return DetailedTranslationResult(
+                    translatedText = stylePreset,
+                    sourceLabel = "Offline Phrasebook (Exact)",
+                    latencyMs = System.currentTimeMillis() - startMs
+                )
+            }
+        }
         val langDialogues = MULTI_LANG_DIALOGUE_MAP[targetLanguage]
         if (langDialogues != null) {
             langDialogues[normalized]?.let { preset ->
-                translationCache.put(cacheKey, preset)
-                recordContextLine(clean, preset)
+                val styled = if (targetLanguage == TargetLanguage.HINDI) {
+                    applyTranslationStyle(preset, normalized, translationStyle)
+                } else {
+                    preset
+                }
+                translationCache.put(cacheKey, styled)
+                recordContextLine(clean, styled)
                 return DetailedTranslationResult(
-                    translatedText = preset,
+                    translatedText = styled,
                     sourceLabel = "Offline Phrasebook (Exact)",
                     latencyMs = System.currentTimeMillis() - startMs
                 )
@@ -668,12 +769,13 @@ object HindiTranslationEngine {
                         englishDialogue = clean,
                         targetLanguage = targetLanguage,
                         speakerName = speakerName,
-                        recentLines = snapshotContext
+                        recentLines = snapshotContext,
+                        translationStyle = translationStyle
                     )
                 ) {
                     is ContextAiTranslationResult.Success -> {
                         val polished = if (targetLanguage == TargetLanguage.HINDI) {
-                            convertFormalHindiToModernCasual(aiResult.translatedText, normalized)
+                            applyTranslationStyle(aiResult.translatedText, normalized, translationStyle)
                         } else {
                             aiResult.translatedText.trim()
                         }
@@ -707,7 +809,7 @@ object HindiTranslationEngine {
         val mlKitResult = translateViaOnDeviceMlKit(clean, targetLanguage)
         if (!mlKitResult.isNullOrBlank()) {
             val finalResult = if (targetLanguage == TargetLanguage.HINDI) {
-                convertFormalHindiToModernCasual(mlKitResult, normalized)
+                applyTranslationStyle(mlKitResult, normalized, translationStyle)
             } else {
                 mlKitResult.trim()
             }
@@ -724,7 +826,7 @@ object HindiTranslationEngine {
         // Strictly Local Offline Fallback (NEVER calls translateViaGoogleApi or network endpoints)
         val offlineRaw = translateOfflineFallback(clean, targetLanguage)
         val offlineCasual = if (targetLanguage == TargetLanguage.HINDI) {
-            convertFormalHindiToModernCasual(offlineRaw, normalized)
+            applyTranslationStyle(offlineRaw, normalized, translationStyle)
         } else {
             offlineRaw
         }
@@ -766,11 +868,20 @@ object HindiTranslationEngine {
         }
         val mlKitCode = resolveMlKitTargetCode(targetLanguage) ?: return null
         return try {
+            // Check non-blockingly so missing packs never stall live subtitle dubbing for 30s!
             val isReady = ensureOfflineModelDownloaded(
                 targetLanguage = targetLanguage,
-                downloadIfMissing = true
+                downloadIfMissing = false
             )
             if (!isReady) {
+                if (isBackgroundPackDownloadTriggered.compareAndSet(false, true)) {
+                    CoroutineScope(Dispatchers.IO).launch {
+                        ensureOfflineModelDownloaded(
+                            targetLanguage = targetLanguage,
+                            downloadIfMissing = true
+                        )
+                    }
+                }
                 return null
             }
             val translator = getOrCreateMlKitTranslator(mlKitCode)
@@ -786,6 +897,44 @@ object HindiTranslationEngine {
         } catch (e: Exception) {
             Log.w(TAG, "ML Kit on-device translation unavailable, using strictly offline phrasebook", e)
             null
+        }
+    }
+
+    fun applyTranslationStyle(
+        hindiText: String,
+        originalEnglishLower: String = "",
+        style: TranslationStyle = TranslatorStateRepository.state.value.translationStyle
+    ): String {
+        val cleanInput = hindiText.trim()
+        if (cleanInput.isEmpty()) return cleanInput
+        return when (style) {
+            TranslationStyle.MODERN_HINDI -> convertFormalHindiToModernCasual(cleanInput, originalEnglishLower)
+            TranslationStyle.CASUAL_HINGLISH -> {
+                var out = convertFormalHindiToModernCasual(cleanInput, originalEnglishLower)
+                out = out
+                    .replace("इंतज़ार", "वेट")
+                    .replace("नाश्ता", "ब्रेकफ़ास्ट")
+                    .replace("शुरू तो", "स्टार्ट तो")
+                    .replace("शुरू किया", "स्टार्ट किया")
+                    .replace("मदद", "हेल्प")
+                    .replace("दोस्त", "ब्रो")
+                out.replace(Regex("\\s+"), " ").trim()
+            }
+            TranslationStyle.FORMAL_HINDI -> {
+                var out = cleanInput
+                out = out
+                    .replace("वेट करो", "प्रतीक्षा करें")
+                    .replace("इंतज़ार", "प्रतीक्षा")
+                    .replace("प्लीज़", "कृपया")
+                    .replace("थैंक्स", "धन्यवाद")
+                    .replace("तुम्हारा", "आपका")
+                    .replace("तुम्हारे", "आपके")
+                    .replace("तुमने", "आपने")
+                    .replace("मदद", "सहायता")
+                    .replace("पापा", "पिताजी")
+                    .replace("दोस्त", "मित्र")
+                out.replace(Regex("\\s+"), " ").trim()
+            }
         }
     }
 
@@ -808,6 +957,7 @@ object HindiTranslationEngine {
     internal fun clearCacheForTesting() {
         translationCache.evictAll()
         downloadedLanguagePacks.clear()
+        isBackgroundPackDownloadTriggered.set(false)
         clearSceneContext()
     }
 

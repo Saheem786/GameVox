@@ -15,6 +15,8 @@ import android.speech.tts.Voice
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.data.CharacterVoiceAssignment
+import com.example.data.DubbingDeliveryMode
+import com.example.data.PipelineStageTimestamps
 import com.example.data.SpeakerGender
 import com.example.data.TargetLanguage
 import com.example.data.TranslatorStateRepository
@@ -193,6 +195,13 @@ class ForegroundTtsManager private constructor(context: Context) {
     var lastSpokenSpeakerId: Int = -1
         private set
 
+    @Volatile
+    var activeSpeakingSequenceId: Long = 0L
+        private set
+
+    @Volatile
+    private var prewarmAttempted: Boolean = false
+
     /**
      * Callback invoked immediately when an utterance completes (`onDone`), used to drain the
      * short subtitle dubbing queue seamlessly.
@@ -269,7 +278,41 @@ class ForegroundTtsManager private constructor(context: Context) {
             TranslatorStateRepository.updateKokoroStatusMessage(discovery.statusSummary)
             refreshInstalledEnginesList()
             initializeAsync(forceRebind = true)
+            prewarmNeuralEngineIfReady()
         }
+    }
+
+    /**
+     * Pre-warms in-process Supertonic 3 ONNX weights and native inference handles on a background thread
+     * before live gameplay starts so the first subtitle doesn't pay cold model initialization latency.
+     */
+    fun prewarmNeuralEngineIfReady(forceRetry: Boolean = false) {
+        if (!forceRetry && prewarmAttempted && sherpaEngine.isModelRuntimeInitialized) return
+        if (!SupertonicModelManager.isModelReady(appContext)) return
+        prewarmAttempted = true
+        managerScope.launch(Dispatchers.IO) {
+            if (!sherpaEngine.isModelRuntimeInitialized) {
+                val ok = sherpaEngine.initialize()
+                Log.i(TAG, "Pre-warmed Supertonic 3 neural engine before gameplay: ready=$ok")
+            }
+        }
+    }
+
+    /**
+     * In [DubbingDeliveryMode.LIVE_MODE], stops currently speaking outdated audio when superseded by
+     * a newer distinct subtitle event (`newSequenceId > activeSpeakingSequenceId`).
+     */
+    fun stopIfSupersededInLiveMode(newSequenceId: Long): Boolean {
+        if (newSequenceId <= 0L) return false
+        if (TranslatorStateRepository.state.value.dubbingDeliveryMode != DubbingDeliveryMode.LIVE_MODE) {
+            return false
+        }
+        val activeSeq = activeSpeakingSequenceId
+        if (activeSeq > 0L && newSequenceId > activeSeq && isSpeakingNow()) {
+            stopSpeaking()
+            return true
+        }
+        return false
     }
 
     fun addVoiceDataDownloadListener(listener: VoiceDataDownloadListener) {
@@ -1228,12 +1271,17 @@ class ForegroundTtsManager private constructor(context: Context) {
         sourceEnglishText: String = "",
         isBenchmarkRun: Boolean = false,
         characterAssignment: CharacterVoiceAssignment? = null,
-        routeDecision: com.example.engine.VoiceRouteDecision? = null
+        routeDecision: com.example.engine.VoiceRouteDecision? = null,
+        sequenceId: Long = 0L,
+        subtitleEventId: String = "",
+        frameTimestampMs: Long = 0L,
+        deliveryMode: DubbingDeliveryMode = TranslatorStateRepository.state.value.dubbingDeliveryMode
     ): Boolean {
         if (text.isBlank()) return false
 
         val state = TranslatorStateRepository.state.value
         val currentEpoch = _playbackEpoch.incrementAndGet()
+        activeSpeakingSequenceId = sequenceId
 
         // Resolve the immutable VoiceRouteDecision BEFORE synthesis
         val effectiveRoute: com.example.engine.VoiceRouteDecision = when {
@@ -1447,9 +1495,18 @@ class ForegroundTtsManager private constructor(context: Context) {
                         )
                     },
                     onFirstAudioStarted = { firstPlayableMs ->
+                        val e2eMs = if (frameTimestampMs > 0L) {
+                            (System.currentTimeMillis() - frameTimestampMs).coerceAtLeast(firstPlayableMs)
+                        } else {
+                            null
+                        }
+                        TranslatorStateRepository.updateTtsGenerationMode(
+                            "FULL_BUFFER_PREGENERATED_BEFORE_PLAYBACK (Chatterbox WAV -> ExoPlayer)"
+                        )
                         TranslatorStateRepository.updateDiagnosisMetrics(
                             ttsFirstAudioLatencyMs = firstPlayableMs,
-                            ttsAudioTrackWriteLatencyMs = firstPlayableMs
+                            ttsAudioTrackWriteLatencyMs = firstPlayableMs,
+                            endToEndSubtitleToAudioLatencyMs = e2eMs
                         )
                     },
                     onCompleted = {
@@ -1693,9 +1750,15 @@ class ForegroundTtsManager private constructor(context: Context) {
                     pitch = pitch,
                     epoch = epoch,
                     onFirstAudioStarted = { latencyMs ->
+                        val e2eMs = if (frameTimestampMs > 0L) {
+                            (System.currentTimeMillis() - frameTimestampMs).coerceAtLeast(latencyMs)
+                        } else {
+                            null
+                        }
                         TranslatorStateRepository.clearVoiceEngineWarning()
                         TranslatorStateRepository.updateDiagnosisMetrics(
                             ttsFirstAudioLatencyMs = latencyMs,
+                            endToEndSubtitleToAudioLatencyMs = e2eMs,
                             activeVoiceName = "Supertonic 3 (Sid #$sid • ${activeAssignment.displayName})"
                         )
                     },
@@ -1825,6 +1888,9 @@ class ForegroundTtsManager private constructor(context: Context) {
 
         // 3. Android System / Preferred Engine Fallback
         val sysBackend = resolveSystemFallbackBackendCode(state)
+        TranslatorStateRepository.updateTtsGenerationMode(
+            "ANDROID_SYSTEM_TTS_QUEUED ($sysBackend)"
+        )
         if (sysBackend == "SYSTEM_FALLBACK_SINGLE_VOICE") {
             val warnMsg = "WARNING: SYSTEM_FALLBACK_SINGLE_VOICE active — ${canonicalSelection.selectionReason}. ${activeAssignment.displayName} (SID #${effectiveRoute.selectedSpeakerId}) and all characters will sound identical on system TTS (${state.activeTtsEngineLabel}). Open Voice Manager to download & verify Supertonic 3 (~145 MB)."
             TranslatorStateRepository.updateVoiceEngineWarning(warnMsg, "SYSTEM_FALLBACK_SINGLE_VOICE")
@@ -2937,6 +3003,7 @@ class ForegroundTtsManager private constructor(context: Context) {
         thirtySecondRepeatDelayJob = null
         isSpeakingUtterance = false
         activeUtteranceId = null
+        activeSpeakingSequenceId = 0L
         CloudTtsService.stopPlayback()
         kokoroEngine.stopPlayback()
         sherpaEngine.stop()

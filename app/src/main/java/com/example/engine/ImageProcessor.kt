@@ -86,7 +86,7 @@ class ImageProcessor(
         private const val SAMPLE_GRID_W = 32
         private const val SAMPLE_GRID_H = 12
         private const val MAX_CONSECUTIVE_SKIPS = 2
-        private const val FORCED_OCR_INTERVAL_MS = 1800L
+        private const val FORCED_OCR_INTERVAL_MS = 1200L
 
         private val COLOR_INVERSION_MATRIX = floatArrayOf(
             -1f,  0f,  0f, 0f, 255f,
@@ -167,6 +167,14 @@ class ImageProcessor(
         }
     }
 
+    private data class CroppedRoiResult(
+        val bitmap: Bitmap,
+        val cropLeftInSource: Int,
+        val cropTopInSource: Int,
+        val cropWidthInSource: Int,
+        val cropHeightInSource: Int
+    )
+
     /**
      * Crops [fullScreenBitmap] strictly to [targetScreenRect] (mapped from real device screen
      * dimensions [rawScreenWidth] x [rawScreenHeight] to the bitmap's native pixel dimensions).
@@ -177,14 +185,27 @@ class ImageProcessor(
         targetScreenRect: Rect?,
         rawScreenWidth: Int,
         rawScreenHeight: Int
-    ): Bitmap {
+    ): Bitmap = cropToTargetRegionWithBounds(
+        fullScreenBitmap = fullScreenBitmap,
+        targetScreenRect = targetScreenRect,
+        rawScreenWidth = rawScreenWidth,
+        rawScreenHeight = rawScreenHeight
+    ).bitmap
+
+    private fun cropToTargetRegionWithBounds(
+        fullScreenBitmap: Bitmap,
+        targetScreenRect: Rect?,
+        rawScreenWidth: Int,
+        rawScreenHeight: Int
+    ): CroppedRoiResult {
         val safeBitmap = ensureSoftwareArgbBitmap(fullScreenBitmap)
         if (targetScreenRect == null || targetScreenRect.isEmpty || rawScreenWidth <= 0 || rawScreenHeight <= 0) {
-            return if (safeBitmap === fullScreenBitmap) {
+            val copy = if (safeBitmap === fullScreenBitmap) {
                 safeBitmap.copy(Bitmap.Config.ARGB_8888, false) ?: safeBitmap
             } else {
                 safeBitmap
             }
+            return CroppedRoiResult(copy, 0, 0, safeBitmap.width, safeBitmap.height)
         }
 
         val scaleX = safeBitmap.width.toFloat() / rawScreenWidth.toFloat()
@@ -201,11 +222,12 @@ class ImageProcessor(
         val cropHeight = (bottom - top).coerceAtLeast(1)
 
         if (cropWidth < 16 || cropHeight < 16) {
-            return if (safeBitmap === fullScreenBitmap) {
+            val copy = if (safeBitmap === fullScreenBitmap) {
                 safeBitmap.copy(Bitmap.Config.ARGB_8888, false) ?: safeBitmap
             } else {
                 safeBitmap
             }
+            return CroppedRoiResult(copy, 0, 0, safeBitmap.width, safeBitmap.height)
         }
 
         return try {
@@ -213,10 +235,70 @@ class ImageProcessor(
             if (safeBitmap !== fullScreenBitmap && !safeBitmap.isRecycled) {
                 safeBitmap.recycle()
             }
-            cropped
+            CroppedRoiResult(cropped, left, top, cropWidth, cropHeight)
         } catch (e: Exception) {
             Log.w(TAG, "Fallback to full bitmap on crop bounds exception", e)
-            safeBitmap
+            CroppedRoiResult(safeBitmap, 0, 0, safeBitmap.width, safeBitmap.height)
+        }
+    }
+
+    /**
+     * Maps screen-space GameVox overlay windows (control bubble, floating Hindi caption box, sheets)
+     * into the upscaled ROI coordinate space so they are cleanly masked BEFORE ML Kit runs.
+     */
+    private fun mapOverlayRectsToRoiSpace(
+        overlayScreenRects: List<Rect>,
+        fullBitmapW: Int,
+        fullBitmapH: Int,
+        rawScreenW: Int,
+        rawScreenH: Int,
+        cropResult: CroppedRoiResult,
+        upscaledW: Int,
+        upscaledH: Int
+    ): List<Rect> {
+        if (overlayScreenRects.isEmpty() || cropResult.cropWidthInSource <= 0 || cropResult.cropHeightInSource <= 0) {
+            return emptyList()
+        }
+        val screenToFullX = if (rawScreenW > 0) fullBitmapW.toFloat() / rawScreenW.toFloat() else 1f
+        val screenToFullY = if (rawScreenH > 0) fullBitmapH.toFloat() / rawScreenH.toFloat() else 1f
+        val cropToUpscaleX = upscaledW.toFloat() / cropResult.cropWidthInSource.toFloat()
+        val cropToUpscaleY = upscaledH.toFloat() / cropResult.cropHeightInSource.toFloat()
+
+        return overlayScreenRects.mapNotNull { screenRect ->
+            if (screenRect.isEmpty) return@mapNotNull null
+            val fullLeft = screenRect.left * screenToFullX
+            val fullTop = screenRect.top * screenToFullY
+            val fullRight = screenRect.right * screenToFullX
+            val fullBottom = screenRect.bottom * screenToFullY
+
+            val relLeft = ((fullLeft - cropResult.cropLeftInSource) * cropToUpscaleX).toInt().coerceIn(0, upscaledW)
+            val relTop = ((fullTop - cropResult.cropTopInSource) * cropToUpscaleY).toInt().coerceIn(0, upscaledH)
+            val relRight = ((fullRight - cropResult.cropLeftInSource) * cropToUpscaleX).toInt().coerceIn(0, upscaledW)
+            val relBottom = ((fullBottom - cropResult.cropTopInSource) * cropToUpscaleY).toInt().coerceIn(0, upscaledH)
+
+            if (relRight > relLeft + 2 && relBottom > relTop + 2) {
+                Rect(relLeft, relTop, relRight, relBottom)
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun maskOverlayRectsOnBitmap(
+        bitmap: Bitmap,
+        maskRects: List<Rect>,
+        fillColor: Int
+    ) {
+        if (maskRects.isEmpty() || bitmap.isRecycled || !bitmap.isMutable) return
+        val canvas = Canvas(bitmap)
+        val maskPaint = Paint().apply {
+            color = fillColor
+            style = Paint.Style.FILL
+        }
+        maskRects.forEach { rect ->
+            if (!rect.isEmpty) {
+                canvas.drawRect(rect, maskPaint)
+            }
         }
     }
 
@@ -244,7 +326,10 @@ class ImageProcessor(
      * Isolates bright white (`R,G,B > 180` with low channel spread) and golden/yellow (`R > 175, G > 145, B < 150`)
      * subtitle text pixels against busy textured game scenes, rendering them crisp black text on pure white.
      */
-    fun createBrightYellowWhiteIsolationBitmap(source: Bitmap): Bitmap {
+    fun createBrightYellowWhiteIsolationBitmap(
+        source: Bitmap,
+        excludeOverlayRects: List<Rect> = emptyList()
+    ): Bitmap {
         val safeBitmap = ensureSoftwareArgbBitmap(source)
         val w = safeBitmap.width.coerceAtLeast(1)
         val h = safeBitmap.height.coerceAtLeast(1)
@@ -265,6 +350,7 @@ class ImageProcessor(
 
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         out.setPixels(pixels, 0, w, 0, 0, w, h)
+        maskOverlayRectsOnBitmap(out, excludeOverlayRects, Color.WHITE)
         if (safeBitmap !== source && !safeBitmap.isRecycled) {
             safeBitmap.recycle()
         }
@@ -323,7 +409,8 @@ class ImageProcessor(
         source: Bitmap,
         enableGrayscale: Boolean = true,
         enableColorInversion: Boolean = true,
-        excludeOverlayRect: Rect? = null
+        excludeOverlayRect: Rect? = null,
+        excludeOverlayRects: List<Rect> = listOfNotNull(excludeOverlayRect)
     ): Bitmap {
         val safeBitmap = ensureSoftwareArgbBitmap(source)
         val width = safeBitmap.width.coerceAtLeast(1)
@@ -347,12 +434,21 @@ class ImageProcessor(
         }
         canvas.drawBitmap(safeBitmap, 0f, 0f, paint)
 
-        if (excludeOverlayRect != null && !excludeOverlayRect.isEmpty) {
+        val effectiveMaskRects = if (excludeOverlayRects.isNotEmpty()) {
+            excludeOverlayRects
+        } else {
+            listOfNotNull(excludeOverlayRect)
+        }
+        if (effectiveMaskRects.isNotEmpty()) {
             val maskPaint = Paint().apply {
                 color = if (enableColorInversion) Color.WHITE else Color.BLACK
                 style = Paint.Style.FILL
             }
-            canvas.drawRect(excludeOverlayRect, maskPaint)
+            effectiveMaskRects.forEach { rect ->
+                if (!rect.isEmpty) {
+                    canvas.drawRect(rect, maskPaint)
+                }
+            }
         }
 
         if (safeBitmap !== source && !safeBitmap.isRecycled) {
@@ -362,7 +458,7 @@ class ImageProcessor(
     }
 
     /**
-     * Runs the complete ROI Crop -> Small-ROI Upscale -> Multi-Pass Preprocessing -> ML Kit [TextRecognizer] pipeline
+     * Runs the complete ROI Crop -> Overlay Self-OCR Masking -> Small-ROI Upscale -> Multi-Pass Preprocessing -> ML Kit [TextRecognizer] pipeline
      * on a captured video frame [source].
      * Safely recycles intermediate temporary bitmaps so only [OcrExtractionResult.croppedOriginalBitmap]
      * and [OcrExtractionResult.processedBitmap] are returned live to the caller.
@@ -375,15 +471,18 @@ class ImageProcessor(
         rawScreenWidth: Int = 0,
         rawScreenHeight: Int = 0,
         skipIfRegionUnchanged: Boolean = true,
-        rotationDegrees: Int = 0
+        rotationDegrees: Int = 0,
+        excludeOverlayRects: List<Rect> = listOfNotNull(excludeOverlayRect)
     ): OcrExtractionResult = withContext(Dispatchers.Default) {
         val ocrStartMs = System.currentTimeMillis()
-        val regionBitmap = if (targetRegionScreenRect != null && !targetRegionScreenRect.isEmpty && rawScreenWidth > 0 && rawScreenHeight > 0) {
-            cropToTargetRegion(source, targetRegionScreenRect, rawScreenWidth, rawScreenHeight)
+        val cropResult = if (targetRegionScreenRect != null && !targetRegionScreenRect.isEmpty && rawScreenWidth > 0 && rawScreenHeight > 0) {
+            cropToTargetRegionWithBounds(source, targetRegionScreenRect, rawScreenWidth, rawScreenHeight)
         } else {
             val safe = ensureSoftwareArgbBitmap(source)
-            safe.copy(Bitmap.Config.ARGB_8888, false) ?: safe
+            val copy = safe.copy(Bitmap.Config.ARGB_8888, false) ?: safe
+            CroppedRoiResult(copy, 0, 0, source.width, source.height)
         }
+        val regionBitmap = cropResult.bitmap
 
         val roiW = regionBitmap.width
         val roiH = regionBitmap.height
@@ -414,7 +513,20 @@ class ImageProcessor(
         previousRegionLumaSample = currentSample
 
         val upscaledRoi = upscaleSmallRoiIfNeeded(regionBitmap)
-        val maskRect = if (targetRegionScreenRect == null) excludeOverlayRect else null
+        val allScreenMasks = buildList {
+            excludeOverlayRect?.let { add(it) }
+            excludeOverlayRects.forEach { r -> if (r !in this) add(r) }
+        }
+        val mappedMaskRects = mapOverlayRectsToRoiSpace(
+            overlayScreenRects = allScreenMasks,
+            fullBitmapW = source.width,
+            fullBitmapH = source.height,
+            rawScreenW = rawScreenWidth,
+            rawScreenH = rawScreenHeight,
+            cropResult = cropResult,
+            upscaledW = upscaledRoi.width,
+            upscaledH = upscaledRoi.height
+        )
         val safeRotation = when (rotationDegrees) {
             90, 180, 270 -> rotationDegrees
             else -> 0
@@ -425,7 +537,7 @@ class ImageProcessor(
             source = upscaledRoi,
             enableGrayscale = true,
             enableColorInversion = enableColorInversion,
-            excludeOverlayRect = maskRect
+            excludeOverlayRects = mappedMaskRects
         )
         val pass1Blocks = runMlKitRecognition(pass1Bitmap, pass1Bitmap.height, safeRotation)
         val pass1Text = formatOverlayBlocks(pass1Blocks, isCroppedBox = targetRegionScreenRect != null)
@@ -446,7 +558,10 @@ class ImageProcessor(
         }
 
         // Pass 2: Bright White & Yellow Subtitle Isolation for busy/moving game backgrounds & outlines
-        val pass2Bitmap = createBrightYellowWhiteIsolationBitmap(upscaledRoi)
+        val pass2Bitmap = createBrightYellowWhiteIsolationBitmap(
+            source = upscaledRoi,
+            excludeOverlayRects = mappedMaskRects
+        )
         val pass2Blocks = runMlKitRecognition(pass2Bitmap, pass2Bitmap.height, safeRotation)
         val pass2Text = formatOverlayBlocks(pass2Blocks, isCroppedBox = targetRegionScreenRect != null)
 
@@ -473,7 +588,7 @@ class ImageProcessor(
                 source = upscaledRoi,
                 enableGrayscale = true,
                 enableColorInversion = false,
-                excludeOverlayRect = maskRect
+                excludeOverlayRects = mappedMaskRects
             )
             val pass3Blocks = runMlKitRecognition(pass3Bitmap, pass3Bitmap.height, safeRotation)
             val pass3Text = formatOverlayBlocks(pass3Blocks, isCroppedBox = targetRegionScreenRect != null)
